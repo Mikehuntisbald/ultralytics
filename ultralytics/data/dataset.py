@@ -25,7 +25,6 @@ from .augment import (
     Format,
     LetterBox,
     RandomLoadText,
-    SemanticFormat,
     classify_augmentations,
     classify_transforms,
     v8_transforms,
@@ -38,15 +37,15 @@ from .utils import (
     get_hash,
     img2label_paths,
     load_dataset_cache_file,
-    polygons2masks_overlap,
     save_dataset_cache_file,
     verify_image,
     verify_image_label,
-    verify_image_mask,
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
+UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
+UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
 
 
 class YOLODataset(BaseDataset):
@@ -74,7 +73,7 @@ class YOLODataset(BaseDataset):
         >>> dataset.get_labels()
     """
 
-    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+    def __init__(self, *args, data: dict | None = None, task: str = "detect", split: str = "train", **kwargs):
         """Initialize the YOLODataset.
 
         Args:
@@ -87,8 +86,19 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        self.split = split
+        self.use_unified_labels = self._has_unified_labels()
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
+
+    def _has_unified_labels(self) -> bool:
+        """Return whether this dataset should read the YOLO26-PS unified label schema."""
+        return bool(
+            self.data.get("unified_schema")
+            or self.data.get("label_schema") == "unified"
+            or self.data.get("unified_labels")
+            or self.data.get("unified_manifest")
+        )
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
         """Cache dataset labels, check images and read shapes.
@@ -166,6 +176,9 @@ class YOLODataset(BaseDataset):
         Returns:
             (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
         """
+        if self.use_unified_labels:
+            return self.get_unified_labels()
+
         self.label_files = img2label_paths(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
         try:
@@ -206,6 +219,286 @@ class YOLODataset(BaseDataset):
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
 
+    def get_unified_labels(self) -> list[dict]:
+        """Return labels parsed from the YOLO26-PS unified JSON schema."""
+        records = self._load_unified_manifest()
+        labels = []
+        missing = 0
+        for im_file in self.im_files:
+            record = records.get(str(Path(im_file).resolve())) or records.get(Path(im_file).name)
+            if record is None:
+                label_file = self._unified_label_file(im_file)
+                if label_file and label_file.exists():
+                    record = json.loads(label_file.read_text(encoding="utf-8"))
+            if record is None:
+                missing += 1
+                record = {"image": im_file, "instances": [], "task_flags": {}}
+            labels.append(self._parse_unified_record(record, im_file))
+        if missing:
+            LOGGER.warning(f"{self.prefix}{missing} images have no unified JSON label; using empty partial labels.")
+        self.im_files = [lb["im_file"] for lb in labels]
+        return labels
+
+    def _split_value(self, key: str) -> Any:
+        value = self.data.get(key)
+        if isinstance(value, dict):
+            value = value.get(self.split) or value.get("default")
+        return value
+
+    def _resolve_data_path(self, value: str | Path | None) -> Path | None:
+        if value is None:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path(self.data.get("path", ".")).resolve() / path
+        return path
+
+    def _resolve_record_path(self, value: str | Path | None, im_file: str | Path | None = None) -> str | None:
+        """Resolve a path from a unified record relative to the image file or data root."""
+        if value is None or value == "":
+            return None
+        path = Path(value)
+        if path.is_absolute():
+            return str(path)
+        if im_file is not None:
+            sibling = Path(im_file).resolve().parent / path
+            if sibling.exists():
+                return str(sibling)
+        return str((Path(self.data.get("path", ".")).resolve() / path).resolve())
+
+    def _load_unified_manifest(self) -> dict[str, dict]:
+        """Load optional split manifest and index records by absolute image path and basename."""
+        manifest = self._resolve_data_path(self._split_value("unified_manifest"))
+        if manifest is None or not manifest.exists():
+            return {}
+        if manifest.suffix == ".jsonl":
+            records = [json.loads(x) for x in manifest.read_text(encoding="utf-8").splitlines() if x.strip()]
+        else:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                records = data.get("samples") or data.get("images") or data.get("annotations") or data
+            else:
+                records = data
+        if isinstance(records, dict):
+            records = [{**v, "image": k} if isinstance(v, dict) else {"image": k, "instances": v} for k, v in records.items()]
+        out = {}
+        root = Path(self.data.get("path", ".")).resolve()
+        for rec in records:
+            image = rec.get("image") or rec.get("im_file") or rec.get("file_name")
+            if not image:
+                continue
+            path = Path(image)
+            abs_path = path if path.is_absolute() else root / path
+            out[str(abs_path.resolve())] = rec
+            out[path.name] = rec
+        return out
+
+    def _unified_label_file(self, im_file: str | Path) -> Path | None:
+        label_root = self._resolve_data_path(self._split_value("unified_labels"))
+        im_path = Path(im_file)
+        if label_root is None:
+            return Path(img2label_paths([str(im_path)])[0]).with_suffix(".json")
+        parts = im_path.parts
+        rel = None
+        marker = ("images", self.split)
+        for i in range(len(parts) - 1):
+            if parts[i : i + 2] == marker:
+                rel = Path(*parts[i + 2 :])
+                break
+        if rel is None and "images" in parts:
+            rel = Path(*parts[parts.index("images") + 1 :])
+        if rel is None:
+            rel = Path(im_path.name)
+        return label_root / rel.with_suffix(".json")
+
+    def _parse_unified_record(self, record: dict, im_file: str | Path) -> dict:
+        im_file = str(Path(im_file).resolve())
+        width, height = self._record_shape(record, im_file)
+        names = self.data.get("names", {})
+        classes, bboxes, segments, kpts2d, kpts3d, person_masks, instance_flags = [], [], [], [], [], [], []
+        task_flags = {k: bool(record.get("task_flags", {}).get(k, False)) for k in UNIFIED_TASK_FLAG_KEYS}
+        nkpt = int((self.data.get("kpt_shape") or [17, 3])[0])
+
+        for inst in record.get("instances", []):
+            flags = inst.get("flags", {})
+            bbox = inst.get("bbox")
+            has_bbox = bool(flags.get("has_bbox", bbox is not None))
+            cls = self._category_to_id(inst, names)
+            if not has_bbox or bbox is None or cls is None:
+                continue
+            box = self._normalize_bbox(bbox, width, height, inst.get("bbox_format", record.get("bbox_format", "xyxy")))
+            if box is None:
+                continue
+            body2d = self._normalize_kpts2d(inst.get("body_kpts_2d"), width, height, nkpt)
+            body3d = self._normalize_kpts3d(inst.get("body_kpts_3d"), body2d, width, height, nkpt)
+            has_body2d = bool(flags.get("has_body2d", np.any(body2d[..., 2] > 0)))
+            has_body3d = bool(flags.get("has_body3d", np.any(body3d[..., 3] > 0)))
+            person_mask = inst.get("person_mask")
+            if isinstance(person_mask, str):
+                person_mask = self._resolve_record_path(person_mask, im_file)
+            has_person_mask = bool(flags.get("has_person_mask", person_mask is not None))
+
+            classes.append([float(cls)])
+            bboxes.append(box)
+            kpts2d.append(body2d)
+            kpts3d.append(body3d)
+            person_masks.append(person_mask)
+            instance_flags.append([has_bbox, has_body2d, has_body3d, has_person_mask])
+            if isinstance(person_mask, list):
+                seg = self._normalize_segment(person_mask, width, height)
+                segments.append(seg if seg is not None else np.zeros((0, 2), dtype=np.float32))
+            elif isinstance(person_mask, str):
+                seg = self._mask_file_to_segment(person_mask, width, height)
+                segments.append(seg if seg is not None else self._dummy_segment_from_box(box))
+            else:
+                segments.append(self._dummy_segment_from_box(box))
+
+        if classes:
+            cls = np.array(classes, dtype=np.float32)
+            bboxes = np.array(bboxes, dtype=np.float32)
+            keypoints = np.stack(kpts2d, axis=0).astype(np.float32)
+            body_kpts_3d = np.stack(kpts3d, axis=0).astype(np.float32)
+            instance_flags = np.array(instance_flags, dtype=bool)
+        else:
+            cls = np.zeros((0, 1), dtype=np.float32)
+            bboxes = np.zeros((0, 4), dtype=np.float32)
+            keypoints = np.zeros((0, nkpt, 3), dtype=np.float32)
+            body_kpts_3d = np.zeros((0, nkpt, 4), dtype=np.float32)
+            instance_flags = np.zeros((0, len(UNIFIED_INSTANCE_FLAG_KEYS)), dtype=bool)
+
+        task_flags["has_det"] = bool(task_flags["has_det"] or len(cls))
+        task_flags["has_pose2d"] = bool(task_flags["has_pose2d"] or instance_flags[:, 1].any() if len(instance_flags) else task_flags["has_pose2d"])
+        task_flags["has_pose3d"] = bool(task_flags["has_pose3d"] or instance_flags[:, 2].any() if len(instance_flags) else task_flags["has_pose3d"])
+        task_flags["has_person_mask"] = bool(
+            task_flags["has_person_mask"] or instance_flags[:, 3].any() if len(instance_flags) else task_flags["has_person_mask"]
+        )
+        scene_seg = self._resolve_record_path(record.get("scene_seg"), im_file)
+        task_flags["has_scene_seg"] = bool(task_flags["has_scene_seg"] or scene_seg)
+
+        return {
+            "im_file": im_file,
+            "shape": (height, width),
+            "cls": cls,
+            "bboxes": bboxes,
+            "segments": segments,
+            "keypoints": keypoints,
+            "body_kpts_3d": body_kpts_3d,
+            "person_mask": person_masks,
+            "instance_flags": instance_flags,
+            "scene_seg": scene_seg,
+            **{k: np.array(task_flags[k], dtype=bool) for k in UNIFIED_TASK_FLAG_KEYS},
+            "normalized": True,
+            "bbox_format": "xywh",
+        }
+
+    def _record_shape(self, record: dict, im_file: str) -> tuple[int, int]:
+        width, height = record.get("width"), record.get("height")
+        if width and height:
+            return int(width), int(height)
+        with Image.open(im_file) as im:
+            return im.size
+
+    def _category_to_id(self, inst: dict, names: dict) -> int | None:
+        category = inst.get("cls_id", inst.get("category_id", inst.get("category")))
+        if category is None:
+            return None
+        if isinstance(category, (int, float)):
+            return int(category)
+        if isinstance(category, str) and category.isdigit():
+            return int(category)
+        mapping = self.data.get("category_mapping") or self.data.get("class_map") or {}
+        if category in mapping:
+            return int(mapping[category])
+        reverse = {str(v): int(k) for k, v in names.items()}
+        for k, v in names.items():
+            for alias in str(v).split("/"):
+                reverse.setdefault(alias.strip(), int(k))
+        return reverse.get(str(category))
+
+    @staticmethod
+    def _normalize_bbox(bbox: list[float], width: int, height: int, bbox_format: str) -> list[float] | None:
+        if len(bbox) < 4:
+            return None
+        x1, y1, x2, y2 = map(float, bbox[:4])
+        if bbox_format == "xywh":
+            cx, cy, bw, bh = x1, y1, x2, y2
+            if max(abs(cx), abs(cy), abs(bw), abs(bh)) > 2:
+                cx, bw = cx / width, bw / width
+                cy, bh = cy / height, bh / height
+        else:
+            if max(abs(x1), abs(y1), abs(x2), abs(y2)) > 2:
+                x1, x2 = x1 / width, x2 / width
+                y1, y2 = y1 / height, y2 / height
+            bw, bh = x2 - x1, y2 - y1
+            cx, cy = x1 + bw * 0.5, y1 + bh * 0.5
+        if bw <= 0 or bh <= 0:
+            return None
+        return [cx, cy, bw, bh]
+
+    @staticmethod
+    def _normalize_kpts2d(kpts: list | None, width: int, height: int, nkpt: int) -> np.ndarray:
+        arr = np.zeros((nkpt, 3), dtype=np.float32)
+        if not kpts:
+            return arr
+        src = np.asarray(kpts, dtype=np.float32).reshape(-1, 3)
+        n = min(nkpt, len(src))
+        arr[:n] = src[:n]
+        if arr[:, 0].max(initial=0) > 2 or arr[:, 1].max(initial=0) > 2:
+            arr[:, 0] /= width
+            arr[:, 1] /= height
+        return arr
+
+    @staticmethod
+    def _normalize_kpts3d(kpts: list | None, kpts2d: np.ndarray, width: int, height: int, nkpt: int) -> np.ndarray:
+        arr = np.zeros((nkpt, 4), dtype=np.float32)
+        arr[:, :2] = kpts2d[:, :2]
+        arr[:, 3] = kpts2d[:, 2]
+        if not kpts:
+            return arr
+        src = np.asarray(kpts, dtype=np.float32).reshape(-1, 4)
+        n = min(nkpt, len(src))
+        arr[:n] = src[:n]
+        if arr[:, 0].max(initial=0) > 2 or arr[:, 1].max(initial=0) > 2:
+            arr[:, 0] /= width
+            arr[:, 1] /= height
+        return arr
+
+    @staticmethod
+    def _normalize_segment(mask: list, width: int, height: int) -> np.ndarray | None:
+        arr = np.asarray(mask, dtype=np.float32).reshape(-1, 2)
+        if len(arr) < 3:
+            return None
+        if arr[:, 0].max(initial=0) > 2 or arr[:, 1].max(initial=0) > 2:
+            arr[:, 0] /= width
+            arr[:, 1] /= height
+        return arr
+
+    @staticmethod
+    def _mask_file_to_segment(mask_file: str, width: int, height: int) -> np.ndarray | None:
+        """Approximate a binary instance-mask file as its largest contour polygon."""
+        mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+        if len(contour) < 3:
+            return None
+        contour[:, 0] /= width
+        contour[:, 1] /= height
+        return contour
+
+    @staticmethod
+    def _dummy_segment_from_box(box: list[float]) -> np.ndarray:
+        """Return a zero-area polygon inside a bbox for non-mask instances."""
+        cx, cy, bw, bh = box
+        x1, y1 = cx - bw * 0.5, cy - bh * 0.5
+        x2, y2 = cx + bw * 0.5, cy + bh * 0.5
+        return np.array([[x1, y1], [x2, y1], [x2, y1]], dtype=np.float32)
+
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list.
 
@@ -226,8 +519,8 @@ class YOLODataset(BaseDataset):
             Format(
                 bbox_format="xywh",
                 normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
+                return_mask=self.use_segments or self.use_unified_labels,
+                return_keypoint=self.use_keypoints or self.use_unified_labels,
                 return_obb=self.use_obb,
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
@@ -267,6 +560,15 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        if label.get("scene_seg") and label.get("scene_mask") is None:
+            scene_mask = cv2.imread(str(label["scene_seg"]), cv2.IMREAD_UNCHANGED)
+            if scene_mask is not None:
+                if scene_mask.ndim == 3:
+                    scene_mask = scene_mask[..., 0]
+                img_shape = label["img"].shape[:2]
+                if scene_mask.shape[:2] != img_shape:
+                    scene_mask = cv2.resize(scene_mask, img_shape[::-1], interpolation=cv2.INTER_NEAREST)
+                label["scene_mask"] = scene_mask
 
         # NOTE: do NOT resample oriented boxes
         segment_resamples = 100 if self.use_obb else 1000
@@ -279,6 +581,10 @@ class YOLODataset(BaseDataset):
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        if label.get("body_kpts_3d") is not None:
+            label["body_kpts_3d"] = np.asarray(label["body_kpts_3d"], dtype=np.float32)
+        if label.get("instance_flags") is not None:
+            label["instance_flags"] = np.asarray(label["instance_flags"], dtype=bool)
         return label
 
     @staticmethod
@@ -297,18 +603,20 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "semantic_mask", "sem_masks"}:
+            if k in {"img", "text_feats", "sem_masks", "scene_seg"} and torch.is_tensor(value[0]):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            elif k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "body_kpts_3d", "instance_flags"}:
+                value = [torch.as_tensor(v) for v in value]
                 value = torch.cat(value, 0)
+            elif k in UNIFIED_TASK_FLAG_KEYS:
+                value = torch.tensor([bool(v) for v in value], dtype=torch.bool)
             new_batch[k] = value
-        if "batch_idx" in new_batch:
-            new_batch["batch_idx"] = list(new_batch["batch_idx"])
-            for i in range(len(new_batch["batch_idx"])):
-                new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-            new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
 
 
@@ -682,262 +990,13 @@ class YOLOConcatDataset(ConcatDataset):
             dataset.close_mosaic(hyp)
 
 
-class SemanticDataset(YOLODataset):
-    """Dataset for semantic segmentation with PNG mask labels.
+# TODO: support semantic segmentation
+class SemanticDataset(BaseDataset):
+    """Semantic Segmentation Dataset."""
 
-    Expects a directory structure where each image has a corresponding PNG mask file with the same stem. Pixel values in
-    masks represent class IDs, with 255 as the ignore label.
-
-    The mask directory is specified in the dataset YAML via 'masks_dir' key, and mirrors the images/ directory structure
-    (e.g., images/train/ -> masks/train/).
-
-    Attributes:
-        data (dict): Dataset configuration from YAML.
-        mask_files (list[str]): List of mask file paths corresponding to images.
-    """
-
-    def __init__(self, *args, data: dict | None = None, **kwargs):
-        """Initialize SemanticDataset.
-
-        Args:
-            *args (Any): Additional positional arguments for the parent class.
-            data (dict): Dataset configuration dictionary.
-            **kwargs (Any): Additional keyword arguments for the parent class.
-        """
-        self.data = data or {}
-        self.label_mapping = self._parse_label_mapping(self.data.get("label_mapping"))
-        self.mask_files = []
-        super().__init__(*args, data=data, **kwargs)
-
-    def _parse_label_mapping(self, mapping):
-        """Normalize label_mapping entries from dataset YAML into integer-to-integer ids."""
-        if mapping is None:
-            return {}
-        if not isinstance(mapping, dict):
-            raise TypeError(f"Expected 'label_mapping' to be a dict in dataset YAML, but got {type(mapping).__name__}.")
-
-        normalized = {}
-        for src, dst in mapping.items():
-            src = int(src)
-            if isinstance(dst, str):
-                dst = dst.strip()
-                dst = 255 if dst == "ignore_label" else int(dst)
-            elif dst is None:
-                dst = 255
-            else:
-                dst = int(dst)
-            normalized[src] = dst
-        return normalized
-
-    def _semantic_cache_hash(self, mask_files: list[str]) -> str:
-        """Return a hash for semantic cache validation that also includes label_mapping changes."""
-        mapping = json.dumps(self.label_mapping, sort_keys=True, separators=(",", ":"))
-        return get_hash(self.im_files + mask_files + [f"label_mapping:{mapping}"])
-
-    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
-        """Cache semantic labels and image-mask pairing metadata.
-
-        Args:
-            path (Path): Path where to save the cache file.
-
-        Returns:
-            (dict[str, Any]): Cached semantic metadata.
-        """
-        x = {"labels": []}
-        nm, nf, nc, msgs = 0, 0, 0, []  # missing, found, corrupt, messages
-        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
-        total = len(self.im_files)
-
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(
-                func=verify_image_mask,
-                iterable=zip(self.im_files, self.mask_files, repeat(self.prefix)),
-            )
-            pbar = TQDM(results, desc=desc, total=total)
-            for im_file, mask_file, shape, nm_f, nf_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                nc += nc_f
-                if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "mask_file": mask_file,
-                            "shape": shape,
-                            "cls": np.array([], dtype=np.float32),
-                            "bboxes": np.zeros((0, 4), dtype=np.float32),
-                            "segments": [],
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f"{desc} {nf} images, {nm} missing masks, {nc} corrupt"
-            pbar.close()
-        x["hash"] = self._semantic_cache_hash(self.mask_files)
-        x["results"] = nf, nm, nc, total
-        x["msgs"] = msgs
-        if x["labels"]:
-            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
-        return x
-
-    def get_labels(self):
-        """Load semantic labels from cache or scan image-mask paths.
-
-        Returns:
-            (list[dict]): List of label dictionaries with mask file paths and image shapes.
-        """
-        self.mask_files = img2label_paths(self.im_files, label_dir=self.data.get("masks_dir", "masks"), suffix=".png")
-        cache_path = Path(self.mask_files[0]).parent.with_suffix(".cache")
-
-        try:
-            cache, exists = load_dataset_cache_file(cache_path), True
-            assert cache["version"] == DATASET_CACHE_VERSION
-            assert cache["hash"] == self._semantic_cache_hash(self.mask_files)
-        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
-            cache, exists = self.cache_labels(cache_path), False
-
-        nf, nm, nc, n = cache.pop("results")
-        if exists and LOCAL_RANK in {-1, 0}:
-            d = f"Scanning {cache_path}... {nf} masks, {nm} missing, {nc} corrupt"
-            TQDM(None, desc=self.prefix + d, total=n, initial=n)
-            if cache["msgs"]:
-                LOGGER.info("\n".join(cache["msgs"]))
-
-        [cache.pop(k) for k in ("hash", "version", "msgs")]
-        labels = cache["labels"]
-        if not labels:
-            raise RuntimeError(f"No valid images found in {cache_path}. {HELP_URL}")
-        self.im_files = [lb["im_file"] for lb in labels]
-        self.mask_files = [lb["mask_file"] for lb in labels]
-        return labels
-
-    def load_image(self, i, rect_mode=True):
-        """Load an image for semantic segmentation, scaling the short side to imgsz when rect_mode=True."""
-        return super().load_image(i, rect_mode=rect_mode, resize_short=self.augment)
-
-    def load_mask(self, index: int, image_shape: tuple[int, int] | None = None) -> np.ndarray:
-        """Load a semantic mask and apply optional dataset label mapping."""
-        mask_file = self.labels[index]["mask_file"]
-        mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Semantic mask not found or unreadable: {mask_file}")
-        if mask.ndim == 3 and mask.shape[2] == 1:
-            mask = np.squeeze(mask, axis=2)
-        if int(self.data.get("nc", 0)) == 1:
-            with Image.open(mask_file) as im:
-                if im.mode == "1":  # cv2 expands 1-bit PNGs to {0, 255}; map only true 1-bit foreground to 1.
-                    mask[mask == 255] = 1
-        if self.label_mapping:
-            mask = self.convert_label(mask, inverse=False)
-        return mask.astype(np.uint8, copy=False)
-
-    def build_transforms(self, hyp=None):
-        """Build transforms for semantic segmentation.
-
-        Args:
-            hyp (dict): Hyperparameters.
-
-        Returns:
-            (Compose): Composed transforms.
-        """
-        transforms = super().build_transforms(hyp)
-        transforms[-1] = SemanticFormat()  # replace the last transform with SemanticFormat
-        return transforms
-
-    def convert_label(self, label, inverse=False):
-        """Convert label values using the dataset's label mapping.
-
-        Args:
-            label (np.ndarray): Segmentation label array to convert.
-            inverse (bool): If True, apply inverse mapping (mapped -> original). Defaults to False.
-
-        Returns:
-            (np.ndarray): Label array with converted values.
-        """
-        temp = label.copy()
-        if inverse:
-            for v, k in self.label_mapping.items():
-                label[temp == k] = v
-        else:
-            for k, v in self.label_mapping.items():
-                label[temp == k] = v
-        return label
-
-    def get_image_and_label(self, index):
-        """Get image, label and semantic mask for the given index.
-
-        Overrides parent to include semantic mask so that Mosaic/CopyPaste mix images
-        also have their masks loaded.
-
-        Args:
-            index (int): Dataset index.
-
-        Returns:
-            (dict): Label dict with 'img', 'semantic_mask', and metadata.
-        """
-        label = super().get_image_and_label(index)
-        h, w = label["img"].shape[:2]
-        mask = self.load_mask(index, image_shape=(h, w))
-        # Resize mask to match the resized image dimensions
-        if mask.shape[:2] != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        label["semantic_mask"] = mask
-        return label
-
-
-class PolygonSemanticDataset(SemanticDataset, YOLODataset):
-    """Semantic segmentation dataset that rasterizes YOLO polygon labels into masks on the fly.
-
-    Used when the dataset YAML lacks 'masks_dir'. Pixels not covered by any polygon become a dedicated background class.
-    Requires `add_polygon_background(data)` to be called first: for nc > 1 it bumps `data['nc']` to user_nc + 1 with
-    background at `nc - 1`; for nc == 1 it keeps nc=1 and rasterizes a {0=bg, 1=fg} binary mask for use with
-    BCEWithLogitsLoss.
-    """
-
-    def __init__(self, *args, data: dict | None = None, **kwargs):
-        """Initialize PolygonSemanticDataset.
-
-        Args:
-            *args (Any): Additional positional arguments for the parent class.
-            data (dict): Dataset configuration dictionary.
-            **kwargs (Any): Additional keyword arguments for the parent class.
-        """
-        nc = (data or {}).get("nc") or len((data or {}).get("names", {}))
-        self.bg_class_idx = data.get("bg_class_idx", max(int(nc) - 1, 0))
-        super().__init__(*args, data=data, **kwargs)
-
-    def get_labels(self):
-        """Parse YOLO polygon .txt labels."""
-        return YOLODataset.get_labels(self)
-
-    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
-        """Cache polygon labels via YOLODataset to keep the 5-tuple `results` format expected by get_labels."""
-        return YOLODataset.cache_labels(self, path)
-
-    def load_mask(self, index: int, image_shape: tuple[int, int] | None = None) -> np.ndarray:
-        """Rasterize this image's polygons into a (H, W) uint8 semantic mask, bg = self.bg_class_idx."""
-        h, w = image_shape
-        label = self.labels[index]
-        cls = label.get("cls")
-        segments = label.get("segments") or []
-        if cls is None or len(cls) == 0 or len(segments) == 0:
-            return np.full((h, w), self.bg_class_idx, dtype=np.uint8)
-
-        # Denormalize polygons (stored as normalized xy) to pixel coordinates at (h, w).
-        scale = np.array([w, h], dtype=np.float32)
-        polys = [np.asarray(s, dtype=np.float32).reshape(-1, 2) * scale for s in segments]
-        # Returns (H, W) instance index map: 0 = no polygon, 1..N = sorted instance index.
-        inst, sorted_idx = polygons2masks_overlap((h, w), polys, downsample_ratio=1)
-        out = np.full((h, w), self.bg_class_idx, dtype=np.uint8)
-        fg = inst > 0
-        if int(self.data.get("nc", 0)) == 1:  # binary: fg=1 regardless of label cls value
-            out[fg] = 1
-        else:
-            cls_arr = np.asarray(cls).reshape(-1).astype(np.int32)[sorted_idx]
-            out[fg] = cls_arr[inst[fg] - 1].astype(np.uint8)
-        return out
+    def __init__(self):
+        """Initialize a SemanticDataset object."""
+        super().__init__()
 
 
 class ClassificationDataset:

@@ -196,7 +196,7 @@ class BaseDataset(Dataset):
                 cls = self.labels[i]["cls"]
                 bboxes = self.labels[i]["bboxes"]
                 segments = self.labels[i]["segments"]
-                keypoints = self.labels[i].get("keypoints")
+                keypoints = self.labels[i]["keypoints"]
                 j = (cls == include_class_array).any(1)
                 self.labels[i]["cls"] = cls[j]
                 self.labels[i]["bboxes"] = bboxes[j]
@@ -204,19 +204,21 @@ class BaseDataset(Dataset):
                     self.labels[i]["segments"] = [segments[si] for si, idx in enumerate(j) if idx]
                 if keypoints is not None:
                     self.labels[i]["keypoints"] = keypoints[j]
+                if self.labels[i].get("body_kpts_3d") is not None:
+                    self.labels[i]["body_kpts_3d"] = self.labels[i]["body_kpts_3d"][j]
+                if self.labels[i].get("instance_flags") is not None:
+                    self.labels[i]["instance_flags"] = self.labels[i]["instance_flags"][j]
+                if self.labels[i].get("person_mask") is not None:
+                    self.labels[i]["person_mask"] = [m for m, idx in zip(self.labels[i]["person_mask"], j) if idx]
             if self.single_cls:
                 self.labels[i]["cls"][:, 0] = 0
 
-    def load_image(
-        self, i: int, rect_mode: bool = True, resize_short: bool = False
-    ) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+    def load_image(self, i: int, rect_mode: bool = True) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
         """Load an image from dataset index 'i'.
 
         Args:
             i (int): Index of the image to load.
-            rect_mode (bool): Whether to use rectangular resizing (long side to imgsz).
-            resize_short (bool): Whether to resize the shorter side to imgsz while maintaining aspect ratio. Overrides
-                rect_mode when True.
+            rect_mode (bool): Whether to use rectangular resizing.
 
         Returns:
             im (np.ndarray): Loaded image as a NumPy array.
@@ -231,13 +233,6 @@ class BaseDataset(Dataset):
             if fn.exists():  # load npy
                 try:
                     im = np.load(fn)
-                    npy_channels = im.shape[-1] if im.ndim >= 3 else 1
-                    if npy_channels != self.channels:
-                        LOGGER.warning(
-                            f"{self.prefix}Removing stale *.npy image file {fn} with {npy_channels} channels, expected {self.channels}"
-                        )
-                        Path(fn).unlink(missing_ok=True)
-                        im = imread(f, flags=self.cv2_flag)
                 except Exception as e:
                     LOGGER.warning(f"{self.prefix}Removing corrupt *.npy image file {fn} due to: {e}")
                     Path(fn).unlink(missing_ok=True)
@@ -249,16 +244,10 @@ class BaseDataset(Dataset):
 
             h0, w0 = im.shape[:2]  # orig hw
             if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
-                if resize_short:  # resize short side to imgsz while maintaining aspect ratio
-                    r = self.imgsz / min(h0, w0)  # ratio
-                    if r != 1:  # if sizes are not equal
-                        w, h = (math.ceil(w0 * r), self.imgsz) if h0 < w0 else (self.imgsz, math.ceil(h0 * r))
-                        im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    r = self.imgsz / max(h0, w0)  # ratio
-                    if r != 1:  # if sizes are not equal
-                        w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                        im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+                r = self.imgsz / max(h0, w0)  # ratio
+                if r != 1:  # if sizes are not equal
+                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
             elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
                 im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
             if im.ndim == 2:
