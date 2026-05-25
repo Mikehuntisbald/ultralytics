@@ -1,0 +1,4 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Alias config for the requested YOLO26s-PS-2.5D scale.
+# The parser resolves this to yolo26-ps25d.yaml and sets scale=s.

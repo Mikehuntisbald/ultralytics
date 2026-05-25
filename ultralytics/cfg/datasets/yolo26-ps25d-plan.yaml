@@ -1,0 +1,226 @@
+# YOLO26s-PS-2.5D multi-dataset training plan.
+# This file records task ownership, class remapping, partial-label flags, loss weights, and staged sampling.
+
+model:
+  name: YOLO26s-PS-2.5D
+  cfg: ultralytics/cfg/models/26/yolo26s-ps25d.yaml
+  dynamic_input: true
+  pad_stride: 32
+  default_imgsz: [448, 768] # Ultralytics height, width
+  neck:
+    outputs: [P2, P3, P4, P5]
+    channels: 192
+  heads:
+    det:
+      levels: [P2, P3, P4, P5]
+      classes: remapped_LVIS + person + face
+      topk: 300
+      nms_free: true
+    body25d:
+      attach_to: person
+      levels: [P3, P4, P5]
+      optional_aux_level: P2
+      num_keypoints: 17
+      dim_per_keypoint: 4
+      output: [x_norm, y_norm, z_norm, conf]
+      z_normalization: torso_length_3d_or_bbox_height
+      training_target:
+        raw: [x, y, z_rel, conf]
+        deploy_output: [x_norm, y_norm, z_norm, conf]
+      root_joint: pelvis
+    person_mask:
+      attach_to: person
+      proto_level: P2
+      proto_channels: 32
+      output_stride: 4
+    scene_seg:
+      classes: 150
+      output_stride: 4
+
+data:
+  detection:
+    - LVIS
+    - CrowdHuman
+    - WIDER_FACE
+  pose2d:
+    - COCO_WholeBody
+    - OCHuman
+    - 3DPW_projected_2d
+    - AGORA_projected_2d
+    - H3WB_projected_2d_optional
+  pose3d:
+    - 3DPW
+    - AGORA
+    - H3WB_optional
+  person_mask:
+    - COCO_person_mask
+    - OCHuman
+    - AGORA_optional
+  scene_seg:
+    - ADE20K
+
+class_mapping:
+  detection:
+    lvis: remapped_lvis_classes
+    person: 1203
+    face: 1204
+    c_det: len(remapped_lvis_classes) + 2
+  crowdhuman:
+    full_body: person
+    visible_body: optional_ignore_or_person
+    head: ignore
+  wider_face:
+    face: face
+  person_bbox_sources:
+    - COCO_WholeBody
+    - COCO_person_mask
+    - OCHuman
+    - 3DPW
+    - AGORA
+    - H3WB_optional
+
+outputs:
+  det_out: [B, 300, 6]
+  body25d_out: [B, 300, 17, 4] # [x_norm, y_norm, z_norm, conf], valid for person detections only
+  mask_coef: [B, 300, 32]
+  mask_proto: [B, 32, padded_H/4, padded_W/4]
+  scene_seg: [B, 150, padded_H/4, padded_W/4]
+
+keypoints:
+  schema: COCO-17
+  names:
+    [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder, left_elbow, right_elbow,
+     left_wrist, right_wrist, left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]
+  root_joint: pelvis
+  root_definition: mean(left_hip, right_hip)
+  z_rel: z_camera[j] - z_camera[pelvis]
+  z_norm: z_rel / torso_length_3d
+  z_norm_fallback: z_rel / bbox_height
+  flip:
+    swap_left_right_joints: true
+    x_flipped: true
+    z_rel_unchanged: true
+    person_mask_flipped: true
+
+label_schema:
+  task_flags: [has_det, has_pose2d, has_pose3d, has_person_mask, has_scene_seg]
+  instance_flags: [has_bbox, has_body2d, has_body3d, has_person_mask]
+  note: has_body2d, has_body3d, has_person_mask, and has_scene_seg must stay independent.
+
+loss:
+  implementation: unified_multitask_loss
+  stage_controls: [data_sampling_ratio, train_freeze_unfreeze, task_loss_weight]
+  note: stage changes task weights and trainable branches only; loss code gates by task flags.
+  no_det_rule: images with has_det=false are skipped by detector loss and must not become background negatives.
+  final:
+    det: 1.0
+    pose2d: 1.0
+    pose_z: 0.5
+    pose_vis: 0.3
+    bone: 0.1
+    person_mask: 0.7
+    scene_seg: 0.2
+  partial_label_logic:
+    has_det: [det]
+    has_pose2d: [pose2d, pose_vis]
+    has_pose3d: [pose_z, bone]
+    has_person_mask: [person_mask]
+    has_scene_seg: [scene_seg]
+  dataset_task_rules:
+    LVIS: [det]
+    CrowdHuman: [det]
+    WIDER_FACE: [det]
+    COCO_WholeBody: [det, pose2d, pose_vis]
+    OCHuman: [det, pose2d, pose_vis, person_mask]
+    3DPW: [det, pose2d, pose3d, pose_vis]
+    AGORA: [det, pose2d, pose3d, pose_vis]
+    H3WB_optional: [det, pose2d, pose3d, pose_vis]
+    COCO_person_mask: [det, person_mask]
+    ADE20K: [scene_seg]
+  pose_z_sources:
+    - 3DPW
+    - AGORA
+    - H3WB_optional
+  no_pose_z_sources:
+    - COCO_WholeBody
+    - OCHuman
+
+stages:
+  A_detection:
+    epochs: 50
+    data: {LVIS: 55, CrowdHuman: 25, WIDER_FACE: 20}
+    train: {backbone: partial, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
+    loss: {det: 1.0}
+    augment: {mosaic: 0.7, mixup: 0.1, copy_paste: 0.1, scale: [0.5, 1.5]}
+  B_pose2d:
+    epochs: 80
+    data: {COCO_WholeBody: 65, OCHuman: 10, CrowdHuman: 10, LVIS: 7, WIDER_FACE: 8}
+    train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
+    loss: {det: 1.0, pose2d: 1.2, pose_z: 0.0, pose_vis: 0.3}
+  C_pose25d:
+    epochs: 80
+    data: {COCO_WholeBody: 35, 3DPW: 22, AGORA: 25, H3WB_optional: 8, OCHuman: 6, CrowdHuman: 2, WIDER_FACE: 2}
+    train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
+    loss: {det: 0.8, pose2d: 1.0, pose_z: 0.7, pose_vis: 0.3, bone: 0.1}
+    augment: {mosaic: 0.0, mixup: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
+  C_pose25d_no_H3WB:
+    data: {COCO_WholeBody: 35, 3DPW: 25, AGORA: 30, OCHuman: 6, CrowdHuman: 2, WIDER_FACE: 2}
+  D_person_mask:
+    epochs: 70
+    data: {COCO_person_mask: 38, OCHuman: 18, COCO_WholeBody: 14, 3DPW: 8, AGORA: 10, H3WB_optional: 4, LVIS: 5, CrowdHuman: 3}
+    train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: true, scene_seg_head: false}
+    loss: {det: 1.0, pose2d: 0.8, pose_z: 0.4, person_mask: 1.0, bone: 0.05}
+  E_scene_seg:
+    epochs: 70
+    data: {ADE20K: 12, COCO_WholeBody: 22, COCO_person_mask: 14, OCHuman: 8, 3DPW: 10, AGORA: 10, H3WB_optional: 4, LVIS: 12, CrowdHuman: 5, WIDER_FACE: 3}
+    train: {all: true}
+    loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, person_mask: 0.8, scene_seg: 0.3}
+    fallback_if_det_drops: {ADE20K: "6-8", scene_seg: 0.2}
+  F_full_finetune:
+    epochs: 50
+    default_imgsz: [448, 768]
+    multi_scale: false
+    data: {LVIS: 15, CrowdHuman: 10, WIDER_FACE: 8, COCO_WholeBody: 22, 3DPW: 14, AGORA: 14, H3WB_optional: 6, COCO_person_mask: 7, OCHuman: 4, ADE20K: "0-2"}
+    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, scale: [0.9, 1.1], flip: 0.5}
+    loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, pose_vis: 0.3, bone: 0.1, person_mask: 0.7, scene_seg: 0.2}
+  F_full_finetune_pose_heavy:
+    data: {LVIS: 12, CrowdHuman: 8, WIDER_FACE: 6, COCO_WholeBody: 24, 3DPW: 18, AGORA: 18, H3WB_optional: 6, COCO_person_mask: 5, OCHuman: 3, ADE20K: 0}
+
+sampling_final:
+  LVIS: 15
+  CrowdHuman: 10
+  WIDER_FACE: 8
+  COCO_WholeBody: 22
+  3DPW: 14
+  AGORA: 14
+  H3WB_optional: 6
+  COCO_person_mask: 7
+  OCHuman: 4
+  ADE20K: "0-2"
+
+sampling_final_no_H3WB:
+  LVIS: 15
+  CrowdHuman: 10
+  WIDER_FACE: 8
+  COCO_WholeBody: 22
+  3DPW: 18
+  AGORA: 18
+  COCO_person_mask: 6
+  OCHuman: 3
+  ADE20K: "0-2"
+
+augmentation:
+  det_aug: {mosaic: 0.7, mixup: 0.1, copy_paste: 0.1, scale: [0.5, 1.5], hsv: true, blur: 0.05}
+  pose_mask_aug: {mosaic: 0.1, mixup: 0.0, scale: [0.7, 1.3], rotate: [-10, 10], flip: 0.5}
+  pose25d_aug: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
+  agora_aug: {mosaic: 0.0, mixup: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5, occlusion_aug: mild}
+  scene_aug: {random_crop: true, scale: [0.5, 2.0], flip: 0.5, color_jitter: true}
+
+optimizer_batch:
+  prefer_native_yolo26_optimizer_scheduler: true
+  recommended:
+    batch_per_gpu: 20
+    accumulate: 4
+    effective_batch: 80
+
+total_epochs: 400
