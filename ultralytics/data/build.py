@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
-from torch.utils.data import Dataset, dataloader, distributed
+from torch.utils.data import Dataset, WeightedRandomSampler, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
 from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
@@ -29,7 +29,7 @@ from ultralytics.data.loaders import (
     autocast_list,
 )
 from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
-from ultralytics.utils import RANK, colorstr
+from ultralytics.utils import LOGGER, RANK, colorstr
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.torch_utils import TORCH_2_0
 
@@ -110,6 +110,50 @@ class _RepeatSampler:
         """Iterate over the sampler indefinitely, yielding its contents."""
         while True:
             yield from iter(self.sampler)
+
+
+def _path_source(path: str, weights: dict[str, float]) -> str:
+    normalized = str(path).replace("\\", "/").lower()
+    segments = normalized.split("/")
+    for source in weights:
+        if source in segments or any(source in segment for segment in segments):
+            return source
+    return ""
+
+
+def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], samples_per_epoch: int) -> WeightedRandomSampler:
+    """Create a weighted replacement sampler from source names embedded in dataset image paths."""
+    if samples_per_epoch <= 0:
+        raise ValueError(f"samples_per_epoch must be positive, got {samples_per_epoch}.")
+    if not weights:
+        raise ValueError("sampling_weights must be set for weighted_random_with_replacement sampling.")
+    im_files = getattr(dataset, "im_files", None)
+    if not im_files:
+        raise ValueError("weighted_random_with_replacement requires a dataset with im_files.")
+    weights = {str(k).lower(): float(v) for k, v in weights.items()}
+    counts = {source: 0 for source in weights}
+    sources = []
+    for path in im_files:
+        source = _path_source(path, weights)
+        sources.append(source)
+        if source in counts:
+            counts[source] += 1
+    sample_weights = []
+    for source in sources:
+        count = counts.get(source, 0)
+        sample_weights.append(weights.get(source, 0.0) / count if count else 0.0)
+    if not any(sample_weights):
+        raise ValueError("Could not match sampling_weights to any dataset image path segments.")
+    LOGGER.info(
+        "Weighted replacement sampler: "
+        + ", ".join(f"{source}={counts[source]} images, weight={weights[source]:g}" for source in weights)
+        + f", samples_per_epoch={samples_per_epoch}"
+    )
+    return WeightedRandomSampler(
+        torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=samples_per_epoch,
+        replacement=True,
+    )
 
 
 class ContiguousDistributedSampler(torch.utils.data.Sampler):
@@ -292,6 +336,9 @@ def build_dataloader(
     rank: int = -1,
     drop_last: bool = False,
     pin_memory: bool = True,
+    sampling: str | None = None,
+    samples_per_epoch: int | None = None,
+    sampling_weights: dict[str, float] | None = None,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -315,13 +362,19 @@ def build_dataloader(
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
+    if sampling == "weighted_random_with_replacement":
+        if rank != -1:
+            raise NotImplementedError("weighted_random_with_replacement is currently implemented for single-GPU only.")
+        sampler = weighted_replacement_sampler(dataset, sampling_weights or {}, int(samples_per_epoch or 0))
+        shuffle = False
+    else:
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
     return InfiniteDataLoader(

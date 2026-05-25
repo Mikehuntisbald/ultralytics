@@ -65,6 +65,25 @@ The loader accepts both legacy YOLO labels and unified JSON records. Task flags 
 The unified multi-task loss gates every term by flags. Images with `has_det=false` are skipped by detector loss and are
 not treated as background negatives.
 
+## Stage Sampling
+
+Every stage uses the same sampler contract:
+
+```yaml
+epochs: 15
+samples_per_epoch: 40000
+sampling: weighted_random_with_replacement
+sampling_weights: {lvis: 55, crowdhuman: 25, wider_face: 20}
+```
+
+`samples_per_epoch` controls the epoch length. With weighted replacement sampling, each step first samples a source by
+`sampling_weights`, then draws a random image from that source. The implementation maps this onto PyTorch
+`WeightedRandomSampler` by giving each image weight `source_weight / source_image_count`, matched from source names in
+image path segments.
+
+Stages should only change three things: data sampling weights, trainable branches, and task loss weights. The dataloader
+and unified loss stay shared across Stage A-F.
+
 ## Stage A Data
 
 Stage A uses:
@@ -117,26 +136,29 @@ loss:
   scene_seg: 0.0
 ```
 
-Stable RTX 5090 32GB parameters found by probe:
+Stable RTX 5090 32GB parameters found by weighted-replacement probe:
 
 ```bash
 python tools/train_yolo26ps_stage_a.py \
+  --epochs 15 \
+  --samples-per-epoch 40000 \
   --imgsz 704 \
-  --batch 8 \
-  --accumulate 10 \
+  --batch 7 \
+  --accumulate 12 \
   --workers 8 \
-  --epochs 50 \
   --no-val \
   --device 0 \
-  --name yolo26ps_stage_a_detection_704_b8_acc10
+  --name yolo26ps_stage_a_detection_704_b7_acc12_spe40000
 ```
 
-This gives an effective batch of 80. `--no-val` is recommended for the long Stage A run; run a separate validation pass
-from the saved checkpoint when the 50-epoch warmup finishes. Probe results:
+This gives an effective batch of 84. `--samples-per-epoch` uses weighted random sampling with replacement from the
+Stage A dataset weights instead of sequentially traversing each dataset. `--no-val` is recommended for the long Stage A
+run; run a separate validation pass from the saved checkpoint when the warmup finishes. Probe results:
 
 - `imgsz=768, batch=8` reached about 27.8 GB but repeatedly fell back to CPU in `TaskAlignedAssigner`.
 - `imgsz=768, batch=7` reached about 27.5 GB in PyTorch and about 31.3 GB in `nvidia-smi` without fallback, but ran at about 1.0 it/s.
-- `imgsz=704, batch=8` reached about 26.2 GB in PyTorch and about 29.8 GB in `nvidia-smi` without fallback, with about 2.4 it/s in the 1% probe.
+- `imgsz=704, batch=7` with `samples_per_epoch=40000` reached about 28.2 GB in PyTorch, avoided assigner CPU fallback over the probe, and ran around 2.1-2.2 it/s after warmup.
+- `imgsz=704, batch=8` reached about 29.5 GB in `nvidia-smi` and high GPU utilization, but hit `TaskAlignedAssigner` CPU fallback on dense batches.
 - `imgsz=704, batch=9` repeatedly fell back to CPU in `TaskAlignedAssigner`.
 - `imgsz=640, batch=10` completed without fallback, but did not improve throughput enough to offset the lower small-object resolution.
 - `imgsz=768, batch=8`, `imgsz=768, batch=16`, and `imgsz=768, batch=32` OOM or fell back in the assigner.
@@ -146,10 +168,10 @@ For quick smoke or VRAM probes:
 ```bash
 python tools/train_yolo26ps_stage_a.py \
   --imgsz 704 \
-  --batch 8 \
-  --accumulate 10 \
+  --batch 7 \
+  --accumulate 12 \
   --epochs 1 \
-  --fraction 0.01 \
+  --samples-per-epoch 70 \
   --no-val \
   --no-save \
   --device 0 \

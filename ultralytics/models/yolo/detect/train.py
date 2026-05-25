@@ -104,6 +104,9 @@ class DetectionTrainer(BaseTrainer):
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",
+            sampling=self.args.sampling if mode == "train" else None,
+            samples_per_epoch=self.args.samples_per_epoch if mode == "train" else None,
+            sampling_weights=self.args.sampling_weights if mode == "train" else None,
         )
 
     def preprocess_batch(self, batch: dict) -> dict:
