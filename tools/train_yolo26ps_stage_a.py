@@ -93,6 +93,12 @@ class YOLO26PSStageATrainer(DetectionTrainer):
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
 
+    def validate(self):
+        """Skip epoch validation when val=False; upstream still validates on the final epoch by default."""
+        if not self.args.val:
+            return {}, 0.0
+        return super().validate()
+
     def final_eval(self):
         """Skip final validation for short VRAM probes when val=False."""
         if not self.args.val:
@@ -111,17 +117,17 @@ def parse_args() -> argparse.Namespace:
         "--imgsz",
         type=int,
         nargs="+",
-        default=[768],
+        default=[704],
         help=(
             "training image size. One value keeps square training; two values are parsed but current Ultralytics "
             "training coerces train/val imgsz back to one square dimension."
         ),
     )
-    parser.add_argument("--batch", type=int, default=20)
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument(
         "--accumulate",
         type=int,
-        default=4,
+        default=10,
         help="target gradient accumulation; mapped to Ultralytics nbs=batch*accumulate",
     )
     parser.add_argument("--device", default=None)
@@ -179,6 +185,7 @@ def main() -> None:
         fraction=args.fraction,
         val=not args.no_val,
         save=not args.no_save,
+        plots=not args.no_val,
     )
     if args.device is not None:
         overrides["device"] = args.device

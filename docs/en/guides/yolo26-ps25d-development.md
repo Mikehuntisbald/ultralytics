@@ -121,28 +121,33 @@ Stable RTX 5090 32GB parameters found by probe:
 
 ```bash
 python tools/train_yolo26ps_stage_a.py \
-  --imgsz 768 \
-  --batch 7 \
-  --accumulate 12 \
+  --imgsz 704 \
+  --batch 8 \
+  --accumulate 10 \
   --workers 8 \
   --epochs 50 \
+  --no-val \
   --device 0 \
-  --name yolo26ps_stage_a_detection_b7_acc12
+  --name yolo26ps_stage_a_detection_704_b8_acc10
 ```
 
-This gives an effective batch of 84. Probe results:
+This gives an effective batch of 80. `--no-val` is recommended for the long Stage A run; run a separate validation pass
+from the saved checkpoint when the 50-epoch warmup finishes. Probe results:
 
-- `batch=8` reached about 27.8 GB but repeatedly fell back to CPU in `TaskAlignedAssigner`.
-- `batch=7` reached about 27.2 GB and completed the probe training steps without assigner OOM fallback.
-- `batch=32` and `batch=16` OOM at square `imgsz=768`.
+- `imgsz=768, batch=8` reached about 27.8 GB but repeatedly fell back to CPU in `TaskAlignedAssigner`.
+- `imgsz=768, batch=7` reached about 27.5 GB in PyTorch and about 31.3 GB in `nvidia-smi` without fallback, but ran at about 1.0 it/s.
+- `imgsz=704, batch=8` reached about 26.2 GB in PyTorch and about 29.8 GB in `nvidia-smi` without fallback, with about 2.4 it/s in the 1% probe.
+- `imgsz=704, batch=9` repeatedly fell back to CPU in `TaskAlignedAssigner`.
+- `imgsz=640, batch=10` completed without fallback, but did not improve throughput enough to offset the lower small-object resolution.
+- `imgsz=768, batch=8`, `imgsz=768, batch=16`, and `imgsz=768, batch=32` OOM or fell back in the assigner.
 
 For quick smoke or VRAM probes:
 
 ```bash
 python tools/train_yolo26ps_stage_a.py \
-  --imgsz 768 \
-  --batch 7 \
-  --accumulate 12 \
+  --imgsz 704 \
+  --batch 8 \
+  --accumulate 10 \
   --epochs 1 \
   --fraction 0.01 \
   --no-val \
@@ -150,4 +155,3 @@ python tools/train_yolo26ps_stage_a.py \
   --device 0 \
   --name yolo26ps_stage_a_probe
 ```
-
