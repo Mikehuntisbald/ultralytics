@@ -27,6 +27,7 @@ __all__ = (
     "Pose",
     "RTDETRDecoder",
     "Segment",
+    "SemanticSegment",
     "YOLO26PSDetect25D",
     "YOLOEDetect",
     "YOLOESegment",
@@ -628,6 +629,35 @@ class YOLO26PSDetect25D(Detect):
     def fuse(self) -> None:
         """Remove one-to-many branches for fused end-to-end inference."""
         self.cv2 = self.cv3 = self.cv4 = self.cv5 = None
+
+
+class SemanticSegment(nn.Module):
+    """YOLO semantic segmentation head for per-pixel classification."""
+
+    export = False
+    format = None
+
+    def __init__(self, nc=19, ch=()):
+        """Initialize the semantic segmentation head."""
+        super().__init__()
+        self.nc = nc
+        self.nl = len(ch)
+        self.stride = torch.zeros(self.nl)
+
+        c_mid = ch[0]
+        self.classifier = nn.Sequential(Conv(c_mid, c_mid, 3), nn.Conv2d(c_mid, nc, 1))
+        self.aux_head = nn.Sequential(Conv(ch[1], c_mid, 3), nn.Conv2d(c_mid, nc, 1)) if len(ch) > 1 else None
+
+    def forward(self, x):
+        """Forward pass: predict dense per-pixel class logits."""
+        logits = self.classifier(x[0])
+        if self.training:
+            if self.aux_head is not None:
+                return logits, self.aux_head(x[1])
+            return logits
+        if self.export and self.format != "coreml":
+            return F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)
+        return logits
 
 
 class OBB(Detect):

@@ -51,6 +51,8 @@
 
 请参阅下文了解快速安装和使用示例。有关训练、验证、预测和部署的全面指南，请参阅我们的完整 [Ultralytics 文档](https://docs.ultralytics.com/)。
 
+此工作空间还补充了 YOLO26s-PS-2.5D 的多任务开发说明、输出契约和 Stage A 检测预热训练方案，见 [YOLO26s-PS-2.5D 开发文档](docs/en/guides/yolo26-ps25d-development.md)。
+
 <details open>
 <summary>安装</summary>
 

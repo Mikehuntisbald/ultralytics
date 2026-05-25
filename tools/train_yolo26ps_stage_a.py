@@ -93,6 +93,13 @@ class YOLO26PSStageATrainer(DetectionTrainer):
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
 
+    def final_eval(self):
+        """Skip final validation for short VRAM probes when val=False."""
+        if not self.args.val:
+            LOGGER.info("Skipping final validation because val=False.")
+            return
+        return super().final_eval()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,7 +107,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", type=Path, default=DATA_YAML)
     parser.add_argument("--model", type=Path, default=MODEL_YAML)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--imgsz", type=int, default=768)
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        nargs="+",
+        default=[768],
+        help=(
+            "training image size. One value keeps square training; two values are parsed but current Ultralytics "
+            "training coerces train/val imgsz back to one square dimension."
+        ),
+    )
     parser.add_argument("--batch", type=int, default=20)
     parser.add_argument(
         "--accumulate",
@@ -113,8 +129,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze", type=int, default=10, help="partial backbone freeze via Ultralytics freeze index")
     parser.add_argument("--project", type=Path, default=ROOT / "runs/detect")
     parser.add_argument("--name", default="yolo26ps_stage_a_detection")
+    parser.add_argument("--fraction", type=float, default=1.0, help="dataset fraction, useful for VRAM probes")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prepare", action="store_true", help="run Stage A data preparation before training")
+    parser.add_argument("--no-val", action="store_true", help="disable validation, useful for short VRAM probes")
+    parser.add_argument("--no-save", action="store_true", help="disable checkpoint saving, useful for short VRAM probes")
     parser.add_argument("--skip-crowdhuman-extract", action="store_true")
     return parser.parse_args()
 
@@ -138,10 +157,11 @@ def main() -> None:
     args = parse_args()
     maybe_prepare(args)
     model = YOLO(str(args.model))
+    imgsz = args.imgsz[0] if len(args.imgsz) == 1 else args.imgsz[:2]
     overrides = dict(
         data=str(args.data),
         epochs=args.epochs,
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         batch=args.batch,
         nbs=args.batch * args.accumulate,
         workers=args.workers,
@@ -156,6 +176,9 @@ def main() -> None:
         close_mosaic=0,
         patience=50,
         resume=args.resume,
+        fraction=args.fraction,
+        val=not args.no_val,
+        save=not args.no_save,
     )
     if args.device is not None:
         overrides["device"] = args.device

@@ -67,6 +67,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
+    SemanticSegment,
     TorchVision,
     WorldDetect,
     YOLO26PSDetect25D,
@@ -80,6 +81,7 @@ from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_req
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
+    SemanticSegmentationLoss,
     YOLO26PS25DE2ELoss,
     YOLO26PS25DLoss,
     v8ClassificationLoss,
@@ -582,6 +584,71 @@ class SegmentationModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
+
+
+class SemanticSegmentationModel(BaseModel):
+    """YOLO semantic segmentation model."""
+
+    def __init__(self, cfg="yolo26n-sem.yaml", ch=3, nc=None, verbose=True):
+        """Initialize the YOLO semantic segmentation model."""
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        self.yaml["channels"] = ch
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}
+        self.inplace = self.yaml.get("inplace", True)
+
+        m = self.model[-1]
+        if isinstance(m, SemanticSegment):
+            s = 256
+            self.model.eval()
+            m.training = True
+            min_h = [s]
+
+            def _record(_m, _inp, out, _h=min_h):
+                tensors = out if isinstance(out, (tuple, list)) else (out,)
+                for item in tensors:
+                    if isinstance(item, torch.Tensor) and item.ndim == 4:
+                        _h[0] = min(_h[0], item.shape[-2])
+
+            hooks = [layer.register_forward_hook(_record) for layer in self.model]
+            try:
+                self.forward(torch.zeros(1, ch, s, s))
+            finally:
+                for h in hooks:
+                    h.remove()
+            m.stride = torch.tensor([s / min_h[0]], dtype=torch.float32)
+            self.stride = m.stride
+            self.model.train()
+        else:
+            self.stride = torch.Tensor([32])
+
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def init_criterion(self):
+        """Initialize the loss criterion for semantic segmentation."""
+        return SemanticSegmentationLoss(self)
+
+    def _apply(self, fn):
+        """Apply a function to all tensors in the model."""
+        self = super()._apply(fn)
+        m = self.model[-1]
+        if isinstance(m, SemanticSegment):
+            m.stride = fn(m.stride)
+        return self
 
 
 class PoseModel(DetectionModel):
@@ -1739,6 +1806,8 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }:
                 m.legacy = legacy
+        elif m is SemanticSegment:
+            args.append([ch[x] for x in f])
         elif m is v10Detect:
             args.append([ch[x] for x in f])
         elif m is ImagePoolingAttn:

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils.metrics import OKS_SIGMA, RLE_WEIGHT
+from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
@@ -1446,6 +1447,91 @@ class YOLO26PS25DE2ELoss:
     def decay(self, updates: int) -> float:
         """Return decayed one-to-many weight."""
         return self.final_o2m + (self.o2m_copy - self.final_o2m) * math.exp(-updates / 2000)
+
+
+class SemanticSegmentationLoss(nn.Module):
+    """Loss function for semantic segmentation using cross-entropy and Dice terms."""
+
+    def __init__(self, model: torch.nn.Module):
+        """Initialize semantic segmentation loss."""
+        super().__init__()
+        m = model.model[-1]
+        self.nc = m.nc
+        self.device = next(model.parameters()).device
+        self.dtype = next(model.parameters()).dtype
+        data_name = Path(str(getattr(model.args, "data", "") or "")).stem.lower()
+        self.use_cityscapes_weight = data_name in {"cityscapes", "cityscapes8"} and self.nc == len(CITYSCAPES_WEIGHT)
+        if self.nc == 1:
+            self.ce = nn.BCEWithLogitsLoss()
+        else:
+            self.ce = nn.CrossEntropyLoss(ignore_index=255).to(device=self.device, dtype=self.dtype)
+            if self.use_cityscapes_weight:
+                weight = torch.from_numpy(CITYSCAPES_WEIGHT).to(device=self.device, dtype=self.dtype)
+                self.ce.register_buffer("weight", weight, persistent=False)
+
+    def _ce_loss(self, preds, masks):
+        """Compute cross-entropy on flattened pixels to avoid the CUDA nll_loss2d path."""
+        if self.nc == 1:
+            flat = masks.reshape(-1)
+            valid = flat != 255
+            logits = preds.reshape(-1)[valid]
+            target = flat[valid].float()
+        else:
+            logits = preds.permute(0, 2, 3, 1).reshape(-1, self.nc)
+            target = masks.reshape(-1).long()
+        return self.ce(logits, target)
+
+    def _dice_loss(self, preds, masks):
+        """Compute Dice loss excluding ignore pixels."""
+        if self.nc == 1:
+            return self._binary_dice_loss(preds, masks)
+        flat_target = masks.reshape(-1)
+        valid = flat_target != 255
+        if not valid.any():
+            return preds.sum() * 0
+
+        pred_soft = F.softmax(preds, dim=1)
+        target = flat_target[valid].long()
+        flat_pred = pred_soft.float().permute(0, 2, 3, 1).reshape(-1, self.nc)[valid]
+        intersection = torch.zeros(self.nc, device=preds.device, dtype=torch.float32)
+        intersection.scatter_add_(0, target, flat_pred.gather(1, target[:, None]).squeeze(1))
+        pred_sum = flat_pred.sum(dim=0)
+        target_sum = torch.bincount(target, minlength=self.nc).to(device=preds.device, dtype=torch.float32)
+        cardinality = pred_sum + target_sum
+        return (1.0 - (2.0 * intersection + 1.0) / (cardinality + 1.0)).mean()
+
+    def _binary_dice_loss(self, preds, masks):
+        """Compute Dice loss for single-class binary segmentation."""
+        valid = (masks != 255).float()
+        pred_soft = preds.squeeze(1).sigmoid()
+        target = (masks == 1).float()
+        intersection = (pred_soft * target * valid).sum()
+        cardinality = ((pred_soft + target) * valid).sum()
+        return 1.0 - (2.0 * intersection + 1.0) / (cardinality + 1.0)
+
+    def forward(self, preds, batch):
+        """Compute semantic segmentation loss with optional auxiliary loss."""
+        aux_logits = None
+        if isinstance(preds, tuple):
+            preds, aux_logits = preds
+
+        masks = batch["semantic_mask"].to(preds.device)
+        if preds.shape[2:] != masks.shape[1:]:
+            preds = F.interpolate(preds, size=masks.shape[1:], mode="bilinear", align_corners=False)
+
+        ce_loss = self._ce_loss(preds, masks)
+        dice_loss = self._dice_loss(preds, masks)
+        total = ce_loss + dice_loss
+
+        aux_loss = torch.tensor(0.0, device=preds.device, dtype=ce_loss.dtype)
+        if aux_logits is not None:
+            if aux_logits.shape[2:] != masks.shape[1:]:
+                aux_logits = F.interpolate(aux_logits, size=masks.shape[1:], mode="bilinear", align_corners=False)
+            aux_loss = self._ce_loss(aux_logits, masks) * 0.4
+            total += aux_loss
+
+        loss_items = torch.stack([ce_loss, dice_loss, aux_loss]).detach()
+        return total * preds.shape[0], loss_items
 
 
 class v8ClassificationLoss:

@@ -25,6 +25,7 @@ from .augment import (
     Format,
     LetterBox,
     RandomLoadText,
+    SemanticFormat,
     classify_augmentations,
     classify_transforms,
     v8_transforms,
@@ -37,9 +38,11 @@ from .utils import (
     get_hash,
     img2label_paths,
     load_dataset_cache_file,
+    polygons2masks_overlap,
     save_dataset_cache_file,
     verify_image,
     verify_image_label,
+    verify_image_mask,
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
@@ -990,13 +993,194 @@ class YOLOConcatDataset(ConcatDataset):
             dataset.close_mosaic(hyp)
 
 
-# TODO: support semantic segmentation
-class SemanticDataset(BaseDataset):
-    """Semantic Segmentation Dataset."""
+class SemanticDataset(YOLODataset):
+    """Dataset for semantic segmentation with PNG mask labels."""
 
-    def __init__(self):
-        """Initialize a SemanticDataset object."""
-        super().__init__()
+    def __init__(self, *args, data: dict | None = None, **kwargs):
+        """Initialize SemanticDataset."""
+        self.data = data or {}
+        self.label_mapping = self._parse_label_mapping(self.data.get("label_mapping"))
+        self.mask_files = []
+        super().__init__(*args, data=data, **kwargs)
+
+    def _parse_label_mapping(self, mapping):
+        """Normalize label_mapping entries from dataset YAML into integer-to-integer ids."""
+        if mapping is None:
+            return {}
+        if not isinstance(mapping, dict):
+            raise TypeError(f"Expected 'label_mapping' to be a dict in dataset YAML, but got {type(mapping).__name__}.")
+
+        normalized = {}
+        for src, dst in mapping.items():
+            src = int(src)
+            if isinstance(dst, str):
+                dst = dst.strip()
+                dst = 255 if dst == "ignore_label" else int(dst)
+            elif dst is None:
+                dst = 255
+            else:
+                dst = int(dst)
+            normalized[src] = dst
+        return normalized
+
+    def _semantic_cache_hash(self, mask_files: list[str]) -> str:
+        """Return a hash for semantic cache validation that also includes label_mapping changes."""
+        mapping = json.dumps(self.label_mapping, sort_keys=True, separators=(",", ":"))
+        return get_hash(self.im_files + mask_files + [f"label_mapping:{mapping}"])
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
+        """Cache semantic labels and image-mask pairing metadata."""
+        x = {"labels": []}
+        nm, nf, nc, msgs = 0, 0, 0, []
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        total = len(self.im_files)
+
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(
+                func=verify_image_mask,
+                iterable=zip(self.im_files, self.mask_files, repeat(self.prefix)),
+            )
+            pbar = TQDM(results, desc=desc, total=total)
+            for im_file, mask_file, shape, nm_f, nf_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                nc += nc_f
+                if im_file:
+                    x["labels"].append(
+                        {
+                            "im_file": im_file,
+                            "mask_file": mask_file,
+                            "shape": shape,
+                            "cls": np.array([], dtype=np.float32),
+                            "bboxes": np.zeros((0, 4), dtype=np.float32),
+                            "segments": [],
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
+                    )
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm} missing masks, {nc} corrupt"
+            pbar.close()
+        x["hash"] = self._semantic_cache_hash(self.mask_files)
+        x["results"] = nf, nm, nc, total
+        x["msgs"] = msgs
+        if x["labels"]:
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self):
+        """Load semantic labels from cache or scan image-mask paths."""
+        self.mask_files = img2label_paths(self.im_files, label_dir=self.data.get("masks_dir", "masks"), suffix=".png")
+        cache_path = Path(self.mask_files[0]).parent.with_suffix(".cache")
+
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache["hash"] == self._semantic_cache_hash(self.mask_files)
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_labels(cache_path), False
+
+        nf, nm, nc, n = cache.pop("results")
+        if exists and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path}... {nf} masks, {nm} missing, {nc} corrupt"
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)
+            if cache["msgs"]:
+                LOGGER.info("\n".join(cache["msgs"]))
+
+        [cache.pop(k) for k in ("hash", "version", "msgs")]
+        labels = cache["labels"]
+        if not labels:
+            raise RuntimeError(f"No valid images found in {cache_path}. {HELP_URL}")
+        self.im_files = [lb["im_file"] for lb in labels]
+        self.mask_files = [lb["mask_file"] for lb in labels]
+        return labels
+
+    def load_image(self, i, rect_mode=True):
+        """Load an image for semantic segmentation, scaling the short side to imgsz when rect_mode=True."""
+        return super().load_image(i, rect_mode=rect_mode, resize_short=self.augment)
+
+    def load_mask(self, index: int, image_shape: tuple[int, int] | None = None) -> np.ndarray:
+        """Load a semantic mask and apply optional dataset label mapping."""
+        mask_file = self.labels[index]["mask_file"]
+        mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Semantic mask not found or unreadable: {mask_file}")
+        if mask.ndim == 3 and mask.shape[2] == 1:
+            mask = np.squeeze(mask, axis=2)
+        if int(self.data.get("nc", 0)) == 1:
+            with Image.open(mask_file) as im:
+                if im.mode == "1":
+                    mask[mask == 255] = 1
+        if self.label_mapping:
+            mask = self.convert_label(mask, inverse=False)
+        return mask.astype(np.uint8, copy=False)
+
+    def build_transforms(self, hyp=None):
+        """Build transforms for semantic segmentation."""
+        transforms = super().build_transforms(hyp)
+        transforms[-1] = SemanticFormat()
+        return transforms
+
+    def convert_label(self, label, inverse=False):
+        """Convert label values using the dataset's label mapping."""
+        temp = label.copy()
+        if inverse:
+            for v, k in self.label_mapping.items():
+                label[temp == k] = v
+        else:
+            for k, v in self.label_mapping.items():
+                label[temp == k] = v
+        return label
+
+    def get_image_and_label(self, index):
+        """Get image, label and semantic mask for the given index."""
+        label = super().get_image_and_label(index)
+        h, w = label["img"].shape[:2]
+        mask = self.load_mask(index, image_shape=(h, w))
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        label["semantic_mask"] = mask
+        return label
+
+
+class PolygonSemanticDataset(SemanticDataset, YOLODataset):
+    """Semantic segmentation dataset that rasterizes YOLO polygon labels into masks on the fly."""
+
+    def __init__(self, *args, data: dict | None = None, **kwargs):
+        """Initialize PolygonSemanticDataset."""
+        nc = (data or {}).get("nc") or len((data or {}).get("names", {}))
+        self.bg_class_idx = data.get("bg_class_idx", max(int(nc) - 1, 0))
+        super().__init__(*args, data=data, **kwargs)
+
+    def get_labels(self):
+        """Parse YOLO polygon .txt labels."""
+        return YOLODataset.get_labels(self)
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
+        """Cache polygon labels via YOLODataset to keep the expected cache format."""
+        return YOLODataset.cache_labels(self, path)
+
+    def load_mask(self, index: int, image_shape: tuple[int, int] | None = None) -> np.ndarray:
+        """Rasterize this image's polygons into a semantic mask."""
+        h, w = image_shape
+        label = self.labels[index]
+        cls = label.get("cls")
+        segments = label.get("segments") or []
+        if cls is None or len(cls) == 0 or len(segments) == 0:
+            return np.full((h, w), self.bg_class_idx, dtype=np.uint8)
+
+        scale = np.array([w, h], dtype=np.float32)
+        polys = [np.asarray(s, dtype=np.float32).reshape(-1, 2) * scale for s in segments]
+        inst, sorted_idx = polygons2masks_overlap((h, w), polys, downsample_ratio=1)
+        out = np.full((h, w), self.bg_class_idx, dtype=np.uint8)
+        fg = inst > 0
+        if int(self.data.get("nc", 0)) == 1:
+            out[fg] = 1
+        else:
+            cls_arr = np.asarray(cls).reshape(-1).astype(np.int32)[sorted_idx]
+            out[fg] = cls_arr[inst[fg] - 1].astype(np.uint8)
+        return out
 
 
 class ClassificationDataset:

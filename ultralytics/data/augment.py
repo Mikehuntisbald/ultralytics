@@ -2384,6 +2384,26 @@ class Format(BaseTransform):
         return masks, instances, cls
 
 
+class SemanticFormat(Format):
+    """Format transform for semantic segmentation that converts images and masks to tensors."""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Format image and semantic mask for semantic segmentation."""
+        img = labels.pop("img", None)
+        if img is not None:
+            labels["img"] = self._format_img(img)
+        mask = labels.get("semantic_mask")
+        if mask is not None:
+            labels["semantic_mask"] = torch.from_numpy(mask.copy()).to(torch.int32)
+        return labels
+
+    def apply_instances(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Remove instance-level keys not needed for semantic segmentation."""
+        for k in ("cls", "instances", "resized_shape", "ori_shape", "ratio_pad"):
+            labels.pop(k, None)
+        return labels
+
+
 class LoadVisualPrompt(BaseTransform):
     """Create visual prompts from bounding boxes or masks for model input."""
 

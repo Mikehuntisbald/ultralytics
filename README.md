@@ -51,6 +51,8 @@ Request an Enterprise License for commercial use at [Ultralytics Licensing](http
 
 See below for quickstart installation and usage examples. For comprehensive guidance on training, validation, prediction, and deployment, refer to our full [Ultralytics Docs](https://docs.ultralytics.com/).
 
+This workspace also includes the YOLO26s-PS-2.5D multi-task development notes, output contract, and Stage A detection warmup recipe in [YOLO26s-PS-2.5D Development Notes](docs/en/guides/yolo26-ps25d-development.md).
+
 <details open>
 <summary>Install</summary>
 
