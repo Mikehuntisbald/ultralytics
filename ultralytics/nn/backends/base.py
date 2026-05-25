@@ -20,7 +20,8 @@ class BaseBackend(ABC):
         device (torch.device): The device to run inference on.
         fp16 (bool): Whether to use FP16 (half-precision) inference.
         nhwc (bool): Whether the model expects NHWC input format instead of NCHW.
-        stride (int): Model stride, typically 32 for YOLO models.
+        stride (int): Model detection stride, typically 32 for YOLO models.
+        input_stride (int): Preprocessing stride used for letterbox padding and image-size checks.
         names (dict): Dictionary mapping class indices to class names.
         task (str | None): The task type (detect, segment, classify, pose, obb).
         batch (int): Batch size for inference.
@@ -43,6 +44,7 @@ class BaseBackend(ABC):
         self.fp16 = fp16
         self.nhwc = False
         self.stride = 32
+        self.input_stride = 32
         self.names = {}
         self.task = None
         self.batch = 1
@@ -97,7 +99,7 @@ class BaseBackend(ABC):
 
         # Process type conversions for known fields
         for k, v in metadata.items():
-            if k in {"stride", "batch", "channels"}:
+            if k in {"stride", "input_stride", "batch", "channels"}:
                 metadata[k] = int(v)
             elif k in {"imgsz", "names", "kpt_shape", "kpt_names", "args", "end2end"} and isinstance(v, str):
                 metadata[k] = ast.literal_eval(v)

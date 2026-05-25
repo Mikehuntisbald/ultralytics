@@ -27,7 +27,7 @@ __all__ = (
     "Pose",
     "RTDETRDecoder",
     "Segment",
-    "SemanticSegment",
+    "YOLO26PSDetect25D",
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
@@ -423,6 +423,211 @@ class Segment26(Segment):
         super().fuse()
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
+
+
+class YOLO26PSDetect25D(Detect):
+    """YOLO26 person-scene multi-task head.
+
+    The head shares YOLO26 detection predictions with dense 2.5D body keypoints, person mask coefficients/prototypes,
+    and ADE20K-style scene semantic logits. During training it returns raw dense maps for positive assignment. During
+    inference/export it returns the deployment contract:
+    ``det_out, body25d_out, mask_coef, mask_proto, scene_seg`` where body25d is ``x_norm, y_norm, z_norm, conf``.
+    """
+
+    def __init__(
+        self,
+        nc: int = 1205,
+        kpt_shape: tuple = (17, 4),
+        nm: int = 32,
+        fusion_channels: int = 192,
+        scene_nc: int = 150,
+        person_cls: int = -2,
+        reg_max=1,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize detection, 2.5D pose, person mask, and scene segmentation branches."""
+        super().__init__(nc, reg_max, end2end, ch)
+        self.kpt_shape = list(kpt_shape)
+        self.nk = self.kpt_shape[0] * self.kpt_shape[1]
+        self.nm = nm
+        self.scene_nc = scene_nc
+        self.person_cls = nc + person_cls if person_cls < 0 else person_cls
+        self.fusion_channels = fusion_channels
+        self.input_stride = 32
+        self.output_stride = 4
+        self.z_normalization = "bbox_height"
+        self.loss_names = (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+            "pose2d_loss",
+            "pose_z_loss",
+            "pose_vis_loss",
+            "bone_loss",
+            "person_mask_loss",
+            "scene_seg_loss",
+        )
+
+        c_pose = max(ch[0] // 4, self.nk)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3), nn.Conv2d(c_pose, self.nk, 1)) for x in ch
+        )
+
+        c_mask = max(ch[0] // 4, self.nm)
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c_mask, 3), Conv(c_mask, c_mask, 3), nn.Conv2d(c_mask, self.nm, 1)) for x in ch
+        )
+
+        self.p2_refine = nn.ModuleList(Conv(x, ch[0], 1) for x in ch[1:])
+        self.proto = nn.Sequential(
+            Conv(ch[0], fusion_channels, 3),
+            Conv(fusion_channels, fusion_channels, 3),
+            nn.Conv2d(fusion_channels, self.nm, 1),
+        )
+        self.scene_seg = nn.Sequential(
+            Conv(ch[0], fusion_channels, 3),
+            Conv(fusion_channels, fusion_channels, 3),
+            nn.Conv2d(fusion_channels, self.scene_nc, 1),
+        )
+
+        if end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv5 = copy.deepcopy(self.cv5)
+
+    @property
+    def one2many(self):
+        """Return one-to-many branch heads."""
+        return dict(box_head=self.cv2, cls_head=self.cv3, pose_head=self.cv4, mask_head=self.cv5)
+
+    @property
+    def one2one(self):
+        """Return one-to-one branch heads."""
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            pose_head=self.one2one_cv4,
+            mask_head=self.one2one_cv5,
+        )
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        pose_head: torch.nn.Module,
+        mask_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Concatenate raw detection, pose, and mask coefficient maps across P2-P5."""
+        preds = super().forward_head(x, box_head, cls_head)
+        bs = x[0].shape[0]
+        if pose_head is not None:
+            preds["pose25d"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
+        if mask_head is not None:
+            preds["mask_coefficient"] = torch.cat(
+                [mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+            )
+        return preds
+
+    def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | tuple:
+        """Run the multi-task head and return raw training maps or deployment tensors."""
+        p2 = self._fuse_p2_features(x)
+        proto = self.proto(p2)
+        scene_seg = self.scene_seg(p2)
+
+        preds = self.forward_head(x, **self.one2many)
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
+            preds = {
+                "one2many": preds,
+                "one2one": self.forward_head(x_detach, **self.one2one),
+            }
+            preds["one2many"]["proto"] = proto
+            preds["one2many"]["scene_seg"] = scene_seg
+            preds["one2one"]["proto"] = proto.detach()
+            preds["one2one"]["scene_seg"] = scene_seg.detach()
+        else:
+            preds["proto"] = proto
+            preds["scene_seg"] = scene_seg
+
+        if self.training:
+            return preds
+
+        raw = preds["one2one"] if self.end2end else preds
+        deploy = self._deploy_outputs(raw, proto, scene_seg)
+        return deploy if self.export else (deploy, preds)
+
+    def _fuse_p2_features(self, x: list[torch.Tensor]) -> torch.Tensor:
+        """Fuse P3-P5 into P2 resolution for stride-4 mask prototypes and scene logits."""
+        feat = x[0]
+        for i, refine in enumerate(self.p2_refine):
+            up_feat = F.interpolate(refine(x[i + 1]), size=feat.shape[2:], mode="nearest")
+            feat = feat + up_feat
+        return feat
+
+    def _get_decode_xyxy(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes to dynamic image-space xyxy coordinates."""
+        shape = preds["feats"][0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(preds["feats"], self.stride, 0.5))
+            self.shape = shape
+        return dist2bbox(self.dfl(preds["boxes"]), self.anchors.unsqueeze(0), xywh=False, dim=1) * self.strides
+
+    def _deploy_outputs(
+        self, preds: dict[str, torch.Tensor], proto: torch.Tensor, scene_seg: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode and top-k gather all task outputs for deployment."""
+        boxes = self._get_decode_xyxy(preds).permute(0, 2, 1)
+        scores = preds["scores"].sigmoid().permute(0, 2, 1)
+        pose25d = self.pose_decode(preds["pose25d"])
+        mask_coef = preds["mask_coefficient"].permute(0, 2, 1)
+
+        score, cls, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        pose25d = pose25d.gather(dim=1, index=idx.view(idx.shape[0], idx.shape[1], 1, 1).repeat(1, 1, *self.kpt_shape))
+        pose25d = self.normalize_pose25d(pose25d, boxes)
+        mask_coef = mask_coef.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+
+        if self.person_cls >= 0:
+            person = (cls == float(self.person_cls)).to(mask_coef.dtype)
+            pose25d = pose25d * person.view(person.shape[0], person.shape[1], 1, 1)
+            mask_coef = mask_coef * person
+
+        det_out = torch.cat([boxes, score, cls], dim=-1)
+        return det_out, pose25d, mask_coef, proto, scene_seg
+
+    def pose_decode(self, pose25d: torch.Tensor) -> torch.Tensor:
+        """Decode dense body keypoints to image-space x/y, relative z, and confidence."""
+        bs = pose25d.shape[0]
+        pose25d = pose25d.view(bs, self.kpt_shape[0], self.kpt_shape[1], -1)
+        xy = (pose25d[:, :, 0:2] + self.anchors) * self.strides
+        z_rel = pose25d[:, :, 2:3]
+        conf = pose25d[:, :, 3:4].sigmoid()
+        return torch.cat((xy, z_rel, conf), 2).permute(0, 3, 1, 2).contiguous()
+
+    def normalize_pose25d(self, pose25d: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+        """Convert decoded keypoints to bbox-normalized x/y/z plus confidence."""
+        x1, y1, x2, y2 = boxes.unsqueeze(2).split(1, dim=-1)
+        box_w = (x2 - x1).clamp(min=1.0)
+        box_h = (y2 - y1).clamp(min=1.0)
+        x_norm = (pose25d[..., 0:1] - x1) / box_w
+        y_norm = (pose25d[..., 1:2] - y1) / box_h
+        z_scale = self.pose_z_scale(pose25d, box_h)
+        z_norm = pose25d[..., 2:3] / z_scale
+        conf = pose25d[..., 3:4]
+        return torch.cat((x_norm, y_norm, z_norm, conf), dim=-1)
+
+    def pose_z_scale(self, pose25d: torch.Tensor, box_h: torch.Tensor) -> torch.Tensor:
+        """Return bbox-height or torso-length scale for root-relative z normalization."""
+        if self.z_normalization == "torso_length":
+            shoulder = (pose25d[..., 5:6, 0:2] + pose25d[..., 6:7, 0:2]) * 0.5
+            pelvis = (pose25d[..., 11:12, 0:2] + pose25d[..., 12:13, 0:2]) * 0.5
+            return (shoulder - pelvis).norm(dim=-1, keepdim=True).clamp(min=1.0)
+        return box_h
+
+    def fuse(self) -> None:
+        """Remove one-to-many branches for fused end-to-end inference."""
+        self.cv2 = self.cv3 = self.cv4 = self.cv5 = None
 
 
 class OBB(Detect):
@@ -1403,7 +1608,7 @@ class YOLOESegment26(YOLOESegment):
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
         outputs = YOLOEDetect.forward(self, x)
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
-        proto = self.proto([xi.detach() for xi in x], return_semantic=False)  # mask protos
+        proto = self.proto([xi.detach() for xi in x], return_semseg=False)  # mask protos
 
         if isinstance(preds, dict):  # training and validating during training
             if self.end2end and not hasattr(self, "lrpc"):  # not prompt-free
@@ -1807,61 +2012,3 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
-
-
-class SemanticSegment(nn.Module):
-    """YOLO semantic segmentation head for per-pixel classification.
-
-    This head produces dense per-pixel class predictions. Unlike instance segmentation, no bounding boxes or instance
-    masks are produced.
-
-    Attributes:
-        nc (int): Number of semantic classes.
-        nl (int): Number of input feature levels.
-        stride (torch.Tensor): Feature map strides.
-        export (bool): Export mode flag.
-        format (str): Export format.
-        classifier (nn.Sequential): Final convolutional classifier head.
-        aux_head (nn.Sequential | None): Auxiliary classifier on P4 for deep supervision.
-    """
-
-    export = False  # export mode
-    format = None  # export format
-
-    def __init__(self, nc=19, ch=()):
-        """Initialize the semantic segmentation head.
-
-        Args:
-            nc (int): Number of semantic classes.
-            ch (tuple): Tuple of channel sizes from neck feature maps (P3, P4).
-        """
-        super().__init__()
-        self.nc = nc
-        self.nl = len(ch)
-        self.stride = torch.zeros(self.nl)
-
-        c_mid = ch[0]  # use P3 channel width as intermediate dimension
-        # Final classifier
-        self.classifier = nn.Sequential(Conv(c_mid, c_mid, 3), nn.Conv2d(c_mid, nc, 1))
-        # Auxiliary head on P4 (index 1) for training
-        self.aux_head = nn.Sequential(Conv(ch[1], c_mid, 3), nn.Conv2d(c_mid, nc, 1)) if len(ch) > 1 else None
-
-    def forward(self, x):
-        """Forward pass: fuse multi-scale features and predict per-pixel classes.
-
-        Args:
-            x (list[torch.Tensor]): List of feature maps [P3, P4].
-
-        Returns:
-            (torch.Tensor): Logits of shape [B, nc, H/8, W/8] during training, inference, and CoreML export. Other
-                export formats return upsampled logits of shape [B, nc, H, W].
-        """
-        # Classify
-        logits = self.classifier(x[0])  # [B, nc, H/8, W/8]
-        if self.training:
-            if self.aux_head is not None:
-                return logits, self.aux_head(x[1])  # main + aux (P4)
-            return logits
-        if self.export and self.format != "coreml":  # coreml does not support interpolate
-            return F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)
-        return logits

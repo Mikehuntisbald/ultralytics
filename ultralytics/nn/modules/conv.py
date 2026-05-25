@@ -12,6 +12,7 @@ import torch.nn as nn
 __all__ = (
     "CBAM",
     "ChannelAttention",
+    "AlignConcat",
     "Concat",
     "Conv",
     "Conv2",
@@ -638,6 +639,16 @@ class Concat(nn.Module):
         Returns:
             (torch.Tensor): Concatenated tensor.
         """
+        return torch.cat(x, self.d)
+
+
+class AlignConcat(Concat):
+    """Concatenate tensors after nearest-neighbor alignment to the smallest spatial size."""
+
+    def forward(self, x: list[torch.Tensor]):
+        """Resize BCHW tensors to a shared H/W before concatenation."""
+        size = (min(xi.shape[2] for xi in x), min(xi.shape[3] for xi in x))
+        x = [xi if xi.shape[2:] == size else nn.functional.interpolate(xi, size=size, mode="nearest") for xi in x]
         return torch.cat(x, self.d)
 
 

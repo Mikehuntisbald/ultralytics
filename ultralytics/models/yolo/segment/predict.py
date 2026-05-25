@@ -78,12 +78,13 @@ class SegmentationPredictor(DetectionPredictor):
             (list[Results]): List of result objects containing the original images, image paths, class names, bounding
                 boxes, and masks.
         """
+        ratio_pads = getattr(self, "batch_ratio_pad", None) or [None] * len(preds)
         return [
-            self.construct_result(pred, img, orig_img, img_path, proto)
-            for pred, orig_img, img_path, proto in zip(preds, orig_imgs, self.batch[0], protos)
+            self.construct_result(pred, img, orig_img, img_path, proto, ratio_pad)
+            for pred, orig_img, img_path, proto, ratio_pad in zip(preds, orig_imgs, self.batch[0], protos, ratio_pads)
         ]
 
-    def construct_result(self, pred, img, orig_img, img_path, proto):
+    def construct_result(self, pred, img, orig_img, img_path, proto, ratio_pad=None):
         """Construct a single result object from the prediction.
 
         Args:
@@ -92,6 +93,7 @@ class SegmentationPredictor(DetectionPredictor):
             orig_img (np.ndarray): The original image before preprocessing.
             img_path (str): The path to the original image.
             proto (torch.Tensor): The prototype masks.
+            ratio_pad (tuple, optional): Dynamic letterbox ratio and padding for this image.
 
         Returns:
             (Results): Result object containing the original image, image path, class names, bounding boxes, and masks.
@@ -99,11 +101,11 @@ class SegmentationPredictor(DetectionPredictor):
         if pred.shape[0] == 0:  # save empty boxes
             masks = None
         elif self.args.retina_masks:
-            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape, ratio_pad=ratio_pad)
             masks = ops.process_mask_native(proto, pred[:, 6:], pred[:, :4], orig_img.shape[:2])  # NHW
         else:
             masks = ops.process_mask(proto, pred[:, 6:], pred[:, :4], img.shape[2:], upsample=True)  # NHW
-            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape, ratio_pad=ratio_pad)
         if masks is not None:
             keep = masks.amax((-2, -1)) > 0  # only keep predictions with masks
             if not all(keep):  # most predictions have masks

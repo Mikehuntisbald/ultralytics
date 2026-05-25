@@ -51,6 +51,10 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
+        if isinstance(preds, (list, tuple)) and isinstance(preds[0], tuple) and len(preds[0]) == 5:
+            preds = preds[0][0]  # YOLO26 PS-2.5D deploy tuple: det_out, pose, mask coeff, proto, scene seg
+        elif isinstance(preds, (list, tuple)) and len(preds) == 5:
+            preds = preds[0]
         preds = nms.non_max_suppression(
             preds,
             self.args.conf,
@@ -101,12 +105,13 @@ class DetectionPredictor(BasePredictor):
         Returns:
             (list[Results]): List of Results objects containing detection information for each image.
         """
+        ratio_pads = getattr(self, "batch_ratio_pad", None) or [None] * len(preds)
         return [
-            self.construct_result(pred, img, orig_img, img_path)
-            for pred, orig_img, img_path in zip(preds, orig_imgs, self.batch[0])
+            self.construct_result(pred, img, orig_img, img_path, ratio_pad)
+            for pred, orig_img, img_path, ratio_pad in zip(preds, orig_imgs, self.batch[0], ratio_pads)
         ]
 
-    def construct_result(self, pred, img, orig_img, img_path):
+    def construct_result(self, pred, img, orig_img, img_path, ratio_pad=None):
         """Construct a single Results object from one image prediction.
 
         Args:
@@ -114,9 +119,10 @@ class DetectionPredictor(BasePredictor):
             img (torch.Tensor): Preprocessed image tensor used for inference.
             orig_img (np.ndarray): Original image before preprocessing.
             img_path (str): Path to the original image file.
+            ratio_pad (tuple, optional): Dynamic letterbox ratio and padding for this image.
 
         Returns:
             (Results): Results object containing the original image, image path, class names, and scaled bounding boxes.
         """
-        pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+        pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape, ratio_pad=ratio_pad)
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])

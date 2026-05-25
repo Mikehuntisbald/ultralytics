@@ -78,11 +78,11 @@ import torch
 
 from ultralytics import __version__
 from ultralytics.cfg import TASK2CALIBRATIONDATA, TASK2DATA, get_cfg
-from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data import build_dataloader
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
-from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder, Segment26, SemanticSegment
+from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder, Segment26, YOLO26PSDetect25D
 from ultralytics.nn.tasks import ClassificationModel, DetectionModel, SegmentationModel, WorldModel
 from ultralytics.utils import (
     ARM64,
@@ -369,7 +369,9 @@ class Exporter:
                 "half=True only compatible with GPU export for TorchScript, i.e. use device=0, setting half=False."
             )
             self.args.half = False
-        self.imgsz = check_imgsz(self.args.imgsz, stride=model.stride, min_dim=2)  # check image size
+        head = model.model[-1] if hasattr(model, "model") and len(model.model) else None
+        input_stride = getattr(head, "input_stride", model.stride)
+        self.imgsz = check_imgsz(self.args.imgsz, stride=input_stride, min_dim=2)  # check image size
         if self.args.optimize:
             assert fmt != "ncnn", "optimize=True not compatible with format='ncnn', i.e. use optimize=False"
             assert self.device.type == "cpu", "optimize=True not compatible with cuda devices, i.e. use device='cpu'"
@@ -384,9 +386,6 @@ class Exporter:
             assert self.args.name in RKNN_CHIPS, (
                 f"Invalid processor name '{self.args.name}' for Rockchip RKNN export. Valid names are {RKNN_CHIPS}."
             )
-        if self.args.nms and model.task == "semantic":
-            LOGGER.warning("'nms=True' is not valid for semantic segmentation models. Forcing 'nms=False'.")
-            self.args.nms = False
         if self.args.nms:
             assert not isinstance(model, ClassificationModel), "'nms=True' is not valid for classification models."
             assert fmt != "tflite" or not ARM64 or not LINUX, "TFLite export with NMS unsupported on ARM64 Linux"
@@ -461,9 +460,8 @@ class Exporter:
 
             model = executorch_wrapper(model)
         for m in model.modules():
-            if isinstance(m, (Classify, SemanticSegment)):
+            if isinstance(m, Classify):
                 m.export = True
-                m.format = self.args.format
             if isinstance(m, (Detect, RTDETRDecoder)):  # includes all Detect subclasses like Segment, Pose, OBB
                 m.dynamic = self.args.dynamic
                 m.export = True
@@ -506,6 +504,7 @@ class Exporter:
             "license": "AGPL-3.0 License (https://ultralytics.com/license)",
             "docs": "https://docs.ultralytics.com",
             "stride": int(max(model.stride)),
+            "input_stride": int(input_stride if isinstance(input_stride, int) else max(input_stride)),
             "task": model.task,
             "batch": self.args.batch,
             "imgsz": self.imgsz,
@@ -567,27 +566,15 @@ class Exporter:
         """Build and return a dataloader for calibration of INT8 models."""
         LOGGER.info(f"{prefix} collecting INT8 calibration images from 'data={self.args.data}'")
         data = (check_cls_dataset if self.model.task == "classify" else check_det_dataset)(self.args.data)
-        if self.model.task == "classify":
-            dataset = YOLODataset(
-                data[self.args.split or "val"],
-                data=data,
-                fraction=self.args.fraction,
-                task=self.model.task,
-                imgsz=max(self.imgsz),
-                augment=False,
-                batch_size=self.args.batch,
-            )
-        else:
-            cfg = deepcopy(self.args)
-            cfg.imgsz = max(self.imgsz)
-            dataset = build_yolo_dataset(
-                cfg,
-                data[self.args.split or "val"],
-                self.args.batch,
-                data,
-                mode="val",
-                fraction=self.args.fraction,
-            )
+        dataset = YOLODataset(
+            data[self.args.split or "val"],
+            data=data,
+            fraction=self.args.fraction,
+            task=self.model.task,
+            imgsz=max(self.imgsz),
+            augment=False,
+            batch_size=self.args.batch,
+        )
         if hasattr(dataset.transforms.transforms[0], "new_shape"):
             dataset.transforms.transforms[0].new_shape = self.imgsz  # LetterBox with non-square imgsz
         n = len(dataset)
@@ -635,17 +622,26 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        if isinstance(self.model.model[-1], YOLO26PSDetect25D):
+            output_names = [f"output{i}" for i in range(5)]
+        else:
+            output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
             if isinstance(self.model, SegmentationModel):
                 dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 116, 8400)
                 dynamic["output1"] = {0: "batch", 2: "mask_height", 3: "mask_width"}  # shape(1,32,160,160)
+            elif isinstance(self.model.model[-1], YOLO26PSDetect25D):
+                dynamic["output0"] = {0: "batch", 1: "detections"}
+                dynamic["output1"] = {0: "batch", 1: "detections"}
+                dynamic["output2"] = {0: "batch", 1: "detections"}
+                dynamic["output3"] = {0: "batch", 2: "mask_height", 3: "mask_width"}
+                dynamic["output4"] = {0: "batch", 2: "mask_height", 3: "mask_width"}
             elif isinstance(self.model, DetectionModel):
                 dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 84, 8400)
             if self.args.nms:  # only batch size is dynamic with NMS
-                dynamic["output0"].pop(2)
+                dynamic["output0"].pop(2, None)
         if self.args.nms and self.model.task == "obb":
             self.args.opset = opset  # for NMSModel
             self.args.simplify = True  # fix OBB runtime error related to topk

@@ -162,6 +162,7 @@ class BaseValidator:
             model = model.half() if self.args.half else model.float()
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            self.stride = getattr(trainer, "stride", max(int(unwrap_model(model).stride.max()), 32))
             model.eval()
         else:
             if str(self.args.model).endswith(".yaml") and model is None:
@@ -183,7 +184,7 @@ class BaseValidator:
             )
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
-            stride, fmt = model.stride, model.format
+            stride, fmt = getattr(model, "input_stride", model.stride), model.format
             pt = fmt == "pt"
             imgsz = check_imgsz(self.args.imgsz, stride=stride)
             if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
@@ -201,7 +202,7 @@ class BaseValidator:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
             if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
-            self.stride = model.stride  # used in get_dataloader() for padding
+            self.stride = stride  # used in get_dataloader() for padding
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()

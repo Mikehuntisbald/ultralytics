@@ -73,7 +73,9 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (Dataset): YOLO dataset object configured for the specified mode.
         """
-        gs = max(int(unwrap_model(self.model).stride.max()), 32)
+        model = unwrap_model(self.model)
+        head = model.model[-1] if hasattr(model, "model") and len(model.model) else None
+        gs = int(getattr(head, "input_stride", max(int(model.stride.max()), 32)))
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
@@ -145,7 +147,7 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
-        if getattr(self.model, "end2end", False):
+        if getattr(self.model, "end2end"):
             self.model.set_head_attr(max_det=self.args.max_det)
 
     def set_class_weights(self):
@@ -185,7 +187,7 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        self.loss_names = getattr(unwrap_model(self.model).model[-1], "loss_names", ("box_loss", "cls_loss", "dfl_loss"))
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

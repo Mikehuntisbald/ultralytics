@@ -137,6 +137,7 @@ class BasePredictor:
         self.imgsz = None
         self.device = None
         self.dataset = None
+        self.batch_ratio_pad = None
         self.vid_writer = {}  # dict of {save_path: video_writer, ...}
         self.plotted_img = None
         self.source_type = None
@@ -160,6 +161,7 @@ class BasePredictor:
             (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
         """
         not_tensor = not isinstance(im, torch.Tensor)
+        self.batch_ratio_pad = None
         if not_tensor:
             im = np.stack(self.pre_transform(im))
             if im.shape[-1] == 3:
@@ -193,14 +195,23 @@ class BasePredictor:
             (list[np.ndarray]): List of transformed images.
         """
         same_shapes = len({x.shape for x in im}) == 1
+        input_stride = getattr(self.model, "input_stride", self.model.stride)
         letterbox = LetterBox(
             self.imgsz,
             auto=same_shapes
             and self.args.rect
             and (self.model.format == "pt" or (getattr(self.model, "dynamic", False) and self.model.format != "imx")),
-            stride=self.model.stride,
+            stride=input_stride,
         )
-        return [letterbox(image=x) for x in im]
+        transformed = []
+        self.batch_ratio_pad = []
+        for x in im:
+            labels = {"img": x}
+            params = letterbox.get_params(labels)
+            labels = letterbox.apply_image(labels, params)
+            self.batch_ratio_pad.append((params["ratio"], (params["left"], params["top"])))
+            transformed.append(labels["img"])
+        return transformed
 
     def postprocess(self, preds, img, orig_imgs):
         """Post-process predictions for an image and return them."""
@@ -254,7 +265,8 @@ class BasePredictor:
                 inference.
             stride (int, optional): Model stride for image size checking.
         """
-        self.imgsz = check_imgsz(self.args.imgsz, stride=stride or self.model.stride, min_dim=2)  # check image size
+        input_stride = getattr(self.model, "input_stride", self.model.stride)
+        self.imgsz = check_imgsz(self.args.imgsz, stride=stride or input_stride, min_dim=2)  # check image size
         self.dataset = load_inference_source(
             source=source,
             batch=self.args.batch,

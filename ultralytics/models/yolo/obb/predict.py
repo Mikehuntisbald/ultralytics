@@ -38,7 +38,7 @@ class OBBPredictor(DetectionPredictor):
         super().__init__(cfg, overrides, _callbacks)
         self.args.task = "obb"
 
-    def construct_result(self, pred, img, orig_img, img_path):
+    def construct_result(self, pred, img, orig_img, img_path, ratio_pad=None):
         """Construct the result object from the prediction.
 
         Args:
@@ -47,12 +47,13 @@ class OBBPredictor(DetectionPredictor):
             img (torch.Tensor): The image after preprocessing with shape (B, C, H, W).
             orig_img (np.ndarray): The original image before preprocessing.
             img_path (str): The path to the original image.
+            ratio_pad (tuple, optional): Dynamic letterbox ratio and padding for this image.
 
         Returns:
             (Results): The result object containing the original image, image path, class names, and oriented bounding
                 boxes.
         """
         rboxes = torch.cat([pred[:, :4], pred[:, -1:]], dim=-1)
-        rboxes[:, :4] = ops.scale_boxes(img.shape[2:], rboxes[:, :4], orig_img.shape, xywh=True)
+        rboxes[:, :4] = ops.scale_boxes(img.shape[2:], rboxes[:, :4], orig_img.shape, ratio_pad=ratio_pad, xywh=True)
         obb = torch.cat([rboxes, pred[:, 4:6]], dim=-1)
         return Results(orig_img, path=img_path, names=self.model.names, obb=obb)

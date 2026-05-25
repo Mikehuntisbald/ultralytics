@@ -13,6 +13,7 @@ import torch.nn as nn
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
+    AlignConcat,
     C1,
     C2,
     C2PSA,
@@ -66,9 +67,9 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
-    SemanticSegment,
     TorchVision,
     WorldDetect,
+    YOLO26PSDetect25D,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
@@ -79,7 +80,8 @@ from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_req
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
-    SemanticSegmentationLoss,
+    YOLO26PS25DE2ELoss,
+    YOLO26PS25DLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -341,25 +343,6 @@ class BaseModel(torch.nn.Module):
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
 
-def _initialize_yolo_model(model, cfg, ch, nc, verbose):
-    """Initialize common YOLO model attributes from a YAML config."""
-    model.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
-    if model.yaml["backbone"][0][2] == "Silence":
-        LOGGER.warning(
-            "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
-            "Please delete local *.pt file and re-download the latest model checkpoint."
-        )
-        model.yaml["backbone"][0][2] = "nn.Identity"
-
-    model.yaml["channels"] = ch  # save channels
-    if nc and nc != model.yaml["nc"]:
-        LOGGER.info(f"Overriding model.yaml nc={model.yaml['nc']} with nc={nc}")
-        model.yaml["nc"] = nc  # override YAML value
-    model.model, model.save = parse_model(deepcopy(model.yaml), ch=ch, verbose=verbose)  # model, savelist
-    model.names = {i: f"{i}" for i in range(model.yaml["nc"])}  # default names dict
-    model.inplace = model.yaml.get("inplace", True)
-
-
 class DetectionModel(BaseModel):
     """YOLO detection model.
 
@@ -398,7 +381,22 @@ class DetectionModel(BaseModel):
             verbose (bool): Whether to display model information.
         """
         super().__init__()
-        _initialize_yolo_model(self, cfg, ch, nc, verbose)
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        if self.yaml["backbone"][0][2] == "Silence":
+            LOGGER.warning(
+                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
+                "Please delete local *.pt file and re-download the latest model checkpoint."
+            )
+            self.yaml["backbone"][0][2] = "nn.Identity"
+
+        # Define model
+        self.yaml["channels"] = ch  # save channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -517,6 +515,8 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        if isinstance(self.model[-1], YOLO26PSDetect25D):
+            return YOLO26PS25DE2ELoss(self) if getattr(self, "end2end", False) else YOLO26PS25DLoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
@@ -582,78 +582,6 @@ class SegmentationModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
-
-
-class SemanticSegmentationModel(BaseModel):
-    """YOLO semantic segmentation model.
-
-    This class implements a semantic segmentation model that produces per-pixel class predictions. Unlike
-    SegmentationModel (instance segmentation), this does not produce bounding boxes.
-
-    Methods:
-        __init__: Initialize the semantic segmentation model.
-        init_criterion: Initialize the loss criterion for semantic segmentation.
-
-    Examples:
-        Initialize a semantic segmentation model
-        >>> model = SemanticSegmentationModel("yolo26n-sem.yaml", ch=3, nc=19)
-    """
-
-    def __init__(self, cfg="yolo26n-sem.yaml", ch=3, nc=None, verbose=True):
-        """Initialize the YOLO semantic segmentation model.
-
-        Args:
-            cfg (str | dict): Model configuration file path or dictionary.
-            ch (int): Number of input channels.
-            nc (int, optional): Number of classes.
-            verbose (bool): Whether to display model information.
-        """
-        super().__init__()
-        _initialize_yolo_model(self, cfg, ch, nc, verbose)
-
-        # Build strides: track smallest spatial size across all layers to find the deepest
-        # backbone stride (e.g. P5/32). Head input alone is insufficient: the FPN upsamples
-        # P5 away before the head, but the encoder still requires inputs aligned to that
-        # deepest stride or FPN concats fail on rounding mismatches.
-        m = self.model[-1]
-        if isinstance(m, SemanticSegment):
-            s = 256
-            self.model.eval()
-            m.training = True  # get training output (stride-4)
-            min_h = [s]
-
-            def _record(_m, _inp, out, _h=min_h):
-                if isinstance(out, torch.Tensor) and out.ndim == 4:
-                    _h[0] = min(_h[0], out.shape[-2])
-
-            hooks = [layer.register_forward_hook(_record) for layer in self.model]
-            try:
-                self.forward(torch.zeros(1, ch, s, s))
-            finally:
-                for h in hooks:
-                    h.remove()
-            m.stride = torch.tensor([s / min_h[0]], dtype=torch.float32)  # e.g., 256/8 = 32
-            self.stride = m.stride
-            self.model.train()
-        else:
-            self.stride = torch.Tensor([32])
-
-        initialize_weights(self)
-        if verbose:
-            self.info()
-            LOGGER.info("")
-
-    def init_criterion(self):
-        """Initialize the loss criterion for semantic segmentation."""
-        return SemanticSegmentationLoss(self)
-
-    def _apply(self, fn):
-        """Apply a function to all tensors in the model."""
-        self = super()._apply(fn)
-        m = self.model[-1]
-        if isinstance(m, SemanticSegment):
-            m.stride = fn(m.stride)
-        return self
 
 
 class PoseModel(DetectionModel):
@@ -1776,7 +1704,7 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
-        elif m is Concat:
+        elif m in frozenset({Concat, AlignConcat}):
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
             {
@@ -1785,6 +1713,7 @@ def parse_model(d, ch, verbose=True):
                 YOLOEDetect,
                 Segment,
                 Segment26,
+                YOLO26PSDetect25D,
                 YOLOESegment,
                 YOLOESegment26,
                 Pose,
@@ -1796,10 +1725,20 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLO26PSDetect25D,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
-        elif m is SemanticSegment:
-            args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:
             args.append([ch[x] for x in f])
         elif m is ImagePoolingAttn:
@@ -1878,7 +1817,7 @@ def guess_model_task(model):
         model (torch.nn.Module | dict | str | Path): PyTorch model, model configuration dict, or model file path.
 
     Returns:
-        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb', 'semantic').
+        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb').
     """
 
     def cfg2task(cfg):
@@ -1888,8 +1827,8 @@ def guess_model_task(model):
             return "classify"
         if "detect" in m:
             return "detect"
-        if "semanticsegment" in m:
-            return "semantic"
+        if "psdetect" in m:
+            return "detect"
         if "segment" in m:
             return "segment"
         if "pose" in m:
@@ -1910,9 +1849,7 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))  # nosec B307: safe eval of known attribute paths
         for m in model.modules():
-            if isinstance(m, SemanticSegment):
-                return "semantic"
-            elif isinstance(m, (Segment, YOLOESegment)):
+            if isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
             elif isinstance(m, Classify):
                 return "classify"
@@ -1926,9 +1863,7 @@ def guess_model_task(model):
     # Guess from model filename
     if isinstance(model, (str, Path)):
         model = Path(model)
-        if "-sem" in model.stem or "semantic" in model.parts:
-            return "semantic"
-        elif "-seg" in model.stem or "segment" in model.parts:
+        if "-seg" in model.stem or "segment" in model.parts:
             return "segment"
         elif "-cls" in model.stem or "classify" in model.parts:
             return "classify"
