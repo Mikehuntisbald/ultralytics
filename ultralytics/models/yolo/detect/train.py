@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data.base import img_size_hw
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
@@ -124,10 +125,12 @@ class DetectionTrainer(BaseTrainer):
         batch["img"] = batch["img"].float() / 255
         if self.args.multi_scale > 0.0:
             imgs = batch["img"]
+            base_h, base_w = img_size_hw(self.args.imgsz)
+            base = max(base_h, base_w)
             sz = (
                 random.randrange(
-                    max(self.stride, int(self.args.imgsz * (1.0 - self.args.multi_scale))),  # min imgsz
-                    int(self.args.imgsz * (1.0 + self.args.multi_scale) + self.stride),  # max imgsz
+                    max(self.stride, int(base * (1.0 - self.args.multi_scale))),  # min imgsz
+                    int(base * (1.0 + self.args.multi_scale) + self.stride),  # max imgsz
                 )
                 // self.stride
                 * self.stride

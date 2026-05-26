@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 from torch.nn import functional as F
 
+from ultralytics.data.base import img_size_hw
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr
 from ultralytics.utils.checks import check_version
@@ -487,7 +488,7 @@ class Mosaic(BaseMixTransform):
         >>> augmented_labels = mosaic_aug(original_labels)
     """
 
-    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4):
+    def __init__(self, dataset, imgsz: int | list[int] | tuple[int, int] = 640, p: float = 1.0, n: int = 4):
         """Initialize the Mosaic augmentation object.
 
         This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image. The
@@ -502,8 +503,8 @@ class Mosaic(BaseMixTransform):
         assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
         assert n in {4, 9}, "grid must be equal to 4 or 9."
         super().__init__(dataset=dataset, p=p)
-        self.imgsz = imgsz
-        self.border = (-imgsz // 2, -imgsz // 2)  # width, height
+        self.imgsz = img_size_hw(imgsz)
+        self.border = (-self.imgsz[0] // 2, -self.imgsz[1] // 2)  # height, width
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
 
@@ -540,10 +541,11 @@ class Mosaic(BaseMixTransform):
         assert labels.get("rect_shape") is None, "rect and mosaic are mutually exclusive."
         assert len(labels.get("mix_labels", [])), "There are no other images for mosaic augment."
 
-        s = self.imgsz
+        h_out, w_out = self.imgsz
         layout = []
         if self.n == 4:
-            yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)
+            yc = int(random.uniform(-self.border[0], 2 * h_out + self.border[0]))
+            xc = int(random.uniform(-self.border[1], 2 * w_out + self.border[1]))
             for i in range(4):
                 labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
                 img = labels_patch["img"]
@@ -552,13 +554,13 @@ class Mosaic(BaseMixTransform):
                     x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
                     x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
                 elif i == 1:  # top right
-                    x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                    x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, w_out * 2), yc
                     x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
                 elif i == 2:  # bottom left
-                    x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                    x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(h_out * 2, yc + h)
                     x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
                 elif i == 3:  # bottom right
-                    x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                    x1a, y1a, x2a, y2a = xc, yc, min(xc + w, w_out * 2), min(h_out * 2, yc + h)
                     x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
                 padw = x1a - x1b
                 padh = y1a - y1b
@@ -586,24 +588,24 @@ class Mosaic(BaseMixTransform):
                 img = labels_patch["img"]
                 h, w = labels_patch.get("resized_shape", img.shape[:2])
                 if i == 0:  # center
-                    c = s, s, s + w, s + h
+                    c = w_out, h_out, w_out + w, h_out + h
                     h0, w0 = h, w
                 elif i == 1:  # top
-                    c = s, s - h, s + w, s
+                    c = w_out, h_out - h, w_out + w, h_out
                 elif i == 2:  # top right
-                    c = s + wp, s - h, s + wp + w, s
+                    c = w_out + wp, h_out - h, w_out + wp + w, h_out
                 elif i == 3:  # right
-                    c = s + w0, s, s + w0 + w, s + h
+                    c = w_out + w0, h_out, w_out + w0 + w, h_out + h
                 elif i == 4:  # bottom right
-                    c = s + w0, s + hp, s + w0 + w, s + hp + h
+                    c = w_out + w0, h_out + hp, w_out + w0 + w, h_out + hp + h
                 elif i == 5:  # bottom
-                    c = s + w0 - w, s + h0, s + w0, s + h0 + h
+                    c = w_out + w0 - w, h_out + h0, w_out + w0, h_out + h0 + h
                 elif i == 6:  # bottom left
-                    c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+                    c = w_out + w0 - wp - w, h_out + h0, w_out + w0 - wp, h_out + h0 + h
                 elif i == 7:  # left
-                    c = s - w, s + h0 - h, s, s + h0
+                    c = w_out - w, h_out + h0 - h, w_out, h_out + h0
                 elif i == 8:  # top left
-                    c = s - w, s + h0 - hp - h, s, s + h0 - hp
+                    c = w_out - w, h_out + h0 - hp - h, w_out, h_out + h0 - hp
                 padw, padh = c[:2]
                 x1, y1, x2, y2 = (max(x, 0) for x in c)
                 layout.append(
@@ -632,10 +634,10 @@ class Mosaic(BaseMixTransform):
         Returns:
             (dict): Updated labels with mosaic image.
         """
-        s = self.imgsz
+        h_out, w_out = self.imgsz
         layout = params["layout"]
         if self.n == 4:
-            img4 = np.full((s * 2, s * 2, labels["img"].shape[2]), 114, dtype=np.uint8)
+            img4 = np.full((h_out * 2, w_out * 2, labels["img"].shape[2]), 114, dtype=np.uint8)
             for item in layout:
                 labels_patch = item["labels_patch"]
                 img = labels_patch["img"]
@@ -644,7 +646,7 @@ class Mosaic(BaseMixTransform):
                 img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
             labels["img"] = img4
         elif self.n == 9:
-            img9 = np.full((s * 3, s * 3, labels["img"].shape[2]), 114, dtype=np.uint8)
+            img9 = np.full((h_out * 3, w_out * 3, labels["img"].shape[2]), 114, dtype=np.uint8)
             for item in layout:
                 labels_patch = item["labels_patch"]
                 img = labels_patch["img"]
@@ -671,8 +673,8 @@ class Mosaic(BaseMixTransform):
                 padw = item["padw"]
                 padh = item["padh"]
             else:  # n == 9
-                padw = item["padw"] + self.border[0]
-                padh = item["padh"] + self.border[1]
+                padw = item["padw"] + self.border[1]
+                padh = item["padh"] + self.border[0]
             labels_patch = self._update_labels(item["labels_patch"], padw, padh, item.get("img_shape"))
             mosaic_labels.append(labels_patch)
         final_labels = self._cat_labels(mosaic_labels)
@@ -737,7 +739,7 @@ class Mosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
-        imgsz = self.imgsz * 2  # mosaic imgsz
+        img_h, img_w = self.imgsz[0] * 2, self.imgsz[1] * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
@@ -745,12 +747,12 @@ class Mosaic(BaseMixTransform):
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
             "ori_shape": mosaic_labels[0]["ori_shape"],
-            "resized_shape": (imgsz, imgsz),
+            "resized_shape": (img_h, img_w),
             "cls": np.concatenate(cls, 0),
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
-        final_labels["instances"].clip(imgsz, imgsz)
+        final_labels["instances"].clip(img_w, img_h)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
         if "texts" in mosaic_labels[0]:
@@ -2637,7 +2639,7 @@ class RandomLoadText(BaseTransform):
         return labels
 
 
-def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bool = False):
+def v8_transforms(dataset, imgsz: int | list[int] | tuple[int, int], hyp: IterableSimpleNamespace, stretch: bool = False):
     """Apply a series of image transformations for training.
 
     This function creates a composition of image augmentation techniques to prepare images for YOLO training. It
@@ -2667,14 +2669,15 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         >>> hyp.augmentations = augmentations
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
-    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    imgsz_hw = img_size_hw(imgsz)
+    mosaic = Mosaic(dataset, imgsz=imgsz_hw, p=hyp.mosaic)
     affine = RandomPerspective(
         degrees=hyp.degrees,
         translate=hyp.translate,
         scale=hyp.scale,
         shear=hyp.shear,
         perspective=hyp.perspective,
-        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+        pre_transform=None if stretch else LetterBox(new_shape=imgsz_hw),
     )
 
     pre_transform = Compose([mosaic, affine])
@@ -2684,7 +2687,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         pre_transform.append(
             CopyPaste(
                 dataset,
-                pre_transform=Compose([Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic), affine]),
+                pre_transform=Compose([Mosaic(dataset, imgsz=imgsz_hw, p=hyp.mosaic), affine]),
                 p=hyp.copy_paste,
                 mode=hyp.copy_paste_mode,
             )

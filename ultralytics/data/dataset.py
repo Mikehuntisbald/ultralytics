@@ -30,7 +30,7 @@ from .augment import (
     classify_transforms,
     v8_transforms,
 )
-from .base import BaseDataset
+from .base import BaseDataset, img_size_hw
 from .converter import merge_multi_segment
 from .utils import (
     HELP_URL,
@@ -517,7 +517,7 @@ class YOLODataset(BaseDataset):
             hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
             transforms = v8_transforms(self, self.imgsz, hyp)
         else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+            transforms = Compose([LetterBox(new_shape=img_size_hw(self.imgsz), scaleup=False, stride=self.stride)])
         transforms.append(
             Format(
                 bbox_format="xywh",

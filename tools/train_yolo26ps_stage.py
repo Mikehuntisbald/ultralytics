@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import numpy as np
 import subprocess
 import sys
 from copy import copy
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
-from ultralytics.utils import LOGGER, YAML
+from ultralytics.utils import LOGGER, RANK, YAML
+from ultralytics.utils.metrics import DetMetrics
 from ultralytics.utils.torch_utils import unwrap_model
 
 
@@ -162,7 +165,7 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
 
 
 class YOLO26PSStageValidator(DetectionValidator):
-    """Validator that unwraps det-only deployment tuples before standard detection postprocess."""
+    """Validator that unwraps det-only outputs and records source-level stage metrics."""
 
     def postprocess(self, preds):
         while isinstance(preds, (list, tuple)) and preds:
@@ -170,6 +173,215 @@ class YOLO26PSStageValidator(DetectionValidator):
             if isinstance(preds, torch.Tensor):
                 break
         return super().postprocess(preds)
+
+    def init_metrics(self, model: torch.nn.Module) -> None:
+        super().init_metrics(model)
+        self.person_cls = int(self.data.get("person_cls", 0))
+        self.face_cls = int(self.data.get("face_cls", max(self.nc - 1, 0)))
+        self.stage_metric_buckets = {name: DetMetrics(names=self.names) for name in self._stage_bucket_names()}
+        self.stage_task_counts = {"pose2d": 0, "pose3d": 0, "person_mask": 0, "scene_seg": 0}
+
+    @staticmethod
+    def _stage_bucket_names() -> tuple[str, ...]:
+        return (
+            "objects365",
+            "objects365_person",
+            "crowdhuman_person",
+            "wider_face",
+            "small",
+        )
+
+    @staticmethod
+    def _source_name(im_file: str | Path) -> str:
+        parts = {p.lower() for p in Path(im_file).parts}
+        if "objects365" in parts:
+            return "objects365"
+        if "crowdhuman" in parts:
+            return "crowdhuman"
+        if "wider_face" in parts or "wider" in parts:
+            return "wider_face"
+        return "unknown"
+
+    def _bucket_update(
+        self,
+        name: str,
+        predn: dict[str, torch.Tensor],
+        pbatch: dict[str, Any],
+        class_id: int | None = None,
+        gt_mask: torch.Tensor | None = None,
+    ) -> None:
+        metric = self.stage_metric_buckets.get(name)
+        if metric is None:
+            return
+        bucket_batch = dict(pbatch)
+        if gt_mask is not None:
+            bucket_batch["cls"] = bucket_batch["cls"][gt_mask]
+            bucket_batch["bboxes"] = bucket_batch["bboxes"][gt_mask]
+        if class_id is not None:
+            class_mask = bucket_batch["cls"] == class_id
+            bucket_batch["cls"] = bucket_batch["cls"][class_mask]
+            bucket_batch["bboxes"] = bucket_batch["bboxes"][class_mask]
+            pred_mask = predn["cls"] == class_id
+            pred_eval = {**predn, "bboxes": predn["bboxes"][pred_mask], "conf": predn["conf"][pred_mask], "cls": predn["cls"][pred_mask]}
+        else:
+            pred_eval = predn
+
+        cls = bucket_batch["cls"].cpu().numpy()
+        no_pred = pred_eval["cls"].shape[0] == 0
+        metric.update_stats(
+            {
+                **self._process_batch(pred_eval, bucket_batch),
+                "target_cls": cls,
+                "target_img": np.unique(cls),
+                "conf": np.zeros(0) if no_pred else pred_eval["conf"].cpu().numpy(),
+                "pred_cls": np.zeros(0) if no_pred else pred_eval["cls"].cpu().numpy(),
+                "im_name": Path(bucket_batch["im_file"]).name,
+            }
+        )
+
+    def _update_stage_counts(self, batch: dict[str, Any], si: int) -> None:
+        for key, out_key in (
+            ("has_pose2d", "pose2d"),
+            ("has_pose3d", "pose3d"),
+            ("has_person_mask", "person_mask"),
+            ("has_scene_seg", "scene_seg"),
+        ):
+            value = batch.get(key)
+            if torch.is_tensor(value) and si < value.numel() and bool(value[si]):
+                self.stage_task_counts[out_key] += 1
+
+    def update_metrics(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
+        for si, pred in enumerate(preds):
+            self.seen += 1
+            self._update_stage_counts(batch, si)
+            if torch.is_tensor(batch.get("has_det")) and si < batch["has_det"].numel() and not bool(batch["has_det"][si]):
+                continue
+
+            pbatch = self._prepare_batch(si, batch)
+            predn = self._prepare_pred(pred)
+            cls = pbatch["cls"].cpu().numpy()
+            no_pred = predn["cls"].shape[0] == 0
+            stat = {
+                **self._process_batch(predn, pbatch),
+                "target_cls": cls,
+                "target_img": np.unique(cls),
+                "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
+                "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                "im_name": Path(pbatch["im_file"]).name,
+            }
+            self.metrics.update_stats(stat)
+
+            source = self._source_name(pbatch["im_file"])
+            if source == "objects365":
+                self._bucket_update("objects365", predn, pbatch)
+                self._bucket_update("objects365_person", predn, pbatch, class_id=self.person_cls)
+            elif source == "crowdhuman":
+                self._bucket_update("crowdhuman_person", predn, pbatch, class_id=self.person_cls)
+            elif source == "wider_face":
+                self._bucket_update("wider_face", predn, pbatch, class_id=self.face_cls)
+            if pbatch["bboxes"].numel():
+                boxes_scaled = self.scale_preds({"bboxes": pbatch["bboxes"].clone()}, pbatch)["bboxes"]
+                small = (boxes_scaled[:, 2] - boxes_scaled[:, 0]) * (boxes_scaled[:, 3] - boxes_scaled[:, 1]) < 32**2
+                if bool(small.any()):
+                    self._bucket_update("small", predn, pbatch, gt_mask=small)
+
+            if self.args.plots:
+                self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
+                if self.args.visualize:
+                    self.confusion_matrix.plot_matches(
+                        batch["img"][si],
+                        pbatch["im_file"],
+                        self.save_dir,
+                        self.args.show_labels,
+                        self.args.show_conf,
+                    )
+
+            if not no_pred and (self.args.save_json or self.args.save_txt):
+                predn_scaled = self.scale_preds(predn, pbatch)
+                if self.args.save_json:
+                    self.pred_to_json(predn_scaled, pbatch)
+                if self.args.save_txt:
+                    self.save_one_txt(
+                        predn_scaled,
+                        self.args.save_conf,
+                        pbatch["ori_shape"],
+                        self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
+                    )
+
+    def gather_stats(self) -> None:
+        super().gather_stats()
+        if RANK == 0:
+            for metric in self.stage_metric_buckets.values():
+                self._gather_stage_metric(metric)
+            self._gather_stage_counts()
+        elif RANK > 0:
+            for metric in self.stage_metric_buckets.values():
+                self._gather_stage_metric(metric)
+            self._gather_stage_counts()
+
+    @staticmethod
+    def _gather_stage_metric(metric: DetMetrics) -> None:
+        """Gather a stage metric bucket across DDP ranks."""
+        if RANK == 0:
+            gathered = [None] * dist.get_world_size()
+            dist.gather_object(metric.stats, gathered, dst=0)
+            merged = {key: [] for key in metric.stats.keys()}
+            for stats in gathered:
+                if not stats:
+                    continue
+                for key in merged:
+                    merged[key].extend(stats[key])
+            metric.stats = merged
+            metric.clear_image_metrics()
+        elif RANK > 0:
+            dist.gather_object(metric.stats, None, dst=0)
+            metric.clear_stats()
+            metric.clear_image_metrics()
+
+    def _gather_stage_counts(self) -> None:
+        """Gather per-task image counters across DDP ranks."""
+        if RANK == 0:
+            gathered = [None] * dist.get_world_size()
+            dist.gather_object(self.stage_task_counts, gathered, dst=0)
+            totals = {key: 0 for key in self.stage_task_counts}
+            for counts in gathered:
+                if not counts:
+                    continue
+                for key in totals:
+                    totals[key] += int(counts.get(key, 0))
+            self.stage_task_counts = totals
+        elif RANK > 0:
+            dist.gather_object(self.stage_task_counts, None, dst=0)
+
+    def get_stats(self) -> dict[str, Any]:
+        stats = super().get_stats()
+        stats.update(self._stage_results())
+        for name, count in self.stage_task_counts.items():
+            stats[f"metrics/stage/{name}_images"] = count
+        return stats
+
+    def _stage_results(self) -> dict[str, float]:
+        results = {}
+        prefix_map = {
+            "objects365": "metrics/stage_a/objects365",
+            "objects365_person": "metrics/stage_a/objects365/person",
+            "crowdhuman_person": "metrics/stage_a/crowdhuman/person",
+            "wider_face": "metrics/stage_a/wider_face/face",
+            "small": "metrics/stage_a/small",
+        }
+        for name, metric in self.stage_metric_buckets.items():
+            prefix = prefix_map[name]
+            has_stats = bool(metric.stats.get("target_cls")) and any(len(x) for x in metric.stats["target_cls"])
+            if has_stats:
+                metric.process(save_dir=self.save_dir / "stage_metrics" / name, plot=False, on_plot=self.on_plot)
+                results[f"{prefix}/mAP50(B)"] = float(metric.box.map50)
+                results[f"{prefix}/mAP50-95(B)"] = float(metric.box.map)
+                metric.clear_stats()
+                metric.clear_image_metrics()
+            else:
+                results[f"{prefix}/mAP50(B)"] = 0.0
+                results[f"{prefix}/mAP50-95(B)"] = 0.0
+        return results
 
 
 class YOLO26PSStageTrainer(DetectionTrainer):

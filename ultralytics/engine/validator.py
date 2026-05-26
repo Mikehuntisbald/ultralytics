@@ -51,6 +51,17 @@ from ultralytics.utils.torch_utils import (
 )
 
 
+def imgsz_hw(imgsz: int | list[int] | tuple[int, ...]) -> tuple[int, int]:
+    """Return image size as (height, width) while preserving square int behavior."""
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    if isinstance(imgsz, (list, tuple)):
+        if len(imgsz) == 1:
+            return int(imgsz[0]), int(imgsz[0])
+        return int(imgsz[0]), int(imgsz[1])
+    raise TypeError(f"imgsz must be int or [height, width], got {imgsz!r}")
+
+
 class BaseValidator:
     """A base class for creating validators.
 
@@ -133,7 +144,7 @@ class BaseValidator:
         (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
         if self.args.conf is None:
             self.args.conf = 0.01 if self.args.task == "obb" else 0.001  # reduce OBB val memory usage
-        self.args.imgsz = check_imgsz(self.args.imgsz, max_dim=1)
+        self.args.imgsz = check_imgsz(self.args.imgsz, max_dim=2)
 
         self.plots = {}
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
@@ -186,10 +197,13 @@ class BaseValidator:
             self.args.half = model.fp16  # update half
             stride, fmt = getattr(model, "input_stride", model.stride), model.format
             pt = fmt == "pt"
-            imgsz = check_imgsz(self.args.imgsz, stride=stride)
+            imgsz = check_imgsz(self.args.imgsz, stride=stride, min_dim=2, max_dim=2)
+            imgsz_h, imgsz_w = imgsz_hw(imgsz)
             if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
                 self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
-                LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
+                LOGGER.info(
+                    f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz_h}, {imgsz_w})"
+                )
 
             if str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"}:
                 self.data = check_det_dataset(self.args.data)
@@ -208,7 +222,7 @@ class BaseValidator:
             model.eval()
             if self.args.compile:
                 model = attempt_compile(model, device=self.device)
-            model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz, imgsz))  # warmup
+            model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz_h, imgsz_w))  # warmup
 
         self.run_callbacks("on_val_start")
         dt = (

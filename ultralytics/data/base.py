@@ -20,6 +20,18 @@ from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM
 from ultralytics.utils.patches import imread
 
 
+def img_size_hw(imgsz: int | list[int] | tuple[int, int]) -> tuple[int, int]:
+    """Normalize an integer or [height, width] image size to an (h, w) tuple."""
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    if isinstance(imgsz, (list, tuple)):
+        if len(imgsz) == 1:
+            return int(imgsz[0]), int(imgsz[0])
+        if len(imgsz) >= 2:
+            return int(imgsz[0]), int(imgsz[1])
+    raise TypeError(f"imgsz must be int or [height, width], got {imgsz!r}")
+
+
 class BaseDataset(Dataset):
     """Base dataset class for loading and processing image data.
 
@@ -108,6 +120,7 @@ class BaseDataset(Dataset):
         super().__init__()
         self.img_path = img_path
         self.imgsz = imgsz
+        self.imgsz_hw = img_size_hw(imgsz)
         self.augment = augment
         self.single_cls = single_cls
         self.prefix = prefix
@@ -243,13 +256,14 @@ class BaseDataset(Dataset):
                 raise FileNotFoundError(f"Image Not Found {f}")
 
             h0, w0 = im.shape[:2]  # orig hw
-            if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
-                r = self.imgsz / max(h0, w0)  # ratio
+            if rect_mode:  # resize to fit inside imgsz while maintaining aspect ratio
+                target_h, target_w = self.imgsz_hw
+                r = min(target_h / h0, target_w / w0)  # ratio
                 if r != 1:  # if sizes are not equal
-                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                    w, h = (min(math.ceil(w0 * r), target_w), min(math.ceil(h0 * r), target_h))
                     im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-            elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+            elif (h0, w0) != self.imgsz_hw:  # resize by stretching image to target size
+                im = cv2.resize(im, self.imgsz_hw[::-1], interpolation=cv2.INTER_LINEAR)
             if im.ndim == 2:
                 im = im[..., None]
 
@@ -342,7 +356,8 @@ class BaseDataset(Dataset):
             im = imread(random.choice(self.im_files))  # sample image
             if im is None:
                 continue
-            ratio = self.imgsz / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
+            target_h, target_w = self.imgsz_hw
+            ratio = min(target_h / im.shape[0], target_w / im.shape[1])
             b += im.nbytes * ratio**2
         mem_required = b * self.ni / n * (1 + safety_margin)  # GB required to cache dataset into RAM
         mem = __import__("psutil").virtual_memory()
@@ -369,16 +384,18 @@ class BaseDataset(Dataset):
         ar = ar[irect]
 
         # Set training image shapes
-        shapes = [[1, 1]] * nb
+        target_h, target_w = self.imgsz_hw
+        target_ar = target_h / target_w
+        shapes = [[target_h, target_w]] * nb
         for i in range(nb):
             ari = ar[bi == i]
             mini, maxi = ari.min(), ari.max()
-            if maxi < 1:
-                shapes[i] = [maxi, 1]
-            elif mini > 1:
-                shapes[i] = [1, 1 / mini]
+            if maxi < target_ar:
+                shapes[i] = [target_w * maxi, target_w]
+            elif mini > target_ar:
+                shapes[i] = [target_h, target_h / mini]
 
-        self.batch_shapes = np.ceil(np.array(shapes) * self.imgsz / self.stride + self.pad).astype(int) * self.stride
+        self.batch_shapes = np.ceil(np.array(shapes) / self.stride + self.pad).astype(int) * self.stride
         self.batch = bi  # batch index of image
 
     def __getitem__(self, index: int) -> dict[str, Any]:

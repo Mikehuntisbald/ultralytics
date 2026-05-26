@@ -1362,6 +1362,12 @@ class YOLO26PS25DLoss:
             return cache[key]
         task_preds = self._select_preds_by_images(preds, image_mask)
         task_batch = self._select_batch_by_images(batch, image_mask)
+        if cache is not None:
+            cached_assignment = self._slice_assignment_from_superset(cache, key, task_preds, task_batch)
+            if cached_assignment is not None:
+                result = task_preds, task_batch, cached_assignment
+                cache[key] = result
+                return result
         if task_batch["batch_idx"].numel() == 0:
             empty = task_preds["boxes"].new_zeros(
                 (task_preds["boxes"].shape[0], task_preds["boxes"].shape[-1]), dtype=torch.bool
@@ -1384,6 +1390,39 @@ class YOLO26PS25DLoss:
     def _assignment_key(image_mask: torch.Tensor) -> tuple[bool, ...]:
         """Convert an image mask into a hashable assignment-cache key."""
         return tuple(bool(x) for x in image_mask.detach().cpu().tolist())
+
+    @staticmethod
+    def _slice_assignment_from_superset(
+        cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]],
+        key: tuple[bool, ...],
+        task_preds: dict[str, torch.Tensor],
+        task_batch: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Slice a cached image-independent assignment from a cached superset batch."""
+        if not any(key):
+            return None
+        want = torch.tensor(key, dtype=torch.bool)
+        for cached_key, (_, _, assignment) in cache.items():
+            if len(cached_key) != len(key):
+                continue
+            have = torch.tensor(cached_key, dtype=torch.bool)
+            if not bool((want & ~have).any()):
+                source_pos = torch.where(have)[0]
+                target_pos = torch.where(want)[0]
+                if not len(target_pos):
+                    continue
+                rel_pos = torch.searchsorted(source_pos, target_pos).to(assignment[0].device)
+                fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor = assignment
+                if fg_mask.shape[0] < int(rel_pos.max().item()) + 1:
+                    continue
+                return (
+                    fg_mask[rel_pos],
+                    target_gt_idx[rel_pos.to(target_gt_idx.device)],
+                    target_bboxes[rel_pos.to(target_bboxes.device)],
+                    anchor_points,
+                    stride_tensor,
+                )
+        return None
 
     def _select_preds_by_images(self, preds: dict[str, torch.Tensor], image_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         """Select prediction tensors for images enabled for a task."""

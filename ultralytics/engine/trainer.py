@@ -64,6 +64,17 @@ from ultralytics.utils.torch_utils import (
 )
 
 
+def imgsz_hw(imgsz: int | list[int] | tuple[int, ...]) -> tuple[int, int]:
+    """Return image size as (height, width) while preserving square int behavior."""
+    if isinstance(imgsz, int):
+        return imgsz, imgsz
+    if isinstance(imgsz, (list, tuple)):
+        if len(imgsz) == 1:
+            return int(imgsz[0]), int(imgsz[0])
+        return int(imgsz[0]), int(imgsz[1])
+    raise TypeError(f"imgsz must be int or [height, width], got {imgsz!r}")
+
+
 class BaseTrainer:
     """A base class for creating trainers.
 
@@ -344,7 +355,7 @@ class BaseTrainer:
         model = unwrap_model(self.model)
         head = model.model[-1] if hasattr(model, "model") and len(model.model) else None
         gs = int(getattr(head, "input_stride", max(int(model.stride.max() if hasattr(model, "stride") else 32), 32)))
-        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=2)
         self.stride = gs  # for multiscale training
 
         if self.world_size > 1:
@@ -497,13 +508,13 @@ class BaseTrainer:
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
                     pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                        ("%11s" * 2 + "%11.4g" * (1 + loss_length) + "%11s")
                         % (
                             f"{epoch + 1}/{self.epochs}",
                             f"{self._get_memory():.3g}G",  # (GB) GPU memory util
                             *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
                             batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
+                            f"{batch['img'].shape[-2]}x{batch['img'].shape[-1]}",  # imgsz, i.e. 640x640
                         )
                     )
                     self.run_callbacks("on_batch_end")
@@ -587,7 +598,7 @@ class BaseTrainer:
 
     def auto_batch(self, max_num_obj=0, dataset_size=0):
         """Calculate optimal batch size based on model and device memory constraints."""
-        max_imgsz = int(self.args.imgsz * (1 + self.args.multi_scale))  # need not be stride-aligned
+        max_imgsz = int(max(imgsz_hw(self.args.imgsz)) * (1 + self.args.multi_scale))  # need not be stride-aligned
         return check_train_batch_size(
             model=self.model,
             imgsz=max_imgsz,
