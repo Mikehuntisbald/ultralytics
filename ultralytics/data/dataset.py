@@ -49,6 +49,17 @@ from .utils import (
 DATASET_CACHE_VERSION = "1.0.3"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
+PERSON_ONLY_SOURCES = {
+    "crowdhuman",
+    "coco_wholebody",
+    "coco_person_mask",
+    "ochuman",
+    "3dpw",
+    "agora",
+    "h3wb",
+}
+FACE_ONLY_SOURCES = {"wider", "wider_face"}
+BASE_DET_SOURCES = {"objects365"}
 
 
 class YOLODataset(BaseDataset):
@@ -151,6 +162,7 @@ class YOLODataset(BaseDataset):
                             "bboxes": lb[:, 1:],  # n, 4
                             "segments": segments,
                             "keypoints": keypoint,
+                            "det_class_mask": self._det_class_mask_for_image(im_file),
                             "normalized": True,
                             "bbox_format": "xywh",
                         }
@@ -206,6 +218,8 @@ class YOLODataset(BaseDataset):
             raise RuntimeError(f"No valid images found in {cache_path}.\n  {issues}\n{HELP_URL}")
         [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
+        for lb in labels:
+            lb.setdefault("det_class_mask", self._det_class_mask_for_image(lb["im_file"]))
 
         # Check if the dataset is all boxes or all segments
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
@@ -389,10 +403,37 @@ class YOLODataset(BaseDataset):
             "person_mask": person_masks,
             "instance_flags": instance_flags,
             "scene_seg": scene_seg,
+            "det_class_mask": self._det_class_mask_for_image(im_file),
             **{k: np.array(task_flags[k], dtype=bool) for k in UNIFIED_TASK_FLAG_KEYS},
             "normalized": True,
             "bbox_format": "xywh",
         }
+
+    def _det_class_mask_for_image(self, im_file: str | Path) -> np.ndarray:
+        """Return per-image detection class supervision mask for partial-label sources."""
+        names = self.data.get("names", {})
+        nc = int(self.data.get("nc", len(names)))
+        mask = np.ones(nc, dtype=bool)
+        if nc <= 0:
+            return mask
+
+        parts = {p.lower() for p in Path(im_file).parts}
+        person_cls = int(self.data.get("person_cls", 0))
+        face_cls = int(self.data.get("face_cls", nc - 1))
+        det_base_nc = int(self.data.get("det_base_nc", nc))
+
+        if parts & BASE_DET_SOURCES:
+            mask[:] = False
+            mask[: max(0, min(det_base_nc, nc))] = True
+        elif parts & PERSON_ONLY_SOURCES:
+            mask[:] = False
+            if 0 <= person_cls < nc:
+                mask[person_cls] = True
+        elif parts & FACE_ONLY_SOURCES:
+            mask[:] = False
+            if 0 <= face_cls < nc:
+                mask[face_cls] = True
+        return mask
 
     def _record_shape(self, record: dict, im_file: str) -> tuple[int, int]:
         width, height = record.get("width"), record.get("height")
@@ -613,6 +654,8 @@ class YOLODataset(BaseDataset):
             elif k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "body_kpts_3d", "instance_flags"}:
                 value = [torch.as_tensor(v) for v in value]
                 value = torch.cat(value, 0)
+            elif k == "det_class_mask":
+                value = torch.stack([torch.as_tensor(v, dtype=torch.bool) for v in value], 0)
             elif k in UNIFIED_TASK_FLAG_KEYS:
                 value = torch.tensor([bool(v) for v in value], dtype=torch.bool)
             new_batch[k] = value

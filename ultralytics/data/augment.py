@@ -66,6 +66,13 @@ def _cat_extra_instances(labels: dict[str, Any], sources: list[dict[str, Any]], 
             labels[key] = parts if isinstance(parts[0], (str, list, tuple, dict, type(None))) else np.concatenate(parts, 0)
 
 
+def _merge_det_class_masks(labels: dict[str, Any], sources: list[dict[str, Any]]) -> None:
+    """Merge per-image detection supervision masks using a conservative intersection."""
+    masks = [np.asarray(src["det_class_mask"], dtype=bool) for src in sources if src.get("det_class_mask") is not None]
+    if masks:
+        labels["det_class_mask"] = np.logical_and.reduce(masks)
+
+
 class BaseTransform:
     """Base class for image transformations in the Ultralytics library.
 
@@ -758,6 +765,7 @@ class Mosaic(BaseMixTransform):
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         _cat_extra_instances(final_labels, mosaic_labels)
+        _merge_det_class_masks(final_labels, mosaic_labels)
         _take_extra_instances(final_labels, good)
         return final_labels
 
@@ -838,6 +846,7 @@ class MixUp(BaseMixTransform):
         """
         labels2 = labels["mix_labels"][0]
         _cat_extra_instances(labels, [labels, labels2])
+        _merge_det_class_masks(labels, [labels, labels2])
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
         return labels
@@ -989,6 +998,7 @@ class CutMix(BaseMixTransform):
         instances2.add_padding(x1, y1)
 
         _cat_extra_instances(labels, [labels, labels2], [None, indexes2])
+        _merge_det_class_masks(labels, [labels, labels2])
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"][indexes2]], axis=0)
         labels["instances"] = Instances.concatenate([labels["instances"], instances2], axis=0)
         return labels
@@ -1955,6 +1965,7 @@ class CopyPaste(BaseMixTransform):
         source = labels if labels2_cls is None else labels.get("mix_labels", [{}])[0]
         if len(selected):
             _cat_extra_instances(labels, [labels, source], [None, selected])
+            _merge_det_class_masks(labels, [labels, source])
         for j in selected:
             cls = np.concatenate((cls, (labels2_cls if labels2_cls is not None else cls)[[j]]), axis=0)
             instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
