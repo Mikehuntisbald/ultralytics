@@ -75,6 +75,10 @@ same `det_class_mask` supervision domain as the anchor image, so an Objects365 m
 person-only mosaic stays person-only, and a WIDER mosaic stays face-only. This avoids the old failure mode where
 cross-source mosaic intersections produced an empty or overly narrow class supervision mask.
 
+Stage YAML owns mixed augmentation. If a stage omits `augment`, the stage trainer forces `mosaic`, `mixup`,
+`copy_paste`, and `cutmix` to `0.0` instead of inheriting Ultralytics defaults. Pose, mask, scene, and final finetune
+stages should keep those mixed augmentations explicitly closed unless the stage has been designed for them.
+
 ## Stage Sampling
 
 Every stage uses the same sampler contract:

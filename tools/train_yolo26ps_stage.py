@@ -43,6 +43,7 @@ STAGE_DATA_YAMLS = {
 }
 
 LOSS_KEYS = ("det", "pose2d", "pose_z", "pose_vis", "bone", "person_mask", "scene_seg")
+MIXED_AUG_KEYS = ("mosaic", "mixup", "copy_paste", "cutmix")
 BRANCH_MODULES = {
     "det": ("cv2", "cv3", "one2one_cv2", "one2one_cv3"),
     "pose": ("cv4", "one2one_cv4"),
@@ -590,12 +591,8 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     cache = normalize_cache(args.cache if args.cache is not None else defaults.get("cache"))
     if cache is not None:
         overrides["cache"] = cache
-    if "mosaic" in augment:
-        overrides["mosaic"] = float(augment["mosaic"])
-    if "mixup" in augment:
-        overrides["mixup"] = float(augment["mixup"])
-    if "copy_paste" in augment:
-        overrides["copy_paste"] = float(augment["copy_paste"])
+    for key in MIXED_AUG_KEYS:
+        overrides[key] = float(augment.get(key, 0.0))
     if "scale" in augment:
         overrides["scale"] = scale_gain(augment["scale"])
     if "rotate" in augment:
