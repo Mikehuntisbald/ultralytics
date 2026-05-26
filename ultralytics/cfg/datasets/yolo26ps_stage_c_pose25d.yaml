@@ -1,0 +1,21 @@
+# YOLO26s-PS-2.5D Stage C dataset.
+
+path: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI
+train: stage_c_train.txt
+val: stage_c_val.txt
+
+unified_schema: true
+unified_labels:
+  train: labels/stage_c/train
+  val: labels/stage_c/val
+unified_manifest:
+  train: manifests/stage_c_train.jsonl
+  val: manifests/stage_c_val.jsonl
+
+nc: 366
+person_cls: 0
+face_cls: 365
+det_base_nc: 365
+det_extra_classes: [face]
+kpt_shape: [17, 3]
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]

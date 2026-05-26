@@ -251,6 +251,7 @@ stages:
   B_pose2d:
     epochs: 80
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml
     sampling: weighted_random_with_replacement
     data: {COCO_WholeBody: 65, OCHuman: 10, CrowdHuman: 10, Objects365: 7, WIDER_FACE: 8}
     sampling_weights: {coco_wholebody: 65, ochuman: 10, crowdhuman: 10, objects365: 7, wider_face: 8}
@@ -260,6 +261,7 @@ stages:
   C_pose25d:
     epochs: 80
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
     data: {COCO_WholeBody: 35, 3DPW: 22, AGORA: 25, H3WB_optional: 8, OCHuman: 6, CrowdHuman: 2, WIDER_FACE: 2}
     sampling_weights: {coco_wholebody: 35, 3dpw: 22, agora: 25, h3wb: 8, ochuman: 6, crowdhuman: 2, wider_face: 2}
@@ -270,12 +272,14 @@ stages:
   C_pose25d_no_H3WB:
     epochs: 80
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
     data: {COCO_WholeBody: 35, 3DPW: 25, AGORA: 30, OCHuman: 6, CrowdHuman: 2, WIDER_FACE: 2}
     sampling_weights: {coco_wholebody: 35, 3dpw: 25, agora: 30, ochuman: 6, crowdhuman: 2, wider_face: 2}
   D_person_mask:
     epochs: 70
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml
     sampling: weighted_random_with_replacement
     data: {COCO_person_mask: 38, OCHuman: 18, COCO_WholeBody: 14, 3DPW: 8, AGORA: 10, H3WB_optional: 4, Objects365: 5, CrowdHuman: 3}
     sampling_weights: {coco_person_mask: 38, ochuman: 18, coco_wholebody: 14, 3dpw: 8, agora: 10, h3wb: 4, objects365: 5, crowdhuman: 3}
@@ -285,6 +289,7 @@ stages:
   E_scene_seg:
     epochs: 70
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml
     sampling: weighted_random_with_replacement
     data: {ADE20K: 12, COCO_WholeBody: 22, COCO_person_mask: 14, OCHuman: 8, 3DPW: 10, AGORA: 10, H3WB_optional: 4, Objects365: 12, CrowdHuman: 5, WIDER_FACE: 3}
     sampling_weights: {ade20k: 12, coco_wholebody: 22, coco_person_mask: 14, ochuman: 8, 3dpw: 10, agora: 10, h3wb: 4, objects365: 12, crowdhuman: 5, wider_face: 3}
@@ -295,6 +300,7 @@ stages:
   F_full_finetune:
     epochs: 50
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml
     sampling: weighted_random_with_replacement
     default_imgsz: [448, 768]
     multi_scale: false
@@ -306,6 +312,7 @@ stages:
   F_full_finetune_pose_heavy:
     epochs: 50
     samples_per_epoch: 40000
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml
     sampling: weighted_random_with_replacement
     data: {Objects365: 12, CrowdHuman: 8, WIDER_FACE: 6, COCO_WholeBody: 24, 3DPW: 18, AGORA: 18, H3WB_optional: 6, COCO_person_mask: 5, OCHuman: 3, ADE20K: 0}
     sampling_weights: {objects365: 12, crowdhuman: 8, wider_face: 6, coco_wholebody: 24, 3dpw: 18, agora: 18, h3wb: 6, coco_person_mask: 5, ochuman: 3, ade20k: 0}

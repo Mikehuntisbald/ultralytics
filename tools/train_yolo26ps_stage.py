@@ -30,6 +30,17 @@ STAGE_A_ROOT = DATA_ROOT / "YOLO26PS_STAGE_A"
 DATA_YAML = STAGE_A_ROOT / "yolo26ps_stage_a.yaml"
 MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d.yaml"
 PLAN_YAML = ROOT / "ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml"
+STAGE_DATA_YAMLS = {
+    "A_detection": DATA_YAML,
+    "A_detection_stable": DATA_YAML,
+    "B_pose2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
+    "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_no_H3WB": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
+    "E_scene_seg": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml",
+    "F_full_finetune": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
+    "F_full_finetune_pose_heavy": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
+}
 
 LOSS_KEYS = ("det", "pose2d", "pose_z", "pose_vis", "bone", "person_mask", "scene_seg")
 BRANCH_MODULES = {
@@ -475,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", default="A_detection_stable", help="stage name under plan['stages']")
     parser.add_argument("--weights", type=Path, help="optional checkpoint to start from")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
-    parser.add_argument("--data", type=Path, default=DATA_YAML)
+    parser.add_argument("--data", type=Path, help="dataset YAML; defaults to the selected stage YAML")
     parser.add_argument("--model", type=Path, default=MODEL_YAML)
     parser.add_argument("--plan", type=Path, default=PLAN_YAML)
     parser.add_argument("--epochs", type=int)
@@ -622,6 +633,9 @@ def main() -> None:
     args = parse_args()
     plan = load_plan(args.plan)
     stage = stage_config(plan, args.stage)
+    if args.data is None:
+        data_yaml = stage.get("data_yaml")
+        args.data = (ROOT / data_yaml) if data_yaml else STAGE_DATA_YAMLS.get(args.stage, DATA_YAML)
     YOLO26PSStageTrainer.stage_cfg = stage
     maybe_prepare(args)
     model = YOLO(str(args.weights or args.model))
