@@ -43,8 +43,9 @@ decode no longer assumes a fixed feature map size, and dense stride-4 outputs fo
 validation accept rectangular `imgsz=[height, width]`; the default deployment-oriented size is `[448, 768]` with
 `pad_stride=32`.
 
-Rectangular training intentionally disables Mosaic/MixUp/CopyPaste for now and uses normal letterbox, HSV, and flip
-transforms. This keeps geometry deterministic for Stage A while preserving the deployment aspect ratio.
+Training accepts fixed rectangular `imgsz=[height, width]` without forcing a square canvas, so Stage A can still use
+Mosaic/MixUp/CopyPaste at the deployment-oriented aspect ratio. True `rect=True` aspect-ratio batch grouping remains
+validation-oriented and disables mosaic-style mixing, as in the base Ultralytics pipeline.
 
 ## Unified Label Schema
 
@@ -68,6 +69,11 @@ not treated as background negatives.
 Detection class supervision is also scoped per image. Objects365 images supervise the full remapped Objects365 class
 set. CrowdHuman, pose, and mask datasets supervise only `person`, while WIDER FACE supervises only `face`; they do not
 turn unannotated Objects365 classes into negative labels.
+
+Mosaic, MixUp, and CopyPaste in `mixup` mode are source-aware for this model family. Mixed samples are drawn from the
+same `det_class_mask` supervision domain as the anchor image, so an Objects365 mosaic stays Objects365-supervised, a
+person-only mosaic stays person-only, and a WIDER mosaic stays face-only. This avoids the old failure mode where
+cross-source mosaic intersections produced an empty or overly narrow class supervision mask.
 
 ## Stage Sampling
 

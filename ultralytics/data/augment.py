@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from copy import deepcopy
+from inspect import signature
 from typing import Any
 
 import cv2
@@ -71,6 +72,17 @@ def _merge_det_class_masks(labels: dict[str, Any], sources: list[dict[str, Any]]
     masks = [np.asarray(src["det_class_mask"], dtype=bool) for src in sources if src.get("det_class_mask") is not None]
     if masks:
         labels["det_class_mask"] = np.logical_and.reduce(masks)
+
+
+def _det_supervision_domain_key(labels: dict[str, Any]) -> tuple[int, bytes] | None:
+    """Return a compact key for the detection supervision domain carried by a label dict."""
+    mask = labels.get("det_class_mask")
+    if mask is None:
+        return None
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if mask.size == 0:
+        return None
+    return mask.size, np.packbits(mask).tobytes()
 
 
 class BaseTransform:
@@ -356,6 +368,7 @@ class BaseMixTransform(BaseTransform):
         self.dataset = dataset
         self.pre_transform = pre_transform
         self.p = p
+        self._get_indexes_accepts_labels = bool(signature(self.get_indexes).parameters)
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Apply pre-processing transforms and cutmix/mixup/mosaic transforms to labels data.
@@ -393,7 +406,7 @@ class BaseMixTransform(BaseTransform):
             (dict[str, Any]): Parameters for apply_image, apply_instances, and apply_semantic.
         """
         # Get index of one or three other images
-        indexes = self.get_indexes()
+        indexes = self._get_indexes(labels)
         if isinstance(indexes, int):
             indexes = [indexes]
 
@@ -409,7 +422,7 @@ class BaseMixTransform(BaseTransform):
         self._update_label_text(labels)
         return {"mix_labels": mix_labels}
 
-    def get_indexes(self):
+    def get_indexes(self, labels: dict[str, Any] | None = None):
         """Get a random index for mosaic augmentation.
 
         Returns:
@@ -420,7 +433,51 @@ class BaseMixTransform(BaseTransform):
             >>> index = transform.get_indexes()
             >>> print(index)  # 7
         """
+        if labels is not None:
+            indexes = self._same_det_domain_indexes(labels, 1)
+            if indexes is not None:
+                return indexes[0]
         return random.randint(0, len(self.dataset) - 1)
+
+    def _get_indexes(self, labels: dict[str, Any]):
+        """Call get_indexes with label context when supported by subclasses."""
+        return self.get_indexes(labels) if self._get_indexes_accepts_labels else self.get_indexes()
+
+    def _same_det_domain_indexes(
+        self,
+        labels: dict[str, Any],
+        n: int,
+        candidates: list[int] | tuple[int, ...] | np.ndarray | None = None,
+    ) -> list[int] | None:
+        """Sample indexes from the same detection supervision domain as ``labels``."""
+        pool = self._det_domain_pool(labels)
+        if pool is None or len(pool) == 0:
+            return None
+        if candidates is not None:
+            candidates = np.asarray(list(candidates), dtype=np.int64)
+            if candidates.size:
+                pool = np.intersect1d(candidates, pool, assume_unique=False)
+        if len(pool) == 0:
+            return None
+        return [int(pool[random.randrange(len(pool))]) for _ in range(n)]
+
+    def _det_domain_pool(self, labels: dict[str, Any]) -> np.ndarray | None:
+        """Return cached dataset indexes with the same detection supervision mask."""
+        key = _det_supervision_domain_key(labels)
+        dataset_labels = getattr(self.dataset, "labels", None)
+        if key is None or not dataset_labels:
+            return None
+
+        cache_size, groups = getattr(self.dataset, "_det_supervision_domain_cache", (None, None))
+        if cache_size != len(dataset_labels) or groups is None:
+            built: dict[tuple[int, bytes], list[int]] = {}
+            for i, label in enumerate(dataset_labels):
+                label_key = _det_supervision_domain_key(label)
+                if label_key is not None:
+                    built.setdefault(label_key, []).append(i)
+            groups = {k: np.asarray(v, dtype=np.int64) for k, v in built.items()}
+            setattr(self.dataset, "_det_supervision_domain_cache", (len(dataset_labels), groups))
+        return groups.get(key)
 
     @staticmethod
     def _update_label_text(labels: dict[str, Any]) -> dict[str, Any]:
@@ -515,7 +572,7 @@ class Mosaic(BaseMixTransform):
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
 
-    def get_indexes(self):
+    def get_indexes(self, labels: dict[str, Any] | None = None):
         """Return a list of random indexes from the dataset for mosaic augmentation.
 
         This method selects random image indexes either from a buffer or from the entire dataset, depending on the
@@ -530,6 +587,13 @@ class Mosaic(BaseMixTransform):
             >>> indexes = mosaic.get_indexes()
             >>> print(len(indexes))  # Output: 3
         """
+        if labels is not None:
+            candidates = list(self.dataset.buffer) if self.buffer_enabled else None
+            indexes = self._same_det_domain_indexes(labels, self.n - 1, candidates=candidates)
+            if indexes is None and candidates is not None:
+                indexes = self._same_det_domain_indexes(labels, self.n - 1)
+            if indexes is not None:
+                return indexes
         if self.buffer_enabled:  # select images from buffer
             return random.choices(list(self.dataset.buffer), k=self.n - 1)
         else:  # select any images

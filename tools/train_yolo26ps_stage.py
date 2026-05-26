@@ -527,7 +527,13 @@ def maybe_prepare(args: argparse.Namespace) -> None:
     if args.stage.startswith("A_detection") and args.data.exists() and not args.prepare:
         try:
             data_cfg = YAML.load(args.data)
-            should_prepare = int(data_cfg.get("nc", 0)) != 366 or "objects365" not in str(args.data.read_text(encoding="utf-8")).lower()
+            should_prepare = not (
+                int(data_cfg.get("nc", 0)) == 366
+                and int(data_cfg.get("det_base_nc", 0)) == 365
+                and int(data_cfg.get("person_cls", -1)) == 0
+                and int(data_cfg.get("face_cls", -1)) == 365
+                and (args.data.parent / str(data_cfg.get("train", "train.txt"))).exists()
+            )
         except Exception:
             should_prepare = True
     if args.stage.startswith("A_detection") and should_prepare:
