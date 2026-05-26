@@ -155,7 +155,7 @@ Current plan defaults for Stage A:
 - `imgsz=[448, 768]`
 - `batch=7`
 - `accumulate=12`
-- `optimizer=MuSGD` (`SGD` is also supported from the CLI)
+- `optimizer=SGD`
 - `lr0=0.006`
 - `lrf=0.01`
 - `momentum=0.937`
@@ -164,7 +164,8 @@ Current plan defaults for Stage A:
 - `cos_lr=true`
 - `amp=true`
 
-The shared optimizer schedule is cosine for every stage. The plan keeps the stage learning rates explicit:
+The shared optimizer schedule is cosine for every stage. Stage A uses SGD for the detection warmup; later stages keep
+the plan default optimizer unless overridden. The plan keeps the stage learning rates explicit:
 
 | Stage | `lr0` |
 | --- | ---: |

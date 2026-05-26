@@ -201,7 +201,7 @@ stages:
       no_val: true
       sampling: weighted_random_with_replacement
       sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
-      optimizer: MuSGD
+      optimizer: SGD
       lr0: 0.006
       lrf: 0.01
       momentum: 0.937
@@ -234,7 +234,7 @@ stages:
       no_val: true
       sampling: weighted_random_with_replacement
       sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
-      optimizer: MuSGD
+      optimizer: SGD
       lr0: 0.006
       lrf: 0.01
       momentum: 0.937
