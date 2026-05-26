@@ -6,9 +6,10 @@
 # Default 768x432 content should run as imgsz=[448,768] in Ultralytics height,width order.
 
 # Parameters
-nc: 1205 # LVIS remap classes + person + face
+nc: 366 # Objects365 remap classes + face
 scene_nc: 150 # ADE20K semantic classes
-person_cls: 1203 # second last class, before face
+person_cls: 0 # Objects365 Person class
+face_cls: 365 # extra WIDER FACE class after Objects365 classes
 end2end: True # NMS-free topK deployment path
 reg_max: 1 # YOLO26 DFL bins
 kpt_shape: [17, 4] # deployment: x_norm, y_norm, z_norm, conf
@@ -61,4 +62,4 @@ head:
   - [[-1, 10], 1, AlignConcat, [1]] # cat backbone P5
   - [-1, 1, C3k2, [384, True, 0.5, True]] # 28 (P5/32)
 
-  - [[19, 22, 25, 28], 1, YOLO26PSDetect25D, [nc, kpt_shape, 32, 192, 150, 1203]]
+  - [[19, 22, 25, 28], 1, YOLO26PSDetect25D, [nc, kpt_shape, 32, 192, 150, 0]]

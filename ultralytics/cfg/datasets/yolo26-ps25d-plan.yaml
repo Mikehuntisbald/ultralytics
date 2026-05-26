@@ -1,5 +1,5 @@
 # YOLO26s-PS-2.5D multi-dataset training plan.
-# This file records task ownership, class remapping, partial-label flags, loss weights, and staged sampling.
+# This file records task ownership, class remapping, partial-label flags, loss weights, staged data lists, and runtime sampling.
 
 model:
   name: YOLO26s-PS-2.5D
@@ -13,9 +13,13 @@ model:
   heads:
     det:
       levels: [P2, P3, P4, P5]
-      classes: remapped_LVIS + person + face
+      classes: remapped_Objects365 + face
       topk: 300
       nms_free: true
+      det_classes:
+        base: Objects365_remapped
+        extra: [face]
+      c_det: len(remapped_Objects365_classes) + 1
     body25d:
       attach_to: person
       levels: [P3, P4, P5]
@@ -39,7 +43,7 @@ model:
 
 data:
   detection:
-    - LVIS
+    - Objects365
     - CrowdHuman
     - WIDER_FACE
   pose2d:
@@ -61,10 +65,13 @@ data:
 
 class_mapping:
   detection:
-    lvis: remapped_lvis_classes
-    person: 1203
-    face: 1204
-    c_det: len(remapped_lvis_classes) + 2
+    base: Objects365_remapped
+    extra: [face]
+    objects365: remapped_objects365_classes
+    person: 0
+    face: len(remapped_objects365_classes)
+    c_det: len(remapped_objects365_classes) + 1
+    note: Objects365 Person maps to the shared person class; face is the only extra detection class.
   crowdhuman:
     full_body: person
     visible_body: optional_ignore_or_person
@@ -127,7 +134,7 @@ loss:
     has_person_mask: [person_mask]
     has_scene_seg: [scene_seg]
   dataset_task_rules:
-    LVIS: [det]
+    Objects365: [det]
     CrowdHuman: [det]
     WIDER_FACE: [det]
     COCO_WholeBody: [det, pose2d, pose_vis]
@@ -144,22 +151,100 @@ loss:
   no_pose_z_sources:
     - COCO_WholeBody
     - OCHuman
+  class_supervision:
+    Objects365: full Objects365_remapped detection classes
+    CrowdHuman: person class only; do not supervise Objects365 negatives
+    WIDER_FACE: face class only; do not supervise Objects365 negatives
+    COCO_WholeBody: person class only; do not supervise Objects365 negatives
+    COCO_person_mask: person class only; do not supervise Objects365 negatives
+    OCHuman: person class only; do not supervise Objects365 negatives
+    3DPW: person class only; do not supervise Objects365 negatives
+    AGORA: person class only; do not supervise Objects365 negatives
+    H3WB_optional: person class only; do not supervise Objects365 negatives
+
+optimizer_scheduler:
+  optimizer: MuSGD # SGD is also supported from the CLI when needed.
+  scheduler: cosine
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  warmup_bias_lr: 0.1
+  ema: true
+  amp: true
+  stage_lr0:
+    A_detection_stable: 0.006
+    A_detection: 0.006
+    B_pose2d: 0.003
+    C_pose25d: 0.002
+    D_person_mask: 0.002
+    E_scene_seg: 0.0015
+    F_full_finetune: 0.001
 
 stages:
   A_detection:
     epochs: 15
     samples_per_epoch: 40000
+    train_list: train.txt # full Objects365 + CrowdHuman + WIDER_FACE source list
+    train_all_list: train_all.txt
+    legacy_weighted_list: train_weighted_legacy.txt
     sampling: weighted_random_with_replacement
-    data: {LVIS: 55, CrowdHuman: 25, WIDER_FACE: 20}
-    sampling_weights: {lvis: 55, crowdhuman: 25, wider_face: 20}
+    data: {Objects365: 45, CrowdHuman: 35, WIDER_FACE: 20}
+    sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
     train_runtime:
-      imgsz: 704
+      active_tasks: [det]
+      imgsz: [448, 768]
+      pad_stride: 32
       batch: 7
       accumulate: 12
       workers: 8
       no_val: true
       sampling: weighted_random_with_replacement
-      sampling_weights: {lvis: 55, crowdhuman: 25, wider_face: 20}
+      sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
+      optimizer: MuSGD
+      lr0: 0.006
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train: {backbone: partial, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
+    loss: {det: 1.0}
+    augment: {mosaic: 0.7, mixup: 0.1, copy_paste: 0.1, scale: [0.5, 1.5]}
+  A_detection_stable:
+    epochs: 15
+    samples_per_epoch: 40000
+    train_list: train.txt # full Objects365 + CrowdHuman + WIDER_FACE source list
+    train_all_list: train_all.txt
+    legacy_weighted_list: train_weighted_legacy.txt
+    sampling: weighted_random_with_replacement
+    data: {Objects365: 45, CrowdHuman: 35, WIDER_FACE: 20}
+    sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 7
+      accumulate: 12
+      workers: 8
+      no_val: true
+      sampling: weighted_random_with_replacement
+      sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
+      optimizer: MuSGD
+      lr0: 0.006
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
     train: {backbone: partial, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
     loss: {det: 1.0}
     augment: {mosaic: 0.7, mixup: 0.1, copy_paste: 0.1, scale: [0.5, 1.5]}
@@ -167,8 +252,9 @@ stages:
     epochs: 80
     samples_per_epoch: 40000
     sampling: weighted_random_with_replacement
-    data: {COCO_WholeBody: 65, OCHuman: 10, CrowdHuman: 10, LVIS: 7, WIDER_FACE: 8}
-    sampling_weights: {coco_wholebody: 65, ochuman: 10, crowdhuman: 10, lvis: 7, wider_face: 8}
+    data: {COCO_WholeBody: 65, OCHuman: 10, CrowdHuman: 10, Objects365: 7, WIDER_FACE: 8}
+    sampling_weights: {coco_wholebody: 65, ochuman: 10, crowdhuman: 10, objects365: 7, wider_face: 8}
+    train_runtime: {optimizer: MuSGD, lr0: 0.003, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
     train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
     loss: {det: 1.0, pose2d: 1.2, pose_z: 0.0, pose_vis: 0.3}
   C_pose25d:
@@ -177,6 +263,7 @@ stages:
     sampling: weighted_random_with_replacement
     data: {COCO_WholeBody: 35, 3DPW: 22, AGORA: 25, H3WB_optional: 8, OCHuman: 6, CrowdHuman: 2, WIDER_FACE: 2}
     sampling_weights: {coco_wholebody: 35, 3dpw: 22, agora: 25, h3wb: 8, ochuman: 6, crowdhuman: 2, wider_face: 2}
+    train_runtime: {optimizer: MuSGD, lr0: 0.002, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
     train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
     loss: {det: 0.8, pose2d: 1.0, pose_z: 0.7, pose_vis: 0.3, bone: 0.1}
     augment: {mosaic: 0.0, mixup: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
@@ -190,16 +277,18 @@ stages:
     epochs: 70
     samples_per_epoch: 40000
     sampling: weighted_random_with_replacement
-    data: {COCO_person_mask: 38, OCHuman: 18, COCO_WholeBody: 14, 3DPW: 8, AGORA: 10, H3WB_optional: 4, LVIS: 5, CrowdHuman: 3}
-    sampling_weights: {coco_person_mask: 38, ochuman: 18, coco_wholebody: 14, 3dpw: 8, agora: 10, h3wb: 4, lvis: 5, crowdhuman: 3}
+    data: {COCO_person_mask: 38, OCHuman: 18, COCO_WholeBody: 14, 3DPW: 8, AGORA: 10, H3WB_optional: 4, Objects365: 5, CrowdHuman: 3}
+    sampling_weights: {coco_person_mask: 38, ochuman: 18, coco_wholebody: 14, 3dpw: 8, agora: 10, h3wb: 4, objects365: 5, crowdhuman: 3}
+    train_runtime: {optimizer: MuSGD, lr0: 0.002, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
     train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: true, scene_seg_head: false}
     loss: {det: 1.0, pose2d: 0.8, pose_z: 0.4, person_mask: 1.0, bone: 0.05}
   E_scene_seg:
     epochs: 70
     samples_per_epoch: 40000
     sampling: weighted_random_with_replacement
-    data: {ADE20K: 12, COCO_WholeBody: 22, COCO_person_mask: 14, OCHuman: 8, 3DPW: 10, AGORA: 10, H3WB_optional: 4, LVIS: 12, CrowdHuman: 5, WIDER_FACE: 3}
-    sampling_weights: {ade20k: 12, coco_wholebody: 22, coco_person_mask: 14, ochuman: 8, 3dpw: 10, agora: 10, h3wb: 4, lvis: 12, crowdhuman: 5, wider_face: 3}
+    data: {ADE20K: 12, COCO_WholeBody: 22, COCO_person_mask: 14, OCHuman: 8, 3DPW: 10, AGORA: 10, H3WB_optional: 4, Objects365: 12, CrowdHuman: 5, WIDER_FACE: 3}
+    sampling_weights: {ade20k: 12, coco_wholebody: 22, coco_person_mask: 14, ochuman: 8, 3dpw: 10, agora: 10, h3wb: 4, objects365: 12, crowdhuman: 5, wider_face: 3}
+    train_runtime: {optimizer: MuSGD, lr0: 0.0015, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
     train: {all: true}
     loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, person_mask: 0.8, scene_seg: 0.3}
     fallback_if_det_drops: {ADE20K: "6-8", scene_seg: 0.2}
@@ -209,19 +298,20 @@ stages:
     sampling: weighted_random_with_replacement
     default_imgsz: [448, 768]
     multi_scale: false
-    data: {LVIS: 15, CrowdHuman: 10, WIDER_FACE: 8, COCO_WholeBody: 22, 3DPW: 14, AGORA: 14, H3WB_optional: 6, COCO_person_mask: 7, OCHuman: 4, ADE20K: "0-2"}
-    sampling_weights: {lvis: 15, crowdhuman: 10, wider_face: 8, coco_wholebody: 22, 3dpw: 14, agora: 14, h3wb: 6, coco_person_mask: 7, ochuman: 4, ade20k: 2}
+    data: {Objects365: 15, CrowdHuman: 10, WIDER_FACE: 8, COCO_WholeBody: 22, 3DPW: 14, AGORA: 14, H3WB_optional: 6, COCO_person_mask: 7, OCHuman: 4, ADE20K: "0-2"}
+    sampling_weights: {objects365: 15, crowdhuman: 10, wider_face: 8, coco_wholebody: 22, 3dpw: 14, agora: 14, h3wb: 6, coco_person_mask: 7, ochuman: 4, ade20k: 2}
+    train_runtime: {optimizer: MuSGD, lr0: 0.001, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
     augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, scale: [0.9, 1.1], flip: 0.5}
     loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, pose_vis: 0.3, bone: 0.1, person_mask: 0.7, scene_seg: 0.2}
   F_full_finetune_pose_heavy:
     epochs: 50
     samples_per_epoch: 40000
     sampling: weighted_random_with_replacement
-    data: {LVIS: 12, CrowdHuman: 8, WIDER_FACE: 6, COCO_WholeBody: 24, 3DPW: 18, AGORA: 18, H3WB_optional: 6, COCO_person_mask: 5, OCHuman: 3, ADE20K: 0}
-    sampling_weights: {lvis: 12, crowdhuman: 8, wider_face: 6, coco_wholebody: 24, 3dpw: 18, agora: 18, h3wb: 6, coco_person_mask: 5, ochuman: 3, ade20k: 0}
+    data: {Objects365: 12, CrowdHuman: 8, WIDER_FACE: 6, COCO_WholeBody: 24, 3DPW: 18, AGORA: 18, H3WB_optional: 6, COCO_person_mask: 5, OCHuman: 3, ADE20K: 0}
+    sampling_weights: {objects365: 12, crowdhuman: 8, wider_face: 6, coco_wholebody: 24, 3dpw: 18, agora: 18, h3wb: 6, coco_person_mask: 5, ochuman: 3, ade20k: 0}
 
 sampling_final:
-  LVIS: 15
+  Objects365: 15
   CrowdHuman: 10
   WIDER_FACE: 8
   COCO_WholeBody: 22
@@ -233,7 +323,7 @@ sampling_final:
   ADE20K: "0-2"
 
 sampling_final_no_H3WB:
-  LVIS: 15
+  Objects365: 15
   CrowdHuman: 10
   WIDER_FACE: 8
   COCO_WholeBody: 22
@@ -252,6 +342,14 @@ augmentation:
 
 optimizer_batch:
   prefer_native_yolo26_optimizer_scheduler: true
+  optimizer: MuSGD
+  scheduler: cosine
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  ema: true
+  amp: true
   recommended:
     batch_per_gpu: 20
     accumulate: 4

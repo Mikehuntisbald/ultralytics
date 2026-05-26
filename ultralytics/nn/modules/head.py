@@ -437,12 +437,12 @@ class YOLO26PSDetect25D(Detect):
 
     def __init__(
         self,
-        nc: int = 1205,
+        nc: int = 366,
         kpt_shape: tuple = (17, 4),
         nm: int = 32,
         fusion_channels: int = 192,
         scene_nc: int = 150,
-        person_cls: int = -2,
+        person_cls: int = 0,
         reg_max=1,
         end2end=False,
         ch: tuple = (),
@@ -458,6 +458,7 @@ class YOLO26PSDetect25D(Detect):
         self.input_stride = 32
         self.output_stride = 4
         self.z_normalization = "bbox_height"
+        self.active_tasks = {"det", "pose", "mask", "scene"}
         self.loss_names = (
             "box_loss",
             "cls_loss",
@@ -511,13 +512,41 @@ class YOLO26PSDetect25D(Detect):
             mask_head=self.one2one_cv5,
         )
 
+    def _active_tasks(self) -> set[str]:
+        """Return normalized active task names for staged training/inference."""
+        tasks = getattr(self, "active_tasks", None)
+        if tasks in (None, "all", True):
+            return {"det", "pose", "mask", "scene"}
+        if isinstance(tasks, str):
+            return {x.strip() for x in tasks.split(",") if x.strip()} or {"det"}
+        return set(tasks) or {"det"}
+
+    def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
+        """Set active task branches. Detection is always enabled."""
+        if tasks in (None, "all", True):
+            self.active_tasks = {"det", "pose", "mask", "scene"}
+        elif isinstance(tasks, str):
+            self.active_tasks = {x.strip() for x in tasks.split(",") if x.strip()}
+        else:
+            self.active_tasks = set(tasks)
+        self.active_tasks.add("det")
+
+    def _head_args_for_tasks(self, tasks: set[str], one2one: bool = False) -> dict[str, torch.nn.Module | None]:
+        """Return branch heads for the currently active tasks."""
+        return dict(
+            box_head=self.one2one_cv2 if one2one else self.cv2,
+            cls_head=self.one2one_cv3 if one2one else self.cv3,
+            pose_head=(self.one2one_cv4 if one2one else self.cv4) if "pose" in tasks else None,
+            mask_head=(self.one2one_cv5 if one2one else self.cv5) if "mask" in tasks else None,
+        )
+
     def forward_head(
         self,
         x: list[torch.Tensor],
         box_head: torch.nn.Module,
         cls_head: torch.nn.Module,
-        pose_head: torch.nn.Module,
-        mask_head: torch.nn.Module,
+        pose_head: torch.nn.Module | None = None,
+        mask_head: torch.nn.Module | None = None,
     ) -> dict[str, torch.Tensor]:
         """Concatenate raw detection, pose, and mask coefficient maps across P2-P5."""
         preds = super().forward_head(x, box_head, cls_head)
@@ -532,30 +561,41 @@ class YOLO26PSDetect25D(Detect):
 
     def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | tuple:
         """Run the multi-task head and return raw training maps or deployment tensors."""
-        p2 = self._fuse_p2_features(x)
-        proto = self.proto(p2)
-        scene_seg = self.scene_seg(p2)
+        tasks = self._active_tasks()
+        need_mask = "mask" in tasks
+        need_scene = "scene" in tasks
+        proto = scene_seg = None
+        if need_mask or need_scene:
+            p2 = self._fuse_p2_features(x)
+            if need_mask:
+                proto = self.proto(p2)
+            if need_scene:
+                scene_seg = self.scene_seg(p2)
 
-        preds = self.forward_head(x, **self.one2many)
+        preds = self.forward_head(x, **self._head_args_for_tasks(tasks))
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
             preds = {
                 "one2many": preds,
-                "one2one": self.forward_head(x_detach, **self.one2one),
+                "one2one": self.forward_head(x_detach, **self._head_args_for_tasks(tasks, one2one=True)),
             }
-            preds["one2many"]["proto"] = proto
-            preds["one2many"]["scene_seg"] = scene_seg
-            preds["one2one"]["proto"] = proto.detach()
-            preds["one2one"]["scene_seg"] = scene_seg.detach()
+            if proto is not None:
+                preds["one2many"]["proto"] = proto
+                preds["one2one"]["proto"] = proto.detach()
+            if scene_seg is not None:
+                preds["one2many"]["scene_seg"] = scene_seg
+                preds["one2one"]["scene_seg"] = scene_seg.detach()
         else:
-            preds["proto"] = proto
-            preds["scene_seg"] = scene_seg
+            if proto is not None:
+                preds["proto"] = proto
+            if scene_seg is not None:
+                preds["scene_seg"] = scene_seg
 
         if self.training:
             return preds
 
         raw = preds["one2one"] if self.end2end else preds
-        deploy = self._deploy_outputs(raw, proto, scene_seg)
+        deploy = self._deploy_outputs(raw, proto, scene_seg, tasks)
         return deploy if self.export else (deploy, preds)
 
     def _fuse_p2_features(self, x: list[torch.Tensor]) -> torch.Tensor:
@@ -575,26 +615,40 @@ class YOLO26PSDetect25D(Detect):
         return dist2bbox(self.dfl(preds["boxes"]), self.anchors.unsqueeze(0), xywh=False, dim=1) * self.strides
 
     def _deploy_outputs(
-        self, preds: dict[str, torch.Tensor], proto: torch.Tensor, scene_seg: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None, scene_seg: torch.Tensor | None, tasks: set[str]
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Decode and top-k gather all task outputs for deployment."""
         boxes = self._get_decode_xyxy(preds).permute(0, 2, 1)
         scores = preds["scores"].sigmoid().permute(0, 2, 1)
-        pose25d = self.pose_decode(preds["pose25d"])
-        mask_coef = preds["mask_coefficient"].permute(0, 2, 1)
 
         score, cls, idx = self.get_topk_index(scores, self.max_det)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
-        pose25d = pose25d.gather(dim=1, index=idx.view(idx.shape[0], idx.shape[1], 1, 1).repeat(1, 1, *self.kpt_shape))
-        pose25d = self.normalize_pose25d(pose25d, boxes)
-        mask_coef = mask_coef.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        det_out = torch.cat([boxes, score, cls], dim=-1)
+        if tasks == {"det"}:
+            return det_out
+
+        pose25d = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.kpt_shape[0], self.kpt_shape[1]))
+        if "pose25d" in preds:
+            pose25d = self.pose_decode(preds["pose25d"])
+            pose25d = pose25d.gather(
+                dim=1, index=idx.view(idx.shape[0], idx.shape[1], 1, 1).repeat(1, 1, *self.kpt_shape)
+            )
+            pose25d = self.normalize_pose25d(pose25d, boxes)
+
+        mask_coef = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.nm))
+        if "mask_coefficient" in preds:
+            mask_coef = preds["mask_coefficient"].permute(0, 2, 1)
+            mask_coef = mask_coef.gather(dim=1, index=idx.repeat(1, 1, self.nm))
 
         if self.person_cls >= 0:
             person = (cls == float(self.person_cls)).to(mask_coef.dtype)
             pose25d = pose25d * person.view(person.shape[0], person.shape[1], 1, 1)
             mask_coef = mask_coef * person
 
-        det_out = torch.cat([boxes, score, cls], dim=-1)
+        if proto is None:
+            proto = boxes.new_zeros((boxes.shape[0], self.nm, 0, 0))
+        if scene_seg is None:
+            scene_seg = boxes.new_zeros((boxes.shape[0], self.scene_nc, 0, 0))
         return det_out, pose25d, mask_coef, proto, scene_seg
 
     def pose_decode(self, pose25d: torch.Tensor) -> torch.Tensor:

@@ -51,7 +51,18 @@ Request an Enterprise License for commercial use at [Ultralytics Licensing](http
 
 See below for quickstart installation and usage examples. For comprehensive guidance on training, validation, prediction, and deployment, refer to our full [Ultralytics Docs](https://docs.ultralytics.com/).
 
-This workspace also includes the YOLO26s-PS-2.5D multi-task development notes, output contract, and Stage A detection warmup recipe in [YOLO26s-PS-2.5D Development Notes](docs/en/guides/yolo26-ps25d-development.md).
+### YOLO26s-PS-2.5D Fork Notes
+
+This workspace also contains the `YOLO26s-PS-2.5D` multi-task branch for detection, body 2.5D pose, person mask, and
+scene segmentation experiments. The staged training plan lives in
+[`ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml`](ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml), with developer
+notes in [`docs/en/guides/yolo26-ps25d-development.md`](docs/en/guides/yolo26-ps25d-development.md).
+
+Stage training uses one shared entrypoint:
+
+```bash
+python tools/train_yolo26ps_stage.py --stage A_detection_stable --device 0
+```
 
 <details open>
 <summary>Install</summary>

@@ -1,50 +1,55 @@
 #!/usr/bin/env python3
 """Prepare YOLO26s-PS-2.5D Stage A detection warmup data.
 
-The script converts LVIS, CrowdHuman, and WIDER FACE annotations into a single YOLO detection dataset:
+The script converts Objects365, CrowdHuman, and WIDER FACE annotations into a single YOLO detection dataset:
 
-    LVIS categories -> 0..1202
-    person -> 1203
-    face -> 1204
+    Objects365 categories -> 0..364, with Objects365 Person at class 0
+    WIDER FACE -> 365
 
-It uses symlinks for images so the prepared dataset is mostly labels and file lists.
+CrowdHuman person boxes are also mapped to class 0. Objects365 is the only source that should supervise the full
+Objects365 class set; the dataloader/loss infer per-image class supervision scope from source path segments.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import random
 import tarfile
 import zipfile
-from collections import defaultdict
 from pathlib import Path
 
+import yaml
 from PIL import Image
 
 
 DATASETS = Path("/home/haoyi/Downloads/datasets/vision_benchmarks")
 OUT = DATASETS / "YOLO26PS_STAGE_A"
-COCO = DATASETS / "COCO_2017"
-LVIS = DATASETS / "LVIS" / "data"
+OBJECTS365 = DATASETS / "Objects365"
+OBJECTS365_DSDL = OBJECTS365 / "OpenDataLab___Objects365" / "dsdl" / "dsdl_Det_full.zip"
+OBJECTS365_IMAGES = OBJECTS365 / "extracted" / "Objects365" / "data"
 WIDER = DATASETS / "WIDER_FACE" / "extracted" / "WIDER_Face_Detection"
 CROWD = DATASETS / "CrowdHuman" / "CrowdHuman"
 CROWD_TAR = CROWD / "crowdhuman.tar.00"
 
-NC = 1205
-PERSON_CLS = 1203
-FACE_CLS = 1204
+OBJECTS365_NC = 365
+NC = OBJECTS365_NC + 1
+PERSON_CLS = 0
+FACE_CLS = 365
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", type=Path, default=DATASETS, help="vision_benchmarks root")
     parser.add_argument("--out", type=Path, default=OUT, help="prepared dataset root")
-    parser.add_argument("--seed", type=int, default=42, help="sampling seed")
-    parser.add_argument("--lvis", type=int, default=55, help="Stage A train sampling weight")
-    parser.add_argument("--crowdhuman", type=int, default=25, help="Stage A train sampling weight")
-    parser.add_argument("--wider-face", type=int, default=20, help="Stage A train sampling weight")
+    parser.add_argument("--seed", type=int, default=42, help="legacy weighted train-list sampling seed")
+    parser.add_argument("--objects365", type=int, default=45, help="legacy Stage A train sampling weight")
+    parser.add_argument("--crowdhuman", type=int, default=35, help="legacy Stage A train sampling weight")
+    parser.add_argument("--wider-face", type=int, default=20, help="legacy Stage A train sampling weight")
     parser.add_argument("--skip-crowdhuman-extract", action="store_true", help="do not extract CrowdHuman tar")
+    parser.add_argument("--max-objects365-train", type=int, help="optional cap for quick local preparation")
+    parser.add_argument("--max-objects365-val", type=int, help="optional cap for quick local preparation")
     return parser.parse_args()
 
 
@@ -77,40 +82,134 @@ def write_label(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def lvis_json(split: str) -> dict:
-    zpath = LVIS / f"lvis_v1_{split}.json.zip"
-    with zipfile.ZipFile(zpath) as zf:
-        with zf.open(f"lvis_v1_{split}.json") as f:
-            return json.load(f)
+def objects365_class_names() -> list[str]:
+    with zipfile.ZipFile(OBJECTS365_DSDL) as zf:
+        text = zf.read("dsdl_Det_full/defs/class-domain.yaml").decode("utf-8")
+    data = yaml.safe_load(text)
+    names = data["Object365ClassDomain"]["classes"]
+    return [str(name).split(".")[-1].strip().replace(" ", "_") for name in names]
 
 
-def prepare_lvis(out: Path, split: str) -> list[str]:
-    data = lvis_json(split)
-    image_dir = COCO / ("train2017" if split == "train" else "val2017")
-    person_category_ids = {int(c["id"]) for c in data.get("categories", []) if c.get("name") == "person"}
-    by_image = defaultdict(list)
-    for ann in data["annotations"]:
-        category_id = int(ann["category_id"])
-        cls = category_id - 1
-        if category_id in person_category_ids:
-            # Reserve class 1203 as unified person. LVIS person is remapped there.
-            cls = PERSON_CLS
-        by_image[int(ann["image_id"])].append((cls, ann["bbox"]))
+def objects365_image_roots(split: str) -> list[Path]:
+    candidates = [
+        OBJECTS365_IMAGES / split,
+        OBJECTS365_IMAGES / ("val" if split == "val" else "train"),
+        OBJECTS365 / "extracted" / "Objects365" / split,
+        OBJECTS365 / split,
+    ]
+    roots = [p for p in candidates if p.exists() and p.is_dir()]
+    return roots or [OBJECTS365_IMAGES]
 
-    list_paths = []
-    for img in data["images"]:
-        image_id = int(img["id"])
-        file_name = Path(img.get("coco_url", "")).name or f"{image_id:012d}.jpg"
-        src = image_dir / file_name
-        if not src.exists():
+
+def resolve_objects365_image(media_path: str, split: str) -> Path | None:
+    rel = Path(media_path)
+    for root in objects365_image_roots(split):
+        candidates = [
+            root / rel,
+            root / Path(*rel.parts[1:]) if len(rel.parts) > 1 else root / rel.name,
+            root / rel.name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def iter_dsdl_samples(split: str):
+    """Yield DSDL sample dicts without materializing multi-GB train JSON into memory."""
+    member = f"dsdl_Det_full/set-{split}/{split}_samples.json"
+    with zipfile.ZipFile(OBJECTS365_DSDL) as zf:
+        with zf.open(member) as f:
+            yield from iter_samples_array(f)
+
+
+def iter_samples_array(raw) -> dict:
+    """Stream objects from the top-level ``{"samples": [...]}`` DSDL JSON payload."""
+    text = io.TextIOWrapper(raw, encoding="utf-8")
+    decoder = json.JSONDecoder()
+    buf = ""
+    in_samples = False
+    eof = False
+
+    while True:
+        if not eof and len(buf) < 1 << 20:
+            chunk = text.read(1 << 20)
+            eof = not chunk
+            buf += chunk
+        if not in_samples:
+            marker = '"samples"'
+            idx = buf.find(marker)
+            if idx < 0:
+                if eof:
+                    return
+                buf = buf[-len(marker) :]
+                continue
+            arr = buf.find("[", idx + len(marker))
+            if arr < 0:
+                if eof:
+                    return
+                buf = buf[idx:]
+                continue
+            buf = buf[arr + 1 :]
+            in_samples = True
+
+        buf = buf.lstrip()
+        if buf.startswith("]"):
+            return
+        try:
+            obj, end = decoder.raw_decode(buf)
+        except json.JSONDecodeError:
+            if eof:
+                raise
+            chunk = text.read(1 << 20)
+            eof = not chunk
+            buf += chunk
             continue
-        rel = Path("lvis") / file_name
+        yield obj
+        buf = buf[end:].lstrip()
+        if buf.startswith(","):
+            buf = buf[1:]
+
+
+def prepare_objects365(out: Path, split: str, max_items: int | None = None) -> list[str]:
+    list_paths = []
+    for sample in iter_dsdl_samples(split):
+        media = sample.get("media", {})
+        media_path = media.get("media_path") or media.get("path") or media.get("file_name")
+        if not media_path:
+            continue
+        src = resolve_objects365_image(media_path, split)
+        if src is None:
+            continue
+        shape = media.get("media_shape") or media.get("shape")
+        if shape and len(shape) >= 2:
+            height, width = int(shape[0]), int(shape[1])
+        else:
+            with Image.open(src) as im:
+                width, height = im.size
+        lines = []
+        for ann in sample.get("annotations", []):
+            if ann.get("isfake", 0) or ann.get("ignore", 0):
+                continue
+            category_id = int(ann["category_id"])
+            cls = category_id - 1
+            if not (0 <= cls < OBJECTS365_NC):
+                continue
+            line = yolo_line(cls, ann["bbox"], width, height)
+            if line:
+                lines.append(line)
+        rel = Path("objects365") / Path(media_path)
         dst_img = out / "images" / split / rel
         dst_lb = out / "labels" / split / rel.with_suffix(".txt")
-        lines = [line for cls, box in by_image.get(image_id, []) if (line := yolo_line(cls, box, img["width"], img["height"]))]
         symlink(src, dst_img)
         write_label(dst_lb, lines)
         list_paths.append(str(dst_img))
+        if max_items and len(list_paths) >= max_items:
+            break
+    if not list_paths:
+        raise RuntimeError(
+            f"No Objects365 {split} images were prepared. Extract Objects365 images under {OBJECTS365_IMAGES} first."
+        )
     return list_paths
 
 
@@ -205,14 +304,15 @@ def prepare_crowdhuman(out: Path, split: str) -> list[str]:
 
 def weighted_repeat(paths: dict[str, list[str]], weights: dict[str, int], seed: int) -> list[str]:
     rng = random.Random(seed)
-    total = sum(weights.values())
-    base = min(len(paths[k]) / (weights[k] / total) for k in weights if paths[k])
+    active = {k: v for k, v in paths.items() if v and weights.get(k, 0) > 0}
+    if not active:
+        return []
+    total = sum(weights[k] for k in active)
+    base = min(len(paths[k]) / (weights[k] / total) for k in active)
     mixed = []
-    for key, weight in weights.items():
-        target = max(1, int(round(base * weight / total)))
+    for key in active:
+        target = max(1, int(round(base * weights[key] / total)))
         source = paths[key]
-        if not source:
-            continue
         reps, rem = divmod(target, len(source))
         sampled = source * reps + rng.sample(source, rem)
         rng.shuffle(sampled)
@@ -221,15 +321,36 @@ def weighted_repeat(paths: dict[str, list[str]], weights: dict[str, int], seed: 
     return mixed
 
 
-def write_lists(out: Path, train_paths: dict[str, list[str]], val_paths: dict[str, list[str]], weights: dict[str, int], seed: int) -> None:
-    train = weighted_repeat(train_paths, weights, seed)
+def source_counts(paths: list[str]) -> dict[str, int]:
+    counts = {"objects365": 0, "crowdhuman": 0, "wider_face": 0}
+    for path in paths:
+        parts = set(Path(path).parts)
+        for key in counts:
+            if key in parts:
+                counts[key] += 1
+                break
+    return counts
+
+
+def write_lists(
+    out: Path, train_paths: dict[str, list[str]], val_paths: dict[str, list[str]], weights: dict[str, int], seed: int
+) -> None:
+    train = []
+    for key in ("objects365", "crowdhuman", "wider_face"):
+        train.extend(train_paths.get(key, []))
+    train_weighted_legacy = weighted_repeat(train_paths, weights, seed)
     val = []
-    for key in ("lvis", "crowdhuman", "wider_face"):
+    for key in ("objects365", "crowdhuman", "wider_face"):
         val.extend(val_paths.get(key, []))
     (out / "train.txt").write_text("\n".join(train) + "\n", encoding="utf-8")
+    (out / "train_all.txt").write_text("\n".join(train) + "\n", encoding="utf-8")
+    (out / "train_weighted_legacy.txt").write_text("\n".join(train_weighted_legacy) + "\n", encoding="utf-8")
     (out / "val.txt").write_text("\n".join(val) + "\n", encoding="utf-8")
     summary = {f"train_{k}": len(v) for k, v in train_paths.items()} | {f"val_{k}": len(v) for k, v in val_paths.items()}
-    summary["train_weighted_total"] = len(train)
+    summary["train_total"] = len(train)
+    summary["train_all_total"] = len(train)
+    summary["train_weighted_legacy_total"] = len(train_weighted_legacy)
+    summary |= {f"train_weighted_legacy_{k}": v for k, v in source_counts(train_weighted_legacy).items()}
     summary["val_total"] = len(val)
     (out / "stage_a_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
@@ -240,12 +361,16 @@ def write_smoke_lists(out: Path, train: list[str], val: list[str], train_n: int 
 
 
 def yaml_text(out: Path, train: str, val: str) -> str:
-    names = [f"lvis_{i}" for i in range(1203)] + ["person", "face"]
+    names = objects365_class_names() + ["face"]
     text = [
         "path: " + str(out.resolve()),
         f"train: {train}",
         f"val: {val}",
-        "nc: 1205",
+        f"nc: {NC}",
+        f"person_cls: {PERSON_CLS}",
+        f"face_cls: {FACE_CLS}",
+        f"det_base_nc: {OBJECTS365_NC}",
+        "det_extra_classes: [face]",
         "names:",
     ]
     text += [f"  {i}: {name}" for i, name in enumerate(names)]
@@ -261,11 +386,12 @@ def write_yaml(out: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    global DATASETS, OUT, COCO, LVIS, WIDER, CROWD, CROWD_TAR
+    global DATASETS, OUT, OBJECTS365, OBJECTS365_DSDL, OBJECTS365_IMAGES, WIDER, CROWD, CROWD_TAR
     DATASETS = args.datasets
     OUT = args.out
-    COCO = DATASETS / "COCO_2017"
-    LVIS = DATASETS / "LVIS" / "data"
+    OBJECTS365 = DATASETS / "Objects365"
+    OBJECTS365_DSDL = OBJECTS365 / "OpenDataLab___Objects365" / "dsdl" / "dsdl_Det_full.zip"
+    OBJECTS365_IMAGES = OBJECTS365 / "extracted" / "Objects365" / "data"
     WIDER = DATASETS / "WIDER_FACE" / "extracted" / "WIDER_Face_Detection"
     CROWD = DATASETS / "CrowdHuman" / "CrowdHuman"
     CROWD_TAR = CROWD / "crowdhuman.tar.00"
@@ -275,16 +401,16 @@ def main() -> None:
         extract_crowdhuman()
 
     train_paths = {
-        "lvis": prepare_lvis(OUT, "train"),
+        "objects365": prepare_objects365(OUT, "train", args.max_objects365_train),
         "crowdhuman": prepare_crowdhuman(OUT, "train"),
         "wider_face": prepare_wider(OUT, "train"),
     }
     val_paths = {
-        "lvis": prepare_lvis(OUT, "val"),
+        "objects365": prepare_objects365(OUT, "val", args.max_objects365_val),
         "crowdhuman": prepare_crowdhuman(OUT, "val"),
         "wider_face": prepare_wider(OUT, "val"),
     }
-    weights = {"lvis": args.lvis, "crowdhuman": args.crowdhuman, "wider_face": args.wider_face}
+    weights = {"objects365": args.objects365, "crowdhuman": args.crowdhuman, "wider_face": args.wider_face}
     write_lists(OUT, train_paths, val_paths, weights, args.seed)
     train = (OUT / "train.txt").read_text(encoding="utf-8").splitlines()
     val = (OUT / "val.txt").read_text(encoding="utf-8").splitlines()

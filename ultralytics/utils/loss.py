@@ -430,6 +430,13 @@ class v8DetectionLoss:
 
         # Cls loss with optional class weighting
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
+        det_class_mask = batch.get("det_class_mask")
+        if torch.is_tensor(det_class_mask):
+            det_class_mask = det_class_mask.to(pred_scores.device).bool()
+            if det_class_mask.ndim == 1:
+                det_class_mask = det_class_mask.view(1, -1).expand(batch_size, -1)
+            if det_class_mask.shape[-1] == pred_scores.shape[-1]:
+                bce_loss *= det_class_mask[:, None, :].to(dtype)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
@@ -1044,14 +1051,16 @@ class YOLO26PS25DLoss:
         weights = self.task_weights()
         loss_items = torch.zeros(9, device=self.device)
         total_loss = self._zero_aux(preds) * batch_size
+        assignment_cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] = {}
 
         if weights["det"]:
             has_det = self._task_image_mask(batch, "has_det", batch_size, default=True)
             if has_det.any():
                 det_preds = self._select_preds_by_images(preds, has_det)
                 det_batch = self._select_batch_by_images(batch, has_det)
-                det_loss, det_items = self.det.loss(det_preds, det_batch)
-                total_loss = total_loss + det_loss.sum() * weights["det"]
+                assignment, det_loss, det_items = self.det.get_assigned_targets_and_loss(det_preds, det_batch)
+                assignment_cache[self._assignment_key(has_det)] = (det_preds, det_batch, assignment)
+                total_loss = total_loss + det_loss.sum() * det_preds["boxes"].shape[0] * weights["det"]
                 loss_items[:3] = det_items * weights["det"]
 
         wants_pose2d = bool(weights["pose2d"] or weights["pose_vis"])
@@ -1063,7 +1072,7 @@ class YOLO26PS25DLoss:
             if wants_pose3d:
                 pose_mask |= self._task_image_mask(batch, "has_pose3d", batch_size)
             if pose_mask.any():
-                pose2d, pose_z, pose_vis, bone = self._pose25d_loss_terms(preds, batch, pose_mask)
+                pose2d, pose_z, pose_vis, bone = self._pose25d_loss_terms(preds, batch, pose_mask, assignment_cache)
                 total_loss = total_loss + pose2d * weights["pose2d"]
                 total_loss = total_loss + pose_z * weights["pose_z"]
                 total_loss = total_loss + pose_vis * weights["pose_vis"]
@@ -1076,7 +1085,7 @@ class YOLO26PS25DLoss:
         if weights["person_mask"] and "mask_coefficient" in preds and "proto" in preds:
             has_mask = self._task_image_mask(batch, "has_person_mask", batch_size)
             if has_mask.any():
-                person_mask_loss = self._person_mask_loss(preds, batch, has_mask)
+                person_mask_loss = self._person_mask_loss(preds, batch, has_mask, assignment_cache)
                 total_loss = total_loss + person_mask_loss * weights["person_mask"]
                 loss_items[7] = person_mask_loss.detach() * weights["person_mask"]
 
@@ -1118,18 +1127,19 @@ class YOLO26PS25DLoss:
         return out
 
     def _pose25d_loss_terms(
-        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], image_mask: torch.Tensor
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+        image_mask: torch.Tensor,
+        assignment_cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute gated 2D, depth, visibility, and bone losses for matched person positives."""
         zero = preds["pose25d"].sum() * 0
-        task_preds = self._select_preds_by_images(preds, image_mask)
-        task_batch = self._select_batch_by_images(batch, image_mask)
+        task_preds, task_batch, assignment = self._get_assignment(preds, batch, image_mask, assignment_cache)
         if task_batch["batch_idx"].numel() == 0:
             return zero, zero, zero, zero
 
-        (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), _, _ = (
-            self.det.get_assigned_targets_and_loss(task_preds, task_batch)
-        )
+        fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor = assignment
         if not fg_mask.any():
             return zero, zero, zero, zero
 
@@ -1233,18 +1243,21 @@ class YOLO26PS25DLoss:
         return F.smooth_l1_loss(pred_len[edge_valid], gt_len[edge_valid])
 
     def _person_mask_loss(
-        self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], image_mask: torch.Tensor
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+        image_mask: torch.Tensor,
+        assignment_cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
     ) -> torch.Tensor:
         """Compute prototype instance-mask loss when rasterized person masks are present."""
         zero = preds["mask_coefficient"].sum() * 0 + preds["proto"].sum() * 0
         if "masks" not in batch or not torch.is_tensor(batch["masks"]):
             return zero
 
-        task_preds = self._select_preds_by_images(preds, image_mask)
-        task_batch = self._select_batch_by_images(batch, image_mask)
+        task_preds, task_batch, assignment = self._get_assignment(preds, batch, image_mask, assignment_cache)
         if task_batch["batch_idx"].numel() == 0:
             return zero
-        (fg_mask, target_gt_idx, target_bboxes, _, _), _, _ = self.det.get_assigned_targets_and_loss(task_preds, task_batch)
+        fg_mask, target_gt_idx, target_bboxes, _, _ = assignment
         if not fg_mask.any():
             return zero
 
@@ -1335,6 +1348,42 @@ class YOLO26PS25DLoss:
         if torch.is_tensor(value):
             return value.to(self.device).bool().view(-1)[:batch_size]
         return torch.tensor([bool(x) for x in value], device=self.device, dtype=torch.bool)[:batch_size]
+
+    def _get_assignment(
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, Any],
+        image_mask: torch.Tensor,
+        cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], tuple]:
+        """Return cached detection assignment for a task image subset."""
+        key = self._assignment_key(image_mask)
+        if cache is not None and key in cache:
+            return cache[key]
+        task_preds = self._select_preds_by_images(preds, image_mask)
+        task_batch = self._select_batch_by_images(batch, image_mask)
+        if task_batch["batch_idx"].numel() == 0:
+            empty = task_preds["boxes"].new_zeros(
+                (task_preds["boxes"].shape[0], task_preds["boxes"].shape[-1]), dtype=torch.bool
+            )
+            assignment = (
+                empty,
+                task_preds["boxes"].new_zeros(empty.shape, dtype=torch.long),
+                task_preds["boxes"].new_zeros((*empty.shape, 4)),
+                task_preds["boxes"].new_zeros((task_preds["boxes"].shape[-1], 2)),
+                task_preds["boxes"].new_ones((task_preds["boxes"].shape[-1], 1)),
+            )
+        else:
+            assignment = self.det.get_assigned_targets_and_loss(task_preds, task_batch)[0]
+        result = task_preds, task_batch, assignment
+        if cache is not None:
+            cache[key] = result
+        return result
+
+    @staticmethod
+    def _assignment_key(image_mask: torch.Tensor) -> tuple[bool, ...]:
+        """Convert an image mask into a hashable assignment-cache key."""
+        return tuple(bool(x) for x in image_mask.detach().cpu().tolist())
 
     def _select_preds_by_images(self, preds: dict[str, torch.Tensor], image_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         """Select prediction tensors for images enabled for a task."""
@@ -1436,7 +1485,10 @@ class YOLO26PS25DE2ELoss:
         preds = self.one2many.parse_output(preds)
         loss_one2many = self.one2many.loss(preds["one2many"], batch)
         loss_one2one = self.one2one.loss(preds["one2one"], batch)
-        return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
+        return (
+            loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o,
+            loss_one2many[1] * self.o2m + loss_one2one[1] * self.o2o,
+        )
 
     def update(self) -> None:
         """Update one-to-many decay schedule to match E2ELoss behavior."""

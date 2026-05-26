@@ -539,6 +539,7 @@ nav:
       - Hyperparameter Tuning: guides/hyperparameter-tuning.md
       - Insights on Model Evaluation and Fine-Tuning: guides/model-evaluation-insights.md
       - Isolating Segmentation Objects: guides/isolating-segmentation-objects.md
+      - YOLO26s-PS-2.5D Development: guides/yolo26-ps25d-development.md
       - K-Fold Cross Validation: guides/kfold-cross-validation.md
       - Maintaining Your Computer Vision Model: guides/model-monitoring-and-maintenance.md
       - Modal Quickstart: guides/modal-quickstart.md
