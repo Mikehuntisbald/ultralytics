@@ -39,6 +39,8 @@ model:
       output_stride: 4
     scene_seg:
       classes: 150
+      dataset: ADEChallengeData2016
+      label_mapping: "raw 0 -> ignore 255; raw 1..150 -> train 0..149"
       output_stride: 4
 
 data:
@@ -59,7 +61,7 @@ data:
     - OCHuman
     - AGORA_optional
   scene_seg:
-    - ADE20K
+    - ADEChallengeData2016
 
 class_mapping:
   detection:
@@ -139,7 +141,7 @@ loss:
     3DPW: [det, pose2d, pose3d, pose_vis]
     AGORA: [det, pose2d, pose3d, pose_vis]
     COCO_person_mask: [det, person_mask]
-    ADE20K: [scene_seg]
+    ADEChallengeData2016: [scene_seg]
   pose_z_sources:
     - 3DPW
     - AGORA

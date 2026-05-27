@@ -50,9 +50,10 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
-UNIFIED_CACHE_VERSION = "1.0.5"
+UNIFIED_CACHE_VERSION = "1.0.6"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
+ADE20K_150_LABEL_MAPPING = {0: 255, **{i: i - 1 for i in range(1, 151)}}
 SOURCE_ALIASES = {
     "object365": "objects365",
     "objects365": "objects365",
@@ -72,6 +73,10 @@ SOURCE_ALIASES = {
     "human36m": "h3wb",
     "human3.6m": "h3wb",
     "ade20k": "ade20k",
+    "adechallenge": "ade20k",
+    "ade_challenge": "ade20k",
+    "adechallengedata2016": "ade20k",
+    "ade_challenge_data_2016": "ade20k",
 }
 PATH_SOURCE_MARKERS = (
     ("objects365", ("objects365", "object365")),
@@ -81,7 +86,7 @@ PATH_SOURCE_MARKERS = (
     ("3dpw", ("3dpw",)),
     ("agora", ("agora",)),
     ("h3wb", ("h3wb", "human36m", "human3.6m")),
-    ("ade20k", ("ade20k",)),
+    ("ade20k", ("ade20k", "adechallenge", "adechallengedata2016")),
     ("coco_person_mask", ("coco_person_mask",)),
     ("coco_wholebody", ("coco_wholebody", "coco-wholebody")),
 )
@@ -460,6 +465,8 @@ class YOLODataset(BaseDataset):
             "person_cls": self.data.get("person_cls"),
             "face_cls": self.data.get("face_cls"),
             "det_base_nc": self.data.get("det_base_nc"),
+            "scene_nc": self.data.get("scene_nc"),
+            "scene_label_mapping": self.data.get("scene_label_mapping"),
         }
         h.update(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode())
         return h.hexdigest()
@@ -763,6 +770,50 @@ class YOLODataset(BaseDataset):
                 mask[face_cls] = True
         return mask
 
+    def _parse_label_mapping(self, mapping: dict | str | None) -> dict[int, int]:
+        """Normalize label_mapping entries from YAML into integer-to-integer ids."""
+        if mapping is None:
+            return {}
+        if isinstance(mapping, str):
+            key = mapping.strip().lower()
+            if key in {"ade20k_150", "adechallenge_150", "ade_challenge_150"}:
+                return ADE20K_150_LABEL_MAPPING.copy()
+            raise ValueError(f"Unknown label mapping preset: {mapping}")
+        if not isinstance(mapping, dict):
+            raise TypeError(f"Expected label mapping to be a dict or preset string, but got {type(mapping).__name__}.")
+
+        normalized = {}
+        for src, dst in mapping.items():
+            src = int(src)
+            if isinstance(dst, str):
+                dst = dst.strip()
+                dst = 255 if dst == "ignore_label" else int(dst)
+            elif dst is None:
+                dst = 255
+            else:
+                dst = int(dst)
+            normalized[src] = dst
+        return normalized
+
+    def _convert_label_values(self, label: np.ndarray, mapping: dict[int, int], inverse: bool = False) -> np.ndarray:
+        """Convert label values using a source-to-target mapping."""
+        temp = label.copy()
+        out = label.copy()
+        if inverse:
+            for v, k in mapping.items():
+                out[temp == k] = v
+        else:
+            for k, v in mapping.items():
+                out[temp == k] = v
+        return out
+
+    def _scene_label_mapping(self) -> dict[int, int]:
+        """Return source-to-train label mapping for unified scene segmentation masks."""
+        mapping = self.data.get("scene_label_mapping")
+        if mapping is None:
+            mapping = self.data.get("label_mapping")
+        return self._parse_label_mapping(mapping)
+
     @staticmethod
     def _canonical_source(value: Any) -> str:
         """Normalize dataset/source names used by manifests, samplers, and partial-label masks."""
@@ -997,6 +1048,9 @@ class YOLODataset(BaseDataset):
             if scene_mask is not None:
                 if scene_mask.ndim == 3:
                     scene_mask = scene_mask[..., 0]
+                scene_mapping = self._scene_label_mapping()
+                if scene_mapping:
+                    scene_mask = self._convert_label_values(scene_mask, scene_mapping)
                 img_shape = label["img"].shape[:2]
                 if scene_mask.shape[:2] != img_shape:
                     scene_mask = cv2.resize(scene_mask, img_shape[::-1], interpolation=cv2.INTER_NEAREST)

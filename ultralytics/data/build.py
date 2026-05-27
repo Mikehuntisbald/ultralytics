@@ -134,6 +134,10 @@ def _label_source(label: dict[str, Any] | None, weights: dict[str, float]) -> st
         "coco-wholebody": "coco_wholebody",
         "human36m": "h3wb",
         "human3.6m": "h3wb",
+        "adechallenge": "ade20k",
+        "ade_challenge": "ade20k",
+        "adechallengedata2016": "ade20k",
+        "ade_challenge_data_2016": "ade20k",
     }
     source = aliases.get(source, source)
     if source in weights:

@@ -37,6 +37,7 @@ flip_idx:
 - 15
 scene_nc: 150
 scene_ignore_index: 255
+scene_label_mapping: ade20k_150
 names:
   0: Person
   1: Sneakers

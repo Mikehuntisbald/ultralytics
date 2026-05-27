@@ -20,7 +20,7 @@ head is `YOLO26PSDetect25D` and exports:
 | `body25d_out` | `[B, 300, 17, 4]` | `[x_norm, y_norm, z_norm, conf]`, valid only for `person` detections. |
 | `mask_coef` | `[B, 300, 32]` | Person-bound instance mask coefficients. |
 | `mask_proto` | `[B, 32, padded_H/4, padded_W/4]` | Dense stride-4 prototype map on padded input. |
-| `scene_seg` | `[B, 150, padded_H/4, padded_W/4]` | ADE20K-style semantic logits on padded input. |
+| `scene_seg` | `[B, 150, padded_H/4, padded_W/4]` | ADEChallengeData2016 150-class semantic logits on padded input. |
 
 Training targets remain raw image/depth values:
 
@@ -35,6 +35,10 @@ body25d:
 
 The `mask_proto` and `scene_seg` dense maps intentionally use padded input size. Postprocess must inverse-letterbox to
 the original image when presenting masks or semantic maps.
+
+Scene segmentation uses the MIT Scene Parsing Benchmark `ADEChallengeData2016` layout, not the full ADE20K object
+vocabulary. Its masks store `0` as ignore/background and `1..150` as source class IDs, so the unified loader maps them to
+train IDs `0..149` with ignore `255`.
 
 ## Dynamic Input Status
 

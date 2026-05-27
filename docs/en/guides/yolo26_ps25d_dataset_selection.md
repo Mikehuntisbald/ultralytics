@@ -9,7 +9,7 @@
 | Detection Head | `Objects365 objects + person + face` | 通用目标、人体、人脸检测 |
 | Body 2.5D Pose Head | `person → 17 × [x, y, z_rel, conf]` | 人体 2D 关键点 + root-relative depth |
 | Person Instance Mask Head | `person → mask coeff + proto` | 人体实例分割 |
-| Scene Semantic Seg Head | `ADE20K semantic logits` | 场景语义分割 |
+| Scene Semantic Seg Head | `ADEChallengeData2016 150-class semantic logits` | 场景语义分割 |
 
 最终采用的数据集组合：
 
@@ -37,7 +37,7 @@ person_mask:
   - AGORA_optional
 
 scene_seg:
-  - ADE20K
+  - ADEChallengeData2016
 ```
 
 ---
@@ -55,7 +55,7 @@ scene_seg:
 | **H3WB optional** | Body 2.5D / 3D pose | 可选 3D pose 补充；映射到 COCO-17 body | 使用 COCO-WholeBody layout，含 133 whole-body keypoints，其中 body 17 与当前 schema 对齐 | 解决 2D COCO-WholeBody 与 3D 数据 skeleton 不一致问题 | 基于 Human3.6M 扩展，场景偏受控；建议 optional，不作为唯一 3D 数据 |
 | **COCO person mask** | Person instance mask | 只取 person instance mask | COCO 的 person instance mask 是人体分割最稳的主数据之一 | 训练 person mask proto/coeff 主力数据 | 只用于 person instance mask；不要用 COCO 其他类扩展当前 mask head |
 | **OCHuman** | Person mask / occluded pose | 训练遮挡人体 mask；可补 2D pose | 面向 heavily occluded human，带 bbox、pose、instance mask | 补重遮挡人体分割和遮挡下 pose 稳定性 | 不是所有实例同时具备 keypoint+mask；训练时必须按 flag 做 partial-label |
-| **ADE20K** | Scene semantic segmentation | 训练 150 类 semantic logits | 场景解析标准数据，覆盖 indoor/outdoor、stuff/object 类别 | 给机器人环境理解补充 wall/floor/table/chair/road/sky 等场景语义 | 只训练 scene seg，不训练 det/pose/mask；占比过高可能拉低 detection/pose |
+| **ADEChallengeData2016** | Scene semantic segmentation | 训练 150 类 semantic logits | MIT Scene Parsing Benchmark 的 ADE20K challenge 版，覆盖 indoor/outdoor、stuff/object 类别 | 给机器人环境理解补充 wall/floor/table/chair/road/sky 等场景语义 | 只训练 scene seg，不训练 det/pose/mask；mask 源 ID 为 `0 ignore, 1..150 classes`，训练时映射到 `255 ignore, 0..149`；不要使用全量 ADE20K 3000+ object vocabulary |
 
 ---
 
@@ -79,10 +79,10 @@ scene_seg:
 | 通用目标检测 | Objects365 | CrowdHuman、WIDER FACE | ADE20K 不参与 det；pose/mask 数据只提供 person bbox |
 | person 检测 | CrowdHuman、Objects365 Person | COCO-WholeBody、COCO person mask、OCHuman、3DPW、AGORA | WIDER FACE 不作为 person 负样本 |
 | face 检测 | WIDER FACE | Objects365 中 face-like 类第一版建议 ignore | CrowdHuman / COCO / 3DPW / AGORA 不作为 face 负样本 |
-| 2D body keypoints | COCO-WholeBody | OCHuman、3DPW projected 2D、AGORA projected 2D、H3WB optional | Objects365、CrowdHuman、WIDER FACE、ADE20K |
+| 2D body keypoints | COCO-WholeBody | OCHuman、3DPW projected 2D、AGORA projected 2D、H3WB optional | Objects365、CrowdHuman、WIDER FACE、ADEChallengeData2016 |
 | 2.5D body pose | 3DPW、AGORA | H3WB optional | COCO-WholeBody / OCHuman 只训 2D，不训 z |
 | person instance mask | COCO person mask | OCHuman、AGORA optional | ADE20K person semantic 不作为 instance mask |
-| scene semantic segmentation | ADE20K | 无 | 其他数据不训练 scene seg |
+| scene semantic segmentation | ADEChallengeData2016 | 无 | 其他数据不训练 scene seg |
 
 ---
 
@@ -100,7 +100,7 @@ scene_seg:
 | OCHuman | `person` | Objects365 其他类、face ignore |
 | 3DPW | `person` | Objects365 其他类、face ignore |
 | AGORA | `person` | Objects365 其他类、face ignore |
-| ADE20K | 无 detection | detection loss 全部 ignore |
+| ADEChallengeData2016 | 无 detection | detection loss 全部 ignore |
 
 推荐每张图带：
 
@@ -180,7 +180,7 @@ stage_E_scene_seg:
   epochs: 50
   samples_per_epoch: 30000
   data:
-    ADE20K: 10
+    ADEChallengeData2016: 10
     COCO_WholeBody: 22
     COCO_person_mask: 15
     OCHuman: 8
@@ -208,7 +208,7 @@ stage_F_full_finetune:
     H3WB_optional: 5
     COCO_person_mask: 8
     OCHuman: 5
-    ADE20K: 2
+    ADEChallengeData2016: 2
 ```
 
 ---
@@ -226,7 +226,7 @@ stage_F_full_finetune:
 | 2.5D pose 可训 | 3DPW + AGORA 提供真实/合成互补的 3D 监督 |
 | skeleton 对齐 | H3WB optional，用于 COCO-WholeBody layout 的 3D 补充 |
 | mask 稳定 | COCO person mask 为主，OCHuman 补重遮挡 |
-| scene seg 独立 | ADE20K 只训练语义分割，不干扰 instance mask |
+| scene seg 独立 | ADEChallengeData2016 只训练语义分割，不干扰 instance mask |
 
 最终选择：
 
@@ -241,7 +241,7 @@ keep:
   - H3WB_optional
   - COCO_person_mask
   - OCHuman
-  - ADE20K
+  - ADEChallengeData2016
 
 remove:
   - LVIS
@@ -263,4 +263,4 @@ remove:
 | 3DPW | 3DPW official |
 | AGORA | AGORA official / CVPR paper material |
 | H3WB | H3WB official repository / ICCV paper |
-| ADE20K | ADE20K official / MIT Scene Parsing Benchmark |
+| ADEChallengeData2016 | ADE20K challenge split / MIT Scene Parsing Benchmark |
