@@ -294,6 +294,7 @@ def build_yolo_dataset(
         data=data,
         split=mode,
         fraction=cfg.fraction if mode == "train" else 1.0,
+        max_samples=getattr(cfg, "val_samples", None) if mode == "val" else None,
     )
 
 

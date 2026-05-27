@@ -35,7 +35,6 @@ STAGE_DATA_YAMLS = {
     "A_detection_stable": DATA_YAML,
     "B_pose2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
-    "C_pose25d_no_H3WB": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
     "E_scene_seg": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml",
     "F_full_finetune": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
@@ -75,7 +74,7 @@ def stage_config(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
     if "_no_" in stage_name or stage_name.endswith("_pose_heavy"):
         base_name = stage_name.split("_no_", 1)[0] if "_no_" in stage_name else "F_full_finetune"
         base = dict(stages.get(base_name, {}) or {})
-        for key in ("train", "loss", "augment", "train_runtime", "sampling", "samples_per_epoch"):
+        for key in ("train", "loss", "augment", "train_runtime", "sampling", "samples_per_epoch", "val_samples"):
             cfg.setdefault(key, base.get(key))
     return cfg
 
@@ -119,6 +118,13 @@ def rotate_gain(value: Any) -> float:
 
 def active_tasks_from_stage(stage: dict[str, Any]) -> set[str]:
     """Resolve active head branches from stage train/loss config."""
+    runtime_tasks = (stage.get("train_runtime") or {}).get("active_tasks")
+    if runtime_tasks:
+        if isinstance(runtime_tasks, str):
+            runtime_tasks = [item.strip() for item in runtime_tasks.split(",") if item.strip()]
+        tasks = {str(task).strip().lower() for task in runtime_tasks}
+        tasks.add("det")
+        return tasks
     train = stage.get("train") or {}
     loss = stage.get("loss") or {}
     tasks = {"det"}
@@ -146,7 +152,7 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
     model_cfg = plan.get("model", {})
     optimizer_cfg = plan.get("optimizer_scheduler") or {}
     defaults: dict[str, Any] = {}
-    for key in ("epochs", "samples_per_epoch", "sampling", "sampling_weights"):
+    for key in ("epochs", "samples_per_epoch", "sampling", "sampling_weights", "val_samples"):
         if stage.get(key) is not None:
             defaults[key] = stage[key]
     for key in (
@@ -485,7 +491,8 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI args. Runtime defaults are loaded in main after reading --stage/--plan."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", default="A_detection_stable", help="stage name under plan['stages']")
-    parser.add_argument("--weights", type=Path, help="optional checkpoint to start from")
+    parser.add_argument("--weights", type=Path, help="optional same-architecture checkpoint to start from")
+    parser.add_argument("--pretrain", type=Path, help="optional detection pretrain to partially load into --model")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--data", type=Path, help="dataset YAML; defaults to the selected stage YAML")
     parser.add_argument("--model", type=Path, default=MODEL_YAML)
@@ -501,6 +508,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", type=Path, default=ROOT / "runs/detect")
     parser.add_argument("--name")
     parser.add_argument("--fraction", type=float, default=1.0)
+    parser.add_argument("--val-samples", type=positive_int, help="limit validation to N evenly spaced images")
     parser.add_argument("--samples-per-epoch", type=positive_int)
     parser.add_argument("--sampling")
     parser.add_argument("--optimizer")
@@ -564,6 +572,7 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     batch = int(args.batch if args.batch is not None else defaults.get("batch", 8))
     accumulate = int(args.accumulate if args.accumulate is not None else defaults.get("accumulate", 1))
     no_val = bool(args.no_val or defaults.get("no_val", False))
+    val_samples = args.val_samples if args.val_samples is not None else defaults.get("val_samples")
 
     overrides = dict(
         data=str(args.data),
@@ -572,7 +581,7 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         batch=batch,
         nbs=batch * accumulate,
         workers=int(args.workers if args.workers is not None else defaults.get("workers", 8)),
-        freeze=int(args.freeze if args.freeze is not None else defaults.get("freeze", 10 if args.stage.startswith("A_detection") else 0)),
+        freeze=int(args.freeze if args.freeze is not None else defaults.get("freeze", 0)),
         project=str(args.project),
         name=args.name or f"yolo26ps_{args.stage.lower()}",
         task="detect",
@@ -584,6 +593,7 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         samples_per_epoch=args.samples_per_epoch or defaults.get("samples_per_epoch") or stage.get("samples_per_epoch"),
         sampling_weights=defaults.get("sampling_weights") or stage.get("sampling_weights") or {},
         val=not no_val,
+        val_samples=val_samples,
         save=not args.no_save,
         plots=not no_val,
         multi_scale=0.0 if stage.get("multi_scale") is False else float(defaults.get("multi_scale", 0.0)),
@@ -642,6 +652,12 @@ def main() -> None:
     YOLO26PSStageTrainer.stage_cfg = stage
     maybe_prepare(args)
     model = YOLO(str(args.weights or args.model))
+    if args.pretrain:
+        if args.weights:
+            LOGGER.warning("--pretrain is ignored when --weights is provided; same-architecture checkpoint already loaded.")
+        else:
+            LOGGER.info(f"Loading partial pretrained weights into {args.model}: {args.pretrain}")
+            model.load(args.pretrain)
     model.train(trainer=YOLO26PSStageTrainer, **build_overrides(args, plan, stage))
 
 

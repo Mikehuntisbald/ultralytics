@@ -96,6 +96,7 @@ class BaseDataset(Dataset):
         single_cls: bool = False,
         classes: list[int] | None = None,
         fraction: float = 1.0,
+        max_samples: int | None = None,
         channels: int = 3,
     ):
         """Initialize BaseDataset with given configuration and options.
@@ -114,6 +115,7 @@ class BaseDataset(Dataset):
             single_cls (bool): If True, single class training is used.
             classes (list[int], optional): List of included classes.
             fraction (float): Fraction of dataset to utilize.
+            max_samples (int, optional): Maximum number of images to keep after fraction filtering.
             channels (int): Number of channels in the images (1 for grayscale, 3 for color). Color images loaded with
                 OpenCV are in BGR channel order.
         """
@@ -125,6 +127,7 @@ class BaseDataset(Dataset):
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
+        self.max_samples = max_samples
         self.channels = channels
         self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
         self.im_files = self.get_img_files(self.img_path)
@@ -194,6 +197,9 @@ class BaseDataset(Dataset):
             raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}") from e
         if self.fraction < 1:
             im_files = im_files[: round(len(im_files) * self.fraction)]  # retain a fraction of the dataset
+        if self.max_samples is not None and self.max_samples > 0 and len(im_files) > self.max_samples:
+            stride = max(len(im_files) / self.max_samples, 1.0)
+            im_files = [im_files[min(int(i * stride), len(im_files) - 1)] for i in range(self.max_samples)]
         check_file_speeds(im_files, prefix=self.prefix)  # check image read speeds
         return im_files
 
