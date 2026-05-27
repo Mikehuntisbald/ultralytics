@@ -242,3 +242,6 @@ The previous square probe found `704, batch=7, accumulate=12` stable on the RTX 
 uses less pixel area than square `704`. The current Stage A restart uses rectangular `[448,768]`, `batch=18`,
 `accumulate=4`, simple validation, and official YOLO26s detection pretrain. Batch 20 trained but repeatedly triggered
 TaskAlignedAssigner CPU fallback near the 32 GB limit, so batch 18 is the default for sustained runs.
+
+Stage A disables mosaic by default. If the deployment target should be closer to 16:10, prefer testing `[480,768]`
+before lowering resolution; it is stride-32 aligned and exactly 16:10, but costs about 7% more pixels than `[448,768]`.

@@ -208,7 +208,7 @@ stages:
       amp: true
     train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
     loss: {det: 1.0}
-    augment: {mosaic: 0.2, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
+    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
   A_detection_stable:
     epochs: 15
     samples_per_epoch: 40000
@@ -241,7 +241,7 @@ stages:
       amp: true
     train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
     loss: {det: 1.0}
-    augment: {mosaic: 0.2, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
+    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
   B_pose2d:
     epochs: 45
     samples_per_epoch: 40000
