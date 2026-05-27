@@ -170,16 +170,26 @@ branches, and task loss weights. Stage A also sets `head.active_tasks={"det"}` s
 python tools/train_yolo26ps_stage.py \
   --stage A_detection_stable \
   --plan ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml \
+  --pretrain pretrains/yolo26s-det.pt \
   --device 0
 ```
+
+Stage A should start from the official YOLO26s detection pretrain when available. Use `--pretrain`, not `--weights`,
+for this case: the trainer first builds `yolo26s-ps25d.yaml`, then partially transfers matching backbone/neck weights
+from `pretrains/yolo26s-det.pt`. `--weights` is reserved for same-architecture YOLO26s-PS-2.5D checkpoints when
+resuming or chaining stages. Confirm the log prints `Transferred ... items from pretrained weights`; otherwise the run
+is effectively random initialization.
 
 Current plan defaults for Stage A:
 
 - `epochs=15`
 - `samples_per_epoch=40000`
+- `val_samples=2000`
 - `imgsz=[448, 768]`
-- `batch=7`
-- `accumulate=12`
+- `batch=18`
+- `accumulate=4`
+- `freeze=0`
+- `val=true` with simple validation capped by `val_samples`
 - `optimizer=SGD`
 - `lr0=0.006`
 - `lrf=0.01`
@@ -203,6 +213,15 @@ the plan default optimizer unless overridden. The plan keeps the stage learning 
 
 The old `tools/train_yolo26ps_stage_a.py` remains as a compatibility wrapper around the shared entrypoint.
 
+Do not enable `freeze` by default for Stage A. Freezing early modules only makes sense after a compatible pretrain is
+confirmed; if partial transfer fails, freezing random backbone layers prevents the detection warmup from recovering.
+The current plan keeps `freeze=0` and trains the backbone, neck, and detection head while auxiliary task heads stay
+inactive.
+
+Validation is enabled for the normal Stage A run, but it is intentionally capped by `val_samples=2000`. The full Stage A
+validation split is large enough to dominate every epoch, so routine training uses a deterministic evenly spaced subset
+for quick signal. Run a full validation explicitly at stage boundaries or before selecting a release checkpoint.
+
 For quick smoke or VRAM probes:
 
 ```bash
@@ -220,4 +239,6 @@ python tools/train_yolo26ps_stage.py \
 ```
 
 The previous square probe found `704, batch=7, accumulate=12` stable on the RTX 5090 32GB path. Rectangular `[448,768]`
-uses less pixel area than square `704`, but it should still be probed on the target machine before increasing batch.
+uses less pixel area than square `704`. The current Stage A restart uses rectangular `[448,768]`, `batch=18`,
+`accumulate=4`, simple validation, and official YOLO26s detection pretrain. Batch 20 trained but repeatedly triggered
+TaskAlignedAssigner CPU fallback near the 32 GB limit, so batch 18 is the default for sustained runs.
