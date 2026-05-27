@@ -1,9 +1,6 @@
-# YOLO26s-PS-2.5D Stage E dataset.
-
 path: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI
 train: stage_e_train.txt
 val: stage_e_val.txt
-
 unified_schema: true
 unified_labels:
   train: labels/stage_e/train
@@ -11,13 +8,399 @@ unified_labels:
 unified_manifest:
   train: manifests/stage_e_train.jsonl
   val: manifests/stage_e_val.jsonl
-
 nc: 366
 person_cls: 0
 face_cls: 365
 det_base_nc: 365
-det_extra_classes: [face]
-kpt_shape: [17, 3]
-flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+det_extra_classes:
+- face
+kpt_shape:
+- 17
+- 3
+flip_idx:
+- 0
+- 2
+- 1
+- 4
+- 3
+- 6
+- 5
+- 8
+- 7
+- 10
+- 9
+- 12
+- 11
+- 14
+- 13
+- 16
+- 15
 scene_nc: 150
 scene_ignore_index: 255
+names:
+  0: Person
+  1: Sneakers
+  2: Chair
+  3: Other_Shoes
+  4: Hat
+  5: Car
+  6: Lamp
+  7: Glasses
+  8: Bottle
+  9: Desk
+  10: Cup
+  11: Street_Lights
+  12: Cabinet/shelf
+  13: Handbag/Satchel
+  14: Bracelet
+  15: Plate
+  16: Picture/Frame
+  17: Helmet
+  18: Book
+  19: Gloves
+  20: Storage_box
+  21: Boat
+  22: Leather_Shoes
+  23: Flower
+  24: Bench
+  25: Potted_Plant
+  26: Bowl/Basin
+  27: Flag
+  28: Pillow
+  29: Boots
+  30: Vase
+  31: Microphone
+  32: Necklace
+  33: Ring
+  34: SUV
+  35: Wine_Glass
+  36: Belt
+  37: Moniter/TV
+  38: Backpack
+  39: Umbrella
+  40: Traffic_Light
+  41: Speaker
+  42: Watch
+  43: Tie
+  44: Trash_bin_Can
+  45: Slippers
+  46: Bicycle
+  47: Stool
+  48: Barrel/bucket
+  49: Van
+  50: Couch
+  51: Sandals
+  52: Bakset
+  53: Drum
+  54: Pen/Pencil
+  55: Bus
+  56: Wild_Bird
+  57: High_Heels
+  58: Motorcycle
+  59: Guitar
+  60: Carpet
+  61: Cell_Phone
+  62: Bread
+  63: Camera
+  64: Canned
+  65: Truck
+  66: Traffic_cone
+  67: Cymbal
+  68: Lifesaver
+  69: Towel
+  70: Stuffed_Toy
+  71: Candle
+  72: Sailboat
+  73: Laptop
+  74: Awning
+  75: Bed
+  76: Faucet
+  77: Tent
+  78: Horse
+  79: Mirror
+  80: Power_outlet
+  81: Sink
+  82: Apple
+  83: Air_Conditioner
+  84: Knife
+  85: Hockey_Stick
+  86: Paddle
+  87: Pickup_Truck
+  88: Fork
+  89: Traffic_Sign
+  90: Ballon
+  91: Tripod
+  92: Dog
+  93: Spoon
+  94: Clock
+  95: Pot
+  96: Cow
+  97: Cake
+  98: Dinning_Table
+  99: Sheep
+  100: Hanger
+  101: Blackboard/Whiteboard
+  102: Napkin
+  103: Other_Fish
+  104: Orange/Tangerine
+  105: Toiletry
+  106: Keyboard
+  107: Tomato
+  108: Lantern
+  109: Machinery_Vehicle
+  110: Fan
+  111: Green_Vegetables
+  112: Banana
+  113: Baseball_Glove
+  114: Airplane
+  115: Mouse
+  116: Train
+  117: Pumpkin
+  118: Soccer
+  119: Skiboard
+  120: Luggage
+  121: Nightstand
+  122: Tea_pot
+  123: Telephone
+  124: Trolley
+  125: Head_Phone
+  126: Sports_Car
+  127: Stop_Sign
+  128: Dessert
+  129: Scooter
+  130: Stroller
+  131: Crane
+  132: Remote
+  133: Refrigerator
+  134: Oven
+  135: Lemon
+  136: Duck
+  137: Baseball_Bat
+  138: Surveillance_Camera
+  139: Cat
+  140: Jug
+  141: Broccoli
+  142: Piano
+  143: Pizza
+  144: Elephant
+  145: Skateboard
+  146: Surfboard
+  147: Gun
+  148: Skating_and_Skiing_shoes
+  149: Gas_stove
+  150: Donut
+  151: Bow_Tie
+  152: Carrot
+  153: Toilet
+  154: Kite
+  155: Strawberry
+  156: Other_Balls
+  157: Shovel
+  158: Pepper
+  159: Computer_Box
+  160: Toilet_Paper
+  161: Cleaning_Products
+  162: Chopsticks
+  163: Microwave
+  164: Pigeon
+  165: Baseball
+  166: Cutting/chopping_Board
+  167: Coffee_Table
+  168: Side_Table
+  169: Scissors
+  170: Marker
+  171: Pie
+  172: Ladder
+  173: Snowboard
+  174: Cookies
+  175: Radiator
+  176: Fire_Hydrant
+  177: Basketball
+  178: Zebra
+  179: Grape
+  180: Giraffe
+  181: Potato
+  182: Sausage
+  183: Tricycle
+  184: Violin
+  185: Egg
+  186: Fire_Extinguisher
+  187: Candy
+  188: Fire_Truck
+  189: Billards
+  190: Converter
+  191: Bathtub
+  192: Wheelchair
+  193: Golf_Club
+  194: Briefcase
+  195: Cucumber
+  196: Cigar/Cigarette
+  197: Paint_Brush
+  198: Pear
+  199: Heavy_Truck
+  200: Hamburger
+  201: Extractor
+  202: Extention_Cord
+  203: Tong
+  204: Tennis_Racket
+  205: Folder
+  206: American_Football
+  207: earphone
+  208: Mask
+  209: Kettle
+  210: Tennis
+  211: Ship
+  212: Swing
+  213: Coffee_Machine
+  214: Slide
+  215: Carriage
+  216: Onion
+  217: Green_beans
+  218: Projector
+  219: Frisbee
+  220: Washing_Machine/Drying_Machine
+  221: Chicken
+  222: Printer
+  223: Watermelon
+  224: Saxophone
+  225: Tissue
+  226: Toothbrush
+  227: Ice_cream
+  228: Hotair_ballon
+  229: Cello
+  230: French_Fries
+  231: Scale
+  232: Trophy
+  233: Cabbage
+  234: Hot_dog
+  235: Blender
+  236: Peach
+  237: Rice
+  238: Wallet/Purse
+  239: Volleyball
+  240: Deer
+  241: Goose
+  242: Tape
+  243: Tablet
+  244: Cosmetics
+  245: Trumpet
+  246: Pineapple
+  247: Golf_Ball
+  248: Ambulance
+  249: Parking_meter
+  250: Mango
+  251: Key
+  252: Hurdle
+  253: Fishing_Rod
+  254: Medal
+  255: Flute
+  256: Brush
+  257: Penguin
+  258: Megaphone
+  259: Corn
+  260: Lettuce
+  261: Garlic
+  262: Swan
+  263: Helicopter
+  264: Green_Onion
+  265: Sandwich
+  266: Nuts
+  267: Speed_Limit_Sign
+  268: Induction_Cooker
+  269: Broom
+  270: Trombone
+  271: Plum
+  272: Rickshaw
+  273: Goldfish
+  274: Kiwi_fruit
+  275: Router/modem
+  276: Poker_Card
+  277: Toaster
+  278: Shrimp
+  279: Sushi
+  280: Cheese
+  281: Notepaper
+  282: Cherry
+  283: Pliers
+  284: CD
+  285: Pasta
+  286: Hammer
+  287: Cue
+  288: Avocado
+  289: Hamimelon
+  290: Flask
+  291: Mushroon
+  292: Screwdriver
+  293: Soap
+  294: Recorder
+  295: Bear
+  296: Eggplant
+  297: Board_Eraser
+  298: Coconut
+  299: Tape_Measur/_Ruler
+  300: Pig
+  301: Showerhead
+  302: Globe
+  303: Chips
+  304: Steak
+  305: Crosswalk_Sign
+  306: Stapler
+  307: Campel
+  308: Formula_1
+  309: Pomegranate
+  310: Dishwasher
+  311: Crab
+  312: Hoverboard
+  313: Meat_ball
+  314: Rice_Cooker
+  315: Tuba
+  316: Calculator
+  317: Papaya
+  318: Antelope
+  319: Parrot
+  320: Seal
+  321: Buttefly
+  322: Dumbbell
+  323: Donkey
+  324: Lion
+  325: Urinal
+  326: Dolphin
+  327: Electric_Drill
+  328: Hair_Dryer
+  329: Egg_tart
+  330: Jellyfish
+  331: Treadmill
+  332: Lighter
+  333: Grapefruit
+  334: Game_board
+  335: Mop
+  336: Radish
+  337: Baozi
+  338: Target
+  339: French
+  340: Spring_Rolls
+  341: Monkey
+  342: Rabbit
+  343: Pencil_Case
+  344: Yak
+  345: Red_Cabbage
+  346: Binoculars
+  347: Asparagus
+  348: Barbell
+  349: Scallop
+  350: Noddles
+  351: Comb
+  352: Dumpling
+  353: Oyster
+  354: Table_Teniis_paddle
+  355: Cosmetics_Brush/Eyeliner_Pencil
+  356: Chainsaw
+  357: Eraser
+  358: Lobster
+  359: Durian
+  360: Okra
+  361: Lipstick
+  362: Cosmetics_Mirror
+  363: Curling
+  364: Table_Tennis
+  365: face
