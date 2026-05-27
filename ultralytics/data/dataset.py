@@ -248,13 +248,53 @@ class YOLODataset(BaseDataset):
                 if label_file and label_file.exists():
                     record = json.loads(label_file.read_text(encoding="utf-8"))
             if record is None:
-                missing += 1
-                record = {"image": im_file, "instances": [], "task_flags": {}}
+                yolo_record = self._yolo_record_from_label_file(im_file)
+                if yolo_record is not None:
+                    record = yolo_record
+                else:
+                    missing += 1
+                    record = {"image": im_file, "instances": [], "task_flags": {}}
             labels.append(self._parse_unified_record(record, im_file))
         if missing:
             LOGGER.warning(f"{self.prefix}{missing} images have no unified JSON label; using empty partial labels.")
         self.im_files = [lb["im_file"] for lb in labels]
         return labels
+
+    def _yolo_record_from_label_file(self, im_file: str | Path) -> dict | None:
+        """Build a minimal unified record from a standard YOLO txt label file."""
+        label_file = Path(img2label_paths([str(im_file)])[0])
+        if not label_file.exists():
+            return None
+        instances = []
+        for line in label_file.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            cls, cx, cy, bw, bh = map(float, parts[:5])
+            instances.append(
+                {
+                    "cls_id": int(cls),
+                    "bbox": [cx, cy, bw, bh],
+                    "bbox_format": "xywh",
+                    "flags": {
+                        "has_bbox": True,
+                        "has_body2d": False,
+                        "has_body3d": False,
+                        "has_person_mask": False,
+                    },
+                }
+            )
+        return {
+            "image": str(im_file),
+            "instances": instances,
+            "task_flags": {
+                "has_det": bool(instances),
+                "has_pose2d": False,
+                "has_pose3d": False,
+                "has_person_mask": False,
+                "has_scene_seg": False,
+            },
+        }
 
     def _split_value(self, key: str) -> Any:
         value = self.data.get(key)
