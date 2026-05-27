@@ -1510,8 +1510,13 @@ class YOLO26PS25DE2ELoss:
 
     def __init__(self, model):
         """Initialize one-to-many and one-to-one branches."""
-        self.one2many = YOLO26PS25DLoss(model, tal_topk=10)
-        self.one2one = YOLO26PS25DLoss(model, tal_topk=7, tal_topk2=1)
+        args = getattr(model, "args", None)
+        o2m_topk = int(getattr(args, "tal_topk_one2many", 10) or 10)
+        o2o_topk = int(getattr(args, "tal_topk_one2one", 7) or 7)
+        o2o_topk2 = int(getattr(args, "tal_topk2_one2one", 1) or 1)
+        self.one2many = YOLO26PS25DLoss(model, tal_topk=o2m_topk)
+        self.one2one = YOLO26PS25DLoss(model, tal_topk=o2o_topk, tal_topk2=o2o_topk2)
+        self.tal_topk = {"one2many": o2m_topk, "one2one": o2o_topk, "one2one_topk2": o2o_topk2}
         self.updates = 0
         self.total = 1.0
         self.o2m = 0.8

@@ -518,6 +518,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--warmup-epochs", type=float)
     parser.add_argument("--warmup-bias-lr", type=float)
+    parser.add_argument("--tal-topk-one2many", type=positive_int)
+    parser.add_argument("--tal-topk-one2one", type=positive_int)
+    parser.add_argument("--tal-topk2-one2one", type=positive_int)
     parser.add_argument("--cos-lr", action="store_true", help="force cosine LR scheduler")
     parser.add_argument("--no-cos-lr", action="store_true", help="force non-cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", help="force AMP on")
@@ -622,6 +625,15 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         value = cli_value if cli_value is not None else defaults.get(key)
         if value is not None:
             overrides[key] = value
+    for key, cli_key in (
+        ("tal_topk_one2many", "tal_topk_one2many"),
+        ("tal_topk_one2one", "tal_topk_one2one"),
+        ("tal_topk2_one2one", "tal_topk2_one2one"),
+    ):
+        cli_value = getattr(args, cli_key, None)
+        value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = int(value)
     if args.cos_lr:
         overrides["cos_lr"] = True
     elif args.no_cos_lr:
