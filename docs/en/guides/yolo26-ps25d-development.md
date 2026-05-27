@@ -239,9 +239,162 @@ python tools/train_yolo26ps_stage.py \
 ```
 
 The previous square probe found `704, batch=7, accumulate=12` stable on the RTX 5090 32GB path. Rectangular `[448,768]`
-uses less pixel area than square `704`. The current Stage A restart uses rectangular `[448,768]`, `batch=18`,
-`accumulate=4`, simple validation, and official YOLO26s detection pretrain. Batch 20 trained but repeatedly triggered
-TaskAlignedAssigner CPU fallback near the 32 GB limit, so batch 18 is the default for sustained runs.
+uses less pixel area than square `704`. The current Stage A runtime uses rectangular `[448,768]`, `batch=18`,
+`accumulate=4`, simple validation, and official YOLO26s detection pretrain. Batch 20 repeatedly triggered
+TaskAlignedAssigner CPU fallback near the 32 GB limit. Batch 18 is the high-util plan value, but if any
+`TaskAlignedAssigner CUDA OOM -> using CPU` warning appears, prefer dropping to `batch=16` over increasing
+resolution. A slightly smaller batch that keeps assignment on GPU is usually faster than a larger batch that falls back
+to CPU.
 
 Stage A disables mosaic by default. If the deployment target should be closer to 16:10, prefer testing `[480,768]`
 before lowering resolution; it is stride-32 aligned and exactly 16:10, but costs about 7% more pixels than `[448,768]`.
+Only try `[480,768]` after `[448,768]` is free of TaskAlignedAssigner fallback.
+
+## End-to-End Detection Loss
+
+YOLO26-PS keeps the YOLO26 end-to-end detection design: training has two detection branches and deployment uses the
+one-to-one branch for NMS-free output.
+
+| Branch | Purpose | Current TAL settings |
+| --- | --- | --- |
+| `one2many` | Dense supervision. One GT may match several anchors, which improves early recall and stabilizes training. | `tal_topk=10` |
+| `one2one` | End-to-end/NMS-free supervision. It encourages each GT to settle onto one final prediction. | `tal_topk=7`, `tal_topk2=1` |
+
+The current wrapper is implemented in `YOLO26PS25DE2ELoss`:
+
+```python
+self.one2many = YOLO26PS25DLoss(model, tal_topk=10)
+self.one2one = YOLO26PS25DLoss(model, tal_topk=7, tal_topk2=1)
+self.o2m = 0.8
+self.o2o = 0.2
+self.final_o2m = 0.1
+```
+
+`criterion.update()` decays the one-to-many contribution during training. At the beginning, one-to-many provides most of
+the signal. Later, the loss shifts toward one-to-one so the exported branch is the one being optimized most directly.
+
+`tal_topk` is not deployment `topK=300`. Deployment topK controls how many decoded detections are returned. TAL topK is
+training-only and controls how many candidate anchors a GT can use during assignment.
+
+## TaskAlignedAssigner Notes
+
+`TaskAlignedAssigner` chooses positive anchors for each GT box. For every batch it builds intermediate tensors with a
+shape close to:
+
+```text
+[batch, max_gt_in_batch, total_anchors]
+```
+
+With `[448,768]` and P2-P5, the model has about 28.5k candidate points per image:
+
+```text
+P2: 112x192 = 21504
+P3:  56x96  = 5376
+P4:  28x48  = 1344
+P5:  14x24  = 336
+total ~= 28560
+```
+
+Objects365 and CrowdHuman can produce batches with many GT boxes, so the assignment peak can be the real memory limit
+even when the forward/backward pass itself fits. When assignment OOMs, Ultralytics catches the exception and reruns TAL
+on CPU. That keeps training alive but lowers GPU utilization and increases epoch time.
+
+Operational rule:
+
+- If there is no TAL fallback, fill remaining memory by testing larger batch or `[480,768]`.
+- If TAL fallback appears, reduce batch first. Do not raise resolution.
+- If fallback persists at a reasonable batch, add a configurable TAL topK in the plan and test `one2many=8` before
+  touching the model architecture.
+- Keep `workers=20` unless CPU image loading clearly becomes the bottleneck; the current low-util symptom is assignment
+  fallback, not dataloader starvation.
+
+Useful checks during training:
+
+```bash
+rg -n "TaskAlignedAssigner|CUDA OutOfMemoryError|using CPU" runs/detect/<run>_train.log
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,utilization.memory,power.draw --format=csv
+tail -n 8 runs/detect/<run>/results.csv
+```
+
+## GPU Utilization Tuning
+
+The desired state is not simply "highest memory used." The desired state is steady GPU-side training without repeated
+CPU fallbacks or long validation stalls.
+
+Preferred tuning order for Stage A:
+
+1. Keep `mosaic=0.0`, `mixup=0.0`, `copy_paste=0.0`, and `cutmix=0.0`.
+2. Use `[448,768]`, `batch=18`, `accumulate=4` as the high-util probe.
+3. If TAL fallback appears, switch to `batch=16` and keep the same image size.
+4. After a clean epoch with no fallback, test `[480,768]` only if 16:10 fidelity matters more than throughput.
+5. Keep simple validation capped with `val_samples=2000`; full validation belongs at stage boundaries.
+
+Low GPU utilization can be healthy during validation, checkpoint save, plot generation, or the first few dataloader warmup
+steps. It is unhealthy when it coincides with repeated `TaskAlignedAssigner` CPU fallback during the training progress
+bar.
+
+## Stage Chaining
+
+Use `--pretrain` only when starting from an official YOLO26 detection checkpoint and building the PS-2.5D model from
+YAML. Use `--weights` when the checkpoint already has the YOLO26s-PS-2.5D architecture.
+
+Examples:
+
+```bash
+# Stage A from official detection pretrain.
+python tools/train_yolo26ps_stage.py \
+  --stage A_detection_stable \
+  --pretrain pretrains/yolo26s-det.pt \
+  --device 0
+
+# Stage B from a finished Stage A checkpoint.
+python tools/train_yolo26ps_stage.py \
+  --stage B_pose2d \
+  --weights runs/detect/<stage_a_run>/weights/best.pt \
+  --device 0
+```
+
+Avoid `resume=True` when intentionally changing augmentation, image size, batch size, or stage behavior. A plain
+`--weights runs/.../last.pt` load starts a new run with the current plan settings. True resume is only for continuing the
+same run configuration after interruption.
+
+## Validation Contract
+
+Stage validation is meant to catch source-specific regressions, not just total loss movement. The Stage A validator
+records lightweight buckets:
+
+- `stage_a/objects365/*`
+- `stage_a/objects365/person/*`
+- `stage_a/crowdhuman/person/*`
+- `stage_a/wider_face/face/*`
+- `stage_a/small/*`
+
+Early Stage A absolute mAP can be low because the run has hundreds of classes, a short warmup, and a capped validation
+subset. A healthy Stage A should still show:
+
+- train box/cls losses trending down
+- CrowdHuman person AP improving
+- WIDER FACE face AP improving
+- Objects365 mAP improving, even if slowly
+- no large detector regression after introducing a new source or augmentation setting
+
+For B-F, add or inspect task-specific metrics at stage boundaries:
+
+| Stage | Required signal |
+| --- | --- |
+| B pose2d | pose AP/PCK or normalized xy error on COCO/OCHuman-style sources |
+| C pose25d | normalized z error and 3D consistency on 3DPW/AGORA |
+| D person mask | person mask AP/Dice on COCO person mask and OCHuman |
+| E scene seg | ADE20K mIoU and detection AP retention |
+| F finetune | all task metrics with ADE20K weight kept small |
+
+## Known Work Items
+
+These are deliberate engineering items, not model-contract changes:
+
+- Make TAL topK configurable from the plan YAML instead of hardcoding `one2many=10`, `one2one=7/1`.
+- Cache person-positive assignment for pose and mask losses in B-F so the same matching result is reused across task
+  heads.
+- Expand validation dashboards so each stage reports its own primary task metrics by source.
+- Consider a strict "resume with plan overrides" path if interrupted runs need to preserve optimizer state while changing
+  augmentation controls.
