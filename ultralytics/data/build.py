@@ -121,8 +121,28 @@ def _path_source(path: str, weights: dict[str, float]) -> str:
     return ""
 
 
+def _label_source(label: dict[str, Any] | None, weights: dict[str, float]) -> str:
+    """Return a sampler source from cached labels, falling back to empty when unavailable."""
+    if not isinstance(label, dict):
+        return ""
+    source = str(label.get("source") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "object365": "objects365",
+        "wider": "wider_face",
+        "widerface": "wider_face",
+        "coco": "coco_wholebody",
+        "coco-wholebody": "coco_wholebody",
+        "human36m": "h3wb",
+        "human3.6m": "h3wb",
+    }
+    source = aliases.get(source, source)
+    if source in weights:
+        return source
+    return ""
+
+
 def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], samples_per_epoch: int) -> WeightedRandomSampler:
-    """Create a weighted replacement sampler from source names embedded in dataset image paths."""
+    """Create a weighted replacement sampler from cached source names or image path segments."""
     if samples_per_epoch <= 0:
         raise ValueError(f"samples_per_epoch must be positive, got {samples_per_epoch}.")
     if not weights:
@@ -132,9 +152,10 @@ def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], sa
         raise ValueError("weighted_random_with_replacement requires a dataset with im_files.")
     weights = {str(k).lower(): float(v) for k, v in weights.items()}
     counts = {source: 0 for source in weights}
+    labels = getattr(dataset, "labels", None) or []
     sources = []
-    for path in im_files:
-        source = _path_source(path, weights)
+    for i, path in enumerate(im_files):
+        source = _label_source(labels[i] if i < len(labels) else None, weights) or _path_source(path, weights)
         sources.append(source)
         if source in counts:
             counts[source] += 1

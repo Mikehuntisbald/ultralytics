@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from itertools import repeat
@@ -33,7 +34,9 @@ from .augment import (
 from .base import BaseDataset, img_size_hw
 from .converter import merge_multi_segment
 from .utils import (
+    FORMATS_HELP_MSG,
     HELP_URL,
+    IMG_FORMATS,
     check_file_speeds,
     get_hash,
     img2label_paths,
@@ -47,8 +50,41 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
+UNIFIED_CACHE_VERSION = "1.0.5"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
+SOURCE_ALIASES = {
+    "object365": "objects365",
+    "objects365": "objects365",
+    "crowdhuman": "crowdhuman",
+    "wider": "wider_face",
+    "widerface": "wider_face",
+    "wider_face": "wider_face",
+    "coco": "coco_wholebody",
+    "coco_wholebody": "coco_wholebody",
+    "coco-wholebody": "coco_wholebody",
+    "coco_person": "coco_person_mask",
+    "coco_person_mask": "coco_person_mask",
+    "ochuman": "ochuman",
+    "3dpw": "3dpw",
+    "agora": "agora",
+    "h3wb": "h3wb",
+    "human36m": "h3wb",
+    "human3.6m": "h3wb",
+    "ade20k": "ade20k",
+}
+PATH_SOURCE_MARKERS = (
+    ("objects365", ("objects365", "object365")),
+    ("crowdhuman", ("crowdhuman",)),
+    ("wider_face", ("wider_face", "widerface")),
+    ("ochuman", ("ochuman",)),
+    ("3dpw", ("3dpw",)),
+    ("agora", ("agora",)),
+    ("h3wb", ("h3wb", "human36m", "human3.6m")),
+    ("ade20k", ("ade20k",)),
+    ("coco_person_mask", ("coco_person_mask",)),
+    ("coco_wholebody", ("coco_wholebody", "coco-wholebody")),
+)
 PERSON_ONLY_SOURCES = {
     "crowdhuman",
     "coco_wholebody",
@@ -113,6 +149,43 @@ class YOLODataset(BaseDataset):
             or self.data.get("unified_labels")
             or self.data.get("unified_manifest")
         )
+
+    def get_img_files(self, img_path: str | list[str]) -> list[str]:
+        """Return image files, using unified manifests directly when available."""
+        if not self.use_unified_labels:
+            return super().get_img_files(img_path)
+        try:
+            # The stage train/val txt files are the source of truth because they can include both unified JSON samples
+            # and detection-only YOLO txt samples. Manifests are used as an annotation index, not as a replacement list.
+            return super().get_img_files(img_path)
+        except FileNotFoundError:
+            pass
+        manifest = self._resolve_data_path(self._split_value("unified_manifest")) if self.use_unified_labels else None
+        if manifest is None or not manifest.exists():
+            return super().get_img_files(img_path)
+
+        records = self._read_unified_manifest_records(manifest)
+        root = Path(self.data.get("path", ".")).resolve()
+        im_files = []
+        for rec in records:
+            image = rec.get("image") or rec.get("im_file") or rec.get("file_name")
+            if not image:
+                continue
+            path = Path(image)
+            if not path.is_absolute():
+                path = root / path
+            if path.suffix[1:].lower() in IMG_FORMATS:
+                im_files.append(str(path.resolve()))
+        im_files = sorted(im_files)
+        if self.fraction < 1:
+            im_files = im_files[: round(len(im_files) * self.fraction)]
+        if self.max_samples is not None and self.max_samples > 0 and len(im_files) > self.max_samples:
+            stride = max(len(im_files) / self.max_samples, 1.0)
+            im_files = [im_files[min(int(i * stride), len(im_files) - 1)] for i in range(self.max_samples)]
+        if not im_files:
+            raise FileNotFoundError(f"{self.prefix}No images found in unified manifest {manifest}. {FORMATS_HELP_MSG}")
+        check_file_speeds(im_files, prefix=self.prefix)
+        return im_files
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
         """Cache dataset labels, check images and read shapes.
@@ -238,27 +311,158 @@ class YOLODataset(BaseDataset):
 
     def get_unified_labels(self) -> list[dict]:
         """Return labels parsed from the YOLO26-PS unified JSON schema."""
+        cache_path = self._unified_cache_path()
+        cache_hash = self._unified_cache_hash()
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache.get("unified_version") == UNIFIED_CACHE_VERSION
+            assert cache["hash"] == cache_hash
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_unified_labels(cache_path, cache_hash), False
+
+        n = cache.get("results", (len(cache.get("labels", [])), 0, 0))[0]
+        if exists and LOCAL_RANK in {-1, 0}:
+            desc = f"{self.prefix}Scanning {cache_path}... {n} unified images"
+            TQDM(None, desc=desc, total=n, initial=n)
+            if cache.get("msgs"):
+                LOGGER.info("\n".join(cache["msgs"]))
+
+        labels = cache["labels"]
+        if not labels:
+            raise RuntimeError(f"No valid unified labels found in {cache_path}.")
+        self.im_files = [lb["im_file"] for lb in labels]
+        return labels
+
+    def cache_unified_labels(self, path: Path, cache_hash: str | None = None) -> dict:
+        """Parse and cache labels from the YOLO26-PS unified JSON schema."""
         records = self._load_unified_manifest()
-        labels = []
+        pending = set(self.im_files)
+        x = {"labels": []}
         missing = 0
-        for im_file in self.im_files:
-            record = records.get(str(Path(im_file).resolve())) or records.get(Path(im_file).name)
-            if record is None:
+        if len(self.im_files) > 100000:
+            for label in self._iter_stage_detection_cache():
+                im_file = str(Path(label["im_file"]).absolute())
+                if im_file in pending:
+                    x["labels"].append(self._unified_label_from_yolo_label(label))
+                    pending.remove(im_file)
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        pbar = TQDM(list(pending), desc=desc, total=len(pending))
+        for im_file in pbar:
+            im_file_abs = str(Path(im_file).absolute())
+            record = records.get(im_file_abs) or records.get(Path(im_file).name)
+            if record is not None:
+                record.setdefault("source", self._source_from_record(record, im_file))
+                label = self._parse_unified_record(record, im_file)
+            else:
                 label_file = self._unified_label_file(im_file)
                 if label_file and label_file.exists():
                     record = json.loads(label_file.read_text(encoding="utf-8"))
-            if record is None:
-                yolo_record = self._yolo_record_from_label_file(im_file)
-                if yolo_record is not None:
-                    record = yolo_record
+                    record.setdefault("source", self._source_from_record(record, im_file))
+                    label = self._parse_unified_record(record, im_file)
                 else:
-                    missing += 1
-                    record = {"image": im_file, "instances": [], "task_flags": {}}
-            labels.append(self._parse_unified_record(record, im_file))
+                    yolo_label = self._unified_label_from_yolo_file(im_file)
+                    if yolo_label is not None:
+                        label = yolo_label
+                    else:
+                        missing += 1
+                        record = {"image": im_file, "source": self._source_from_path(im_file), "instances": [], "task_flags": {}}
+                        label = self._parse_unified_record(record, im_file)
+            x["labels"].append(label)
+            pbar.desc = f"{desc} {len(x['labels'])} images, {missing} missing"
+        pbar.close()
+        order = {str(Path(im_file).absolute()): i for i, im_file in enumerate(self.im_files)}
+        x["labels"].sort(key=lambda label: order.get(label["im_file"], len(order)))
+
+        x["hash"] = cache_hash or self._unified_cache_hash()
+        x["results"] = (len(x["labels"]), missing, 0)
+        x["msgs"] = [f"{missing} images have no unified JSON label; using empty partial labels."] if missing else []
+        x["unified_version"] = UNIFIED_CACHE_VERSION
         if missing:
-            LOGGER.warning(f"{self.prefix}{missing} images have no unified JSON label; using empty partial labels.")
-        self.im_files = [lb["im_file"] for lb in labels]
-        return labels
+            LOGGER.warning(f"{self.prefix}{x['msgs'][0]}")
+        if x["labels"]:
+            save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def _iter_stage_detection_cache(self):
+        """Yield labels from the prepared Stage A detection cache."""
+        path_root = Path(self.data.get("path", ".")).resolve()
+        stage_a = path_root.parent / "YOLO26PS_STAGE_A"
+        split = "train" if self.split == "train" else "val"
+        cache_path = stage_a / "labels" / split / "crowdhuman.cache"
+        try:
+            cache = load_dataset_cache_file(cache_path)
+            assert cache.get("version") == DATASET_CACHE_VERSION
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            return
+        yield from cache.get("labels", [])
+
+    def _unified_cache_path(self) -> Path:
+        """Return the cache path for parsed unified labels."""
+        img_sources = self.img_path if isinstance(self.img_path, list) else [self.img_path]
+        if img_sources:
+            source = Path(img_sources[0])
+            suffix = ".cache"
+            if self.max_samples is not None:
+                suffix = f".max{self.max_samples}.cache"
+            elif self.fraction < 1:
+                suffix = f".frac{self.fraction:g}.cache"
+            if source.is_file() or source.suffix:
+                return source.with_suffix(suffix)
+        manifest = self._resolve_data_path(self._split_value("unified_manifest"))
+        if manifest is not None:
+            return manifest.with_suffix(".cache")
+        label_root = self._resolve_data_path(self._split_value("unified_labels"))
+        if label_root is not None:
+            return label_root.parent / f"{label_root.name}.cache"
+        first = Path(img2label_paths([str(self.im_files[0])])[0]) if self.im_files else Path("labels")
+        return first.parent.with_suffix(".unified.cache")
+
+    def _unified_cache_hash(self) -> str:
+        """Return a hash covering unified image lists, manifests, label roots, and schema-critical settings."""
+        h = hashlib.sha256()
+
+        def update_path(path: str | Path | None, tag: str) -> None:
+            if path is None:
+                return
+            p = Path(path)
+            h.update(f"{tag}:{p.resolve() if p.exists() else p}".encode())
+            try:
+                stat = p.stat()
+                h.update(f":{stat.st_size}:{stat.st_mtime_ns}".encode())
+            except OSError:
+                pass
+
+        img_sources = self.img_path if isinstance(self.img_path, list) else [self.img_path]
+        for source in img_sources:
+            update_path(source, "img_source")
+        h.update(f"num_images:{len(self.im_files)}".encode())
+        if self.im_files:
+            h.update(f"first:{self.im_files[0]}".encode())
+            h.update(f"last:{self.im_files[-1]}".encode())
+
+        manifest = self._resolve_data_path(self._split_value("unified_manifest"))
+        label_root = self._resolve_data_path(self._split_value("unified_labels"))
+        update_path(manifest, "manifest")
+        update_path(label_root, "label_root")
+        if manifest is None and label_root is not None and label_root.exists():
+            # Manifest-backed datasets use the manifest fingerprint. Label-only datasets need per-file invalidation.
+            for label_file in sorted(label_root.rglob("*.json")):
+                update_path(label_file, "label")
+        schema = {
+            "cache_version": UNIFIED_CACHE_VERSION,
+            "split": self.split,
+            "fraction": self.fraction,
+            "max_samples": self.max_samples,
+            "nc": self.data.get("nc"),
+            "names": self.data.get("names"),
+            "kpt_shape": self.data.get("kpt_shape"),
+            "person_cls": self.data.get("person_cls"),
+            "face_cls": self.data.get("face_cls"),
+            "det_base_nc": self.data.get("det_base_nc"),
+        }
+        h.update(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode())
+        return h.hexdigest()
 
     def _yolo_record_from_label_file(self, im_file: str | Path) -> dict | None:
         """Build a minimal unified record from a standard YOLO txt label file."""
@@ -286,6 +490,7 @@ class YOLODataset(BaseDataset):
             )
         return {
             "image": str(im_file),
+            "source": self._source_from_path(im_file),
             "instances": instances,
             "task_flags": {
                 "has_det": bool(instances),
@@ -328,6 +533,93 @@ class YOLODataset(BaseDataset):
         manifest = self._resolve_data_path(self._split_value("unified_manifest"))
         if manifest is None or not manifest.exists():
             return {}
+        records = self._read_unified_manifest_records(manifest)
+        out = {}
+        root = Path(self.data.get("path", ".")).resolve()
+        for rec in records:
+            image = rec.get("image") or rec.get("im_file") or rec.get("file_name")
+            if not image:
+                continue
+            path = Path(image)
+            abs_path = path if path.is_absolute() else root / path
+            out[str(abs_path.absolute())] = rec
+            out[path.name] = rec
+        return out
+
+    def _unified_label_from_yolo_file(self, im_file: str | Path) -> dict | None:
+        """Read a standard YOLO txt label file as a minimal unified detection-only label."""
+        im_file = str(Path(im_file).absolute())
+        label_file = Path(img2label_paths([im_file])[0])
+        if not label_file.exists():
+            return None
+        cls, bboxes = [], []
+        for line in label_file.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            c, cx, cy, bw, bh = map(float, parts[:5])
+            if bw <= 0 or bh <= 0:
+                continue
+            cls.append([c])
+            bboxes.append([cx, cy, bw, bh])
+        with Image.open(im_file) as im:
+            width, height = im.size
+        source = self._source_from_path(im_file)
+        n = len(cls)
+        return {
+            "im_file": im_file,
+            "shape": (height, width),
+            "cls": np.asarray(cls, dtype=np.float32).reshape(n, 1),
+            "bboxes": np.asarray(bboxes, dtype=np.float32).reshape(n, 4),
+            "segments": [],
+            "keypoints": None,
+            "body_kpts_3d": None,
+            "person_mask": [None] * n,
+            "instance_flags": None,
+            "scene_seg": None,
+            "source": source,
+            "det_class_mask": self._det_class_mask_for_source(source, im_file),
+            "has_det": np.array(bool(n), dtype=bool),
+            "has_pose2d": np.array(False, dtype=bool),
+            "has_pose3d": np.array(False, dtype=bool),
+            "has_person_mask": np.array(False, dtype=bool),
+            "has_scene_seg": np.array(False, dtype=bool),
+            "normalized": True,
+            "bbox_format": "xywh",
+        }
+
+    def _unified_label_from_yolo_label(self, label: dict) -> dict:
+        """Add unified-schema fields to a standard YOLO detection label."""
+        im_file = str(Path(label["im_file"]).absolute())
+        source = self._source_from_path(im_file)
+        cls = np.asarray(label.get("cls", np.zeros((0, 1), dtype=np.float32)), dtype=np.float32)
+        bboxes = np.asarray(label.get("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+        n = len(cls)
+        return {
+            "im_file": im_file,
+            "shape": tuple(label.get("shape", (0, 0))),
+            "cls": cls,
+            "bboxes": bboxes,
+            "segments": label.get("segments", []),
+            "keypoints": None,
+            "body_kpts_3d": None,
+            "person_mask": [None] * n,
+            "instance_flags": None,
+            "scene_seg": None,
+            "source": source,
+            "det_class_mask": self._det_class_mask_for_source(source, im_file),
+            "has_det": np.array(bool(n), dtype=bool),
+            "has_pose2d": np.array(False, dtype=bool),
+            "has_pose3d": np.array(False, dtype=bool),
+            "has_person_mask": np.array(False, dtype=bool),
+            "has_scene_seg": np.array(False, dtype=bool),
+            "normalized": True,
+            "bbox_format": "xywh",
+        }
+
+    @staticmethod
+    def _read_unified_manifest_records(manifest: Path) -> list[dict]:
+        """Read unified manifest records from JSONL or JSON."""
         if manifest.suffix == ".jsonl":
             records = [json.loads(x) for x in manifest.read_text(encoding="utf-8").splitlines() if x.strip()]
         else:
@@ -338,17 +630,7 @@ class YOLODataset(BaseDataset):
                 records = data
         if isinstance(records, dict):
             records = [{**v, "image": k} if isinstance(v, dict) else {"image": k, "instances": v} for k, v in records.items()]
-        out = {}
-        root = Path(self.data.get("path", ".")).resolve()
-        for rec in records:
-            image = rec.get("image") or rec.get("im_file") or rec.get("file_name")
-            if not image:
-                continue
-            path = Path(image)
-            abs_path = path if path.is_absolute() else root / path
-            out[str(abs_path.resolve())] = rec
-            out[path.name] = rec
-        return out
+        return records
 
     def _unified_label_file(self, im_file: str | Path) -> Path | None:
         label_root = self._resolve_data_path(self._split_value("unified_labels"))
@@ -369,9 +651,10 @@ class YOLODataset(BaseDataset):
         return label_root / rel.with_suffix(".json")
 
     def _parse_unified_record(self, record: dict, im_file: str | Path) -> dict:
-        im_file = str(Path(im_file).resolve())
+        im_file = str(Path(im_file).absolute())
         width, height = self._record_shape(record, im_file)
         names = self.data.get("names", {})
+        source = self._source_from_record(record, im_file)
         classes, bboxes, segments, kpts2d, kpts3d, person_masks, instance_flags = [], [], [], [], [], [], []
         task_flags = {k: bool(record.get("task_flags", {}).get(k, False)) for k in UNIFIED_TASK_FLAG_KEYS}
         nkpt = int((self.data.get("kpt_shape") or [17, 3])[0])
@@ -443,7 +726,8 @@ class YOLODataset(BaseDataset):
             "person_mask": person_masks,
             "instance_flags": instance_flags,
             "scene_seg": scene_seg,
-            "det_class_mask": self._det_class_mask_for_image(im_file),
+            "source": source,
+            "det_class_mask": self._det_class_mask_for_source(source, im_file),
             **{k: np.array(task_flags[k], dtype=bool) for k in UNIFIED_TASK_FLAG_KEYS},
             "normalized": True,
             "bbox_format": "xywh",
@@ -451,29 +735,80 @@ class YOLODataset(BaseDataset):
 
     def _det_class_mask_for_image(self, im_file: str | Path) -> np.ndarray:
         """Return per-image detection class supervision mask for partial-label sources."""
+        return self._det_class_mask_for_source(self._source_from_path(im_file), im_file)
+
+    def _det_class_mask_for_source(self, source: str | None, im_file: str | Path | None = None) -> np.ndarray:
+        """Return per-image detection class supervision mask from a normalized source name."""
         names = self.data.get("names", {})
         nc = int(self.data.get("nc", len(names)))
         mask = np.ones(nc, dtype=bool)
         if nc <= 0:
             return mask
 
-        parts = {p.lower() for p in Path(im_file).parts}
+        source = self._canonical_source(source) or (self._source_from_path(im_file) if im_file is not None else "")
         person_cls = int(self.data.get("person_cls", 0))
         face_cls = int(self.data.get("face_cls", nc - 1))
         det_base_nc = int(self.data.get("det_base_nc", nc))
 
-        if parts & BASE_DET_SOURCES:
+        if source in BASE_DET_SOURCES:
             mask[:] = False
             mask[: max(0, min(det_base_nc, nc))] = True
-        elif parts & PERSON_ONLY_SOURCES:
+        elif source in PERSON_ONLY_SOURCES:
             mask[:] = False
             if 0 <= person_cls < nc:
                 mask[person_cls] = True
-        elif parts & FACE_ONLY_SOURCES:
+        elif source in FACE_ONLY_SOURCES:
             mask[:] = False
             if 0 <= face_cls < nc:
                 mask[face_cls] = True
         return mask
+
+    @staticmethod
+    def _canonical_source(value: Any) -> str:
+        """Normalize dataset/source names used by manifests, samplers, and partial-label masks."""
+        if value is None:
+            return ""
+        text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+        return SOURCE_ALIASES.get(text, text)
+
+    def _source_from_record(self, record: dict | None, im_file: str | Path | None = None) -> str:
+        """Infer the supervision source from explicit record fields, task flags, and finally the image path."""
+        record = record or {}
+        for key in ("source", "dataset", "dataset_name", "source_dataset", "domain"):
+            source = self._canonical_source(record.get(key))
+            if source:
+                return source
+        path_source = self._source_from_path(im_file)
+        if path_source:
+            return path_source
+
+        task_flags = record.get("task_flags") or {}
+        instances = record.get("instances") or []
+        if task_flags.get("has_scene_seg") or record.get("scene_seg"):
+            return "ade20k"
+        if any((inst.get("flags") or {}).get("has_person_mask") or inst.get("person_mask") for inst in instances):
+            return "coco_person_mask"
+        if task_flags.get("has_pose3d") or any((inst.get("flags") or {}).get("has_body3d") for inst in instances):
+            return "agora"
+        if task_flags.get("has_pose2d") or any((inst.get("flags") or {}).get("has_body2d") for inst in instances):
+            return "coco_wholebody"
+        categories = {str(inst.get("category", "")).strip().lower() for inst in instances}
+        if "face" in categories:
+            return "wider_face"
+        if "person" in categories:
+            return "coco_wholebody"
+        return ""
+
+    def _source_from_path(self, im_file: str | Path | None) -> str:
+        """Infer a normalized source name from common dataset path markers."""
+        if im_file is None:
+            return ""
+        normalized = str(im_file).replace("\\", "/").lower()
+        parts = {p.lower() for p in Path(im_file).parts}
+        for source, markers in PATH_SOURCE_MARKERS:
+            if any(marker in parts or marker in normalized for marker in markers):
+                return source
+        return ""
 
     def _record_shape(self, record: dict, im_file: str) -> tuple[int, int]:
         width, height = record.get("width"), record.get("height")
@@ -490,6 +825,12 @@ class YOLODataset(BaseDataset):
             return int(category)
         if isinstance(category, str) and category.isdigit():
             return int(category)
+        if isinstance(category, str):
+            lower = category.strip().lower()
+            if lower == "person":
+                return int(self.data.get("person_cls", 0))
+            if lower == "face":
+                return int(self.data.get("face_cls", int(self.data.get("nc", 1)) - 1))
         mapping = self.data.get("category_mapping") or self.data.get("class_map") or {}
         if category in mapping:
             return int(mapping[category])
@@ -644,6 +985,13 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        if self.use_unified_labels:
+            nkpt = int((self.data.get("kpt_shape") or [17, 3])[0])
+            kpts = np.asarray(keypoints) if keypoints is not None else None
+            if kpts is None or kpts.ndim != 3 or kpts.shape[0] != len(bboxes) or kpts.shape[1] != nkpt:
+                keypoints = np.zeros((len(bboxes), nkpt, 3), dtype=np.float32)
+        if self.use_unified_labels and not segments and len(bboxes):
+            segments = [self._dummy_segment_from_box(box.tolist()) for box in np.asarray(bboxes, dtype=np.float32)]
         if label.get("scene_seg") and label.get("scene_mask") is None:
             scene_mask = cv2.imread(str(label["scene_seg"]), cv2.IMREAD_UNCHANGED)
             if scene_mask is not None:
@@ -667,8 +1015,17 @@ class YOLODataset(BaseDataset):
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         if label.get("body_kpts_3d") is not None:
             label["body_kpts_3d"] = np.asarray(label["body_kpts_3d"], dtype=np.float32)
+        elif self.use_unified_labels:
+            n = len(label.get("cls", []))
+            nkpt = int((self.data.get("kpt_shape") or [17, 3])[0])
+            label["body_kpts_3d"] = np.zeros((n, nkpt, 4), dtype=np.float32)
+        if self.use_unified_labels and keypoints is None:
+            nkpt = int((self.data.get("kpt_shape") or [17, 3])[0])
+            label["instances"].keypoints = np.zeros((len(label.get("cls", [])), nkpt, 3), dtype=np.float32)
         if label.get("instance_flags") is not None:
             label["instance_flags"] = np.asarray(label["instance_flags"], dtype=bool)
+        elif self.use_unified_labels:
+            label["instance_flags"] = np.zeros((len(label.get("cls", [])), len(UNIFIED_INSTANCE_FLAG_KEYS)), dtype=bool)
         return label
 
     @staticmethod
