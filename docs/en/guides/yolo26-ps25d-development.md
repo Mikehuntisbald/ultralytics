@@ -186,7 +186,7 @@ Current plan defaults for Stage A:
 - `samples_per_epoch=40000`
 - `val_samples=2000`
 - `imgsz=[448, 768]`
-- `batch=18`
+- `batch=16`
 - `accumulate=4`
 - `freeze=0`
 - `val=true` with simple validation capped by `val_samples`
@@ -239,12 +239,11 @@ python tools/train_yolo26ps_stage.py \
 ```
 
 The previous square probe found `704, batch=7, accumulate=12` stable on the RTX 5090 32GB path. Rectangular `[448,768]`
-uses less pixel area than square `704`. The current Stage A runtime uses rectangular `[448,768]`, `batch=18`,
+uses less pixel area than square `704`. The current stable Stage A runtime uses rectangular `[448,768]`, `batch=16`,
 `accumulate=4`, simple validation, and official YOLO26s detection pretrain. Batch 20 repeatedly triggered
-TaskAlignedAssigner CPU fallback near the 32 GB limit. Batch 18 is the high-util plan value, but if any
-`TaskAlignedAssigner CUDA OOM -> using CPU` warning appears, prefer dropping to `batch=16` over increasing
-resolution. A slightly smaller batch that keeps assignment on GPU is usually faster than a larger batch that falls back
-to CPU.
+TaskAlignedAssigner CPU fallback near the 32 GB limit, and batch 18 still produced intermittent fallback on crowd-heavy
+batches. A slightly smaller batch that keeps assignment on GPU is usually faster than a larger batch that falls back to
+CPU.
 
 Stage A disables mosaic by default. If the deployment target should be closer to 16:10, prefer testing `[480,768]`
 before lowering resolution; it is stride-32 aligned and exactly 16:10, but costs about 7% more pixels than `[448,768]`.
@@ -257,14 +256,15 @@ one-to-one branch for NMS-free output.
 
 | Branch | Purpose | Current TAL settings |
 | --- | --- | --- |
-| `one2many` | Dense supervision. One GT may match several anchors, which improves early recall and stabilizes training. | `tal_topk=10` |
-| `one2one` | End-to-end/NMS-free supervision. It encourages each GT to settle onto one final prediction. | `tal_topk=7`, `tal_topk2=1` |
+| `one2many` | Dense supervision. One GT may match several anchors, which improves early recall and stabilizes training. | default `tal_topk=10`; Stage A stable uses `8` |
+| `one2one` | End-to-end/NMS-free supervision. It encourages each GT to settle onto one final prediction. | default `tal_topk=7`, `tal_topk2=1`; Stage A stable uses `5`, `1` |
 
-The current wrapper is implemented in `YOLO26PS25DE2ELoss`:
+The wrapper is implemented in `YOLO26PS25DE2ELoss` and reads the values from `model.args`:
 
 ```python
-self.one2many = YOLO26PS25DLoss(model, tal_topk=10)
-self.one2one = YOLO26PS25DLoss(model, tal_topk=7, tal_topk2=1)
+tal_topk_one2many: 10
+tal_topk_one2one: 7
+tal_topk2_one2one: 1
 self.o2m = 0.8
 self.o2o = 0.2
 self.final_o2m = 0.1
@@ -303,8 +303,8 @@ Operational rule:
 
 - If there is no TAL fallback, fill remaining memory by testing larger batch or `[480,768]`.
 - If TAL fallback appears, reduce batch first. Do not raise resolution.
-- If fallback persists at a reasonable batch, add a configurable TAL topK in the plan and test `one2many=8` before
-  touching the model architecture.
+- If fallback persists at a reasonable batch, lower the plan TAL topK first. Stage A stable currently uses
+  `tal_topk_one2many=8`, `tal_topk_one2one=5`, and `tal_topk2_one2one=1`.
 - Keep `workers=20` unless CPU image loading clearly becomes the bottleneck; the current low-util symptom is assignment
   fallback, not dataloader starvation.
 
@@ -324,8 +324,8 @@ CPU fallbacks or long validation stalls.
 Preferred tuning order for Stage A:
 
 1. Keep `mosaic=0.0`, `mixup=0.0`, `copy_paste=0.0`, and `cutmix=0.0`.
-2. Use `[448,768]`, `batch=18`, `accumulate=4` as the high-util probe.
-3. If TAL fallback appears, switch to `batch=16` and keep the same image size.
+2. Use `[448,768]`, `batch=16`, `accumulate=4` as the stable high-util setting.
+3. If TAL fallback still appears, keep the same image size and reduce TAL topK before raising resolution.
 4. After a clean epoch with no fallback, test `[480,768]` only if 16:10 fidelity matters more than throughput.
 5. Keep simple validation capped with `val_samples=2000`; full validation belongs at stage boundaries.
 
@@ -392,7 +392,6 @@ For B-F, add or inspect task-specific metrics at stage boundaries:
 
 These are deliberate engineering items, not model-contract changes:
 
-- Make TAL topK configurable from the plan YAML instead of hardcoding `one2many=10`, `one2one=7/1`.
 - Cache person-positive assignment for pose and mask losses in B-F so the same matching result is reused across task
   heads.
 - Expand validation dashboards so each stage reports its own primary task metrics by source.
