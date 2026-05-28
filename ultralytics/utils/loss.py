@@ -1134,7 +1134,7 @@ class YOLO26PS25DLoss:
         assignment_cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute gated 2D, depth, visibility, and bone losses for matched person positives."""
-        zero = preds["pose25d"].sum() * 0
+        zero = self._safe_zero(preds["pose25d"])
         task_preds, task_batch, assignment = self._get_assignment(preds, batch, image_mask, assignment_cache)
         if task_batch["batch_idx"].numel() == 0:
             return zero, zero, zero, zero
@@ -1225,10 +1225,10 @@ class YOLO26PS25DLoss:
     ) -> torch.Tensor:
         """Compute bone-length consistency on pseudo-3D normalized coordinates."""
         if self.kpt_shape[0] < 17:
-            return pred_xy.sum() * 0
+            return self._safe_zero(pred_xy)
         root_valid = valid3d[..., 11] & valid3d[..., 12]
         if not root_valid.any():
-            return pred_xy.sum() * 0
+            return self._safe_zero(pred_xy)
         pred_root = (pred_xy[..., 11:12, :] + pred_xy[..., 12:13, :]) * 0.5
         gt_root = (gt_xy[..., 11:12, :] + gt_xy[..., 12:13, :]) * 0.5
         scale = bbox_h.unsqueeze(-1).unsqueeze(-1).clamp(min=1.0)
@@ -1239,7 +1239,7 @@ class YOLO26PS25DLoss:
         gt_len = (gt_xyz[..., edges[:, 0], :] - gt_xyz[..., edges[:, 1], :]).norm(dim=-1)
         edge_valid = valid3d[..., edges[:, 0]] & valid3d[..., edges[:, 1]] & root_valid.unsqueeze(-1)
         if not edge_valid.any():
-            return pred_xy.sum() * 0
+            return self._safe_zero(pred_xy)
         return F.smooth_l1_loss(pred_len[edge_valid], gt_len[edge_valid])
 
     def _person_mask_loss(
@@ -1250,7 +1250,7 @@ class YOLO26PS25DLoss:
         assignment_cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
     ) -> torch.Tensor:
         """Compute prototype instance-mask loss when rasterized person masks are present."""
-        zero = preds["mask_coefficient"].sum() * 0 + preds["proto"].sum() * 0
+        zero = self._safe_zero(preds["mask_coefficient"]) + self._safe_zero(preds["proto"])
         if "masks" not in batch or not torch.is_tensor(batch["masks"]):
             return zero
 
@@ -1303,7 +1303,7 @@ class YOLO26PS25DLoss:
     ) -> torch.Tensor:
         """Calculate person instance-mask loss from matched positive anchors."""
         _, _, mask_h, mask_w = proto.shape
-        loss = proto.sum() * 0 + pred_masks.sum() * 0
+        loss = self._safe_zero(proto) + self._safe_zero(pred_masks)
         target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
         marea = xyxy2xywh(target_bboxes_normalized)[..., 2:].prod(2)
         mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
@@ -1326,7 +1326,7 @@ class YOLO26PS25DLoss:
         self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], image_mask: torch.Tensor
     ) -> torch.Tensor:
         """Compute semantic scene loss when collate provides raster scene masks."""
-        zero = preds["scene_seg"].sum() * 0
+        zero = self._safe_zero(preds["scene_seg"])
         target = batch.get("scene_seg")
         if not torch.is_tensor(target):
             return zero
@@ -1498,11 +1498,16 @@ class YOLO26PS25DLoss:
 
     def _zero_aux(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
         """Keep inactive branches graph-connected for DDP and staged partial-label training."""
-        zero = (preds["boxes"].sum() + preds["scores"].sum()) * 0
+        zero = self._safe_zero(preds["boxes"]) + self._safe_zero(preds["scores"])
         for key in ("pose25d", "mask_coefficient", "proto", "scene_seg"):
             if key in preds:
-                zero = zero + preds[key].sum() * 0
+                zero = zero + self._safe_zero(preds[key])
         return zero
+
+    @staticmethod
+    def _safe_zero(tensor: torch.Tensor) -> torch.Tensor:
+        """Return a graph-connected scalar zero without large FP16 reductions."""
+        return tensor.float().sum() * 0.0
 
 
 class YOLO26PS25DE2ELoss:
