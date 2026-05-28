@@ -33,6 +33,8 @@ PLAN_YAML = ROOT / "ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml"
 STAGE_DATA_YAMLS = {
     "A_detection": DATA_YAML,
     "A_detection_stable": DATA_YAML,
+    "B_pose2d_probe": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
+    "B_pose2d_det_probe": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "B_pose2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
@@ -49,6 +51,16 @@ BRANCH_MODULES = {
     "mask": ("cv5", "one2one_cv5", "proto"),
     "scene": ("scene_seg",),
     "p2_dense": ("p2_refine",),
+}
+BRANCH_TRAIN_FLAGS = {
+    "det": "det_head",
+    "pose": "body25d_head",
+    "mask": "mask_head",
+    "scene": "scene_seg_head",
+}
+MODEL_GROUP_RANGES = {
+    "backbone": (0, 11),
+    "neck": (11, -1),
 }
 
 
@@ -99,6 +111,18 @@ def normalize_cache(value: Any) -> bool | str | None:
     if text in {"true", "1", "yes", "on"}:
         return True
     return text
+
+
+def train_flag_enabled(train: dict[str, Any], key: str, default: bool = True) -> bool:
+    """Read train/freeze booleans while allowing legacy string values such as partial."""
+    if train.get("all"):
+        return True
+    if key not in train:
+        return default
+    value = train[key]
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off", "freeze", "frozen"}
+    return bool(value)
 
 
 def scale_gain(value: Any) -> float:
@@ -421,24 +445,52 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         if hasattr(head, "set_active_tasks"):
             head.set_active_tasks(tasks)
         model.loss_weights = complete_loss_weights(self.stage_cfg)
+        frozen_groups = self._apply_model_trainability(model, freeze=freeze)
         frozen = self._apply_branch_trainability(head, tasks, freeze=freeze)
         if log:
             LOGGER.info(f"Stage active tasks: {sorted(tasks)}")
             LOGGER.info(f"Stage task loss weights: {model.loss_weights}")
+            if frozen_groups:
+                LOGGER.info(f"Stage frozen/eval model groups: {', '.join(frozen_groups)}")
             if frozen:
                 LOGGER.info(f"Stage frozen/eval branches: {', '.join(frozen)}")
 
-    def _apply_branch_trainability(self, head: nn.Module, tasks: set[str], freeze: bool = True) -> list[str]:
-        """Freeze inactive auxiliary modules and keep them in eval mode."""
+    def _apply_model_trainability(self, model: nn.Module, freeze: bool = True) -> list[str]:
+        """Freeze backbone/neck groups from the stage train config and keep their BN layers in eval mode."""
         train = self.stage_cfg.get("train") or {}
-        train_all = bool(train.get("all"))
+        layers = getattr(model, "model", [])
+        frozen: list[str] = []
+        for group, (start, end) in MODEL_GROUP_RANGES.items():
+            trainable = train_flag_enabled(train, group, default=True)
+            stop = len(layers) if end is None else end if end >= 0 else len(layers) + end
+            modules = layers[start:stop]
+            if not trainable:
+                frozen.append(group)
+            for module in modules:
+                if not trainable:
+                    module.eval()
+                if freeze:
+                    for p in module.parameters():
+                        p.requires_grad = bool(trainable)
+        return frozen
+
+    def _apply_branch_trainability(self, head: nn.Module, tasks: set[str], freeze: bool = True) -> list[str]:
+        """Freeze inactive or explicitly frozen head modules and keep them in eval mode."""
+        train = self.stage_cfg.get("train") or {}
         active_groups = set(tasks)
         if {"mask", "scene"} & tasks:
             active_groups.add("p2_dense")
 
         frozen: list[str] = []
         for group, names in BRANCH_MODULES.items():
-            trainable = train_all or group in active_groups
+            if group == "p2_dense":
+                default = group in active_groups
+                trainable = train_flag_enabled(train, "mask_head", default=False) or train_flag_enabled(
+                    train, "scene_seg_head", default=False
+                )
+                trainable = bool(train.get("all")) or (default and trainable)
+            else:
+                trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=group in active_groups)
             for name in names:
                 module = getattr(head, name, None)
                 if module is None:
