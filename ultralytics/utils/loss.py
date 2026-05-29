@@ -428,15 +428,40 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss with optional class weighting
+        # Cls loss with optional per-image class supervision masks.
+        # Partial-label datasets may supervise only person or face. Normalize by
+        # the number of supervised classes so full Objects365 images do not
+        # dominate mixed-domain reanchor stages with hundreds of extra negatives.
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
         det_class_mask = batch.get("det_class_mask")
+        det_class_count = None
         if torch.is_tensor(det_class_mask):
             det_class_mask = det_class_mask.to(pred_scores.device).bool()
             if det_class_mask.ndim == 1:
                 det_class_mask = det_class_mask.view(1, -1).expand(batch_size, -1)
             if det_class_mask.shape[-1] == pred_scores.shape[-1]:
                 bce_loss *= det_class_mask[:, None, :].to(dtype)
+                det_class_count = det_class_mask.sum(-1).clamp(min=1).to(dtype)
+        if det_class_count is not None:
+            mode = str(getattr(self.hyp, "det_class_mask_normalization", "sqrt")).lower()
+            if mode not in {"0", "false", "none", "off"}:
+                norm = det_class_count if mode in {"linear", "true", "1"} else det_class_count.sqrt()
+                bce_loss = bce_loss / norm.view(batch_size, 1, 1)
+        partial_pos_only = str(getattr(self.hyp, "det_partial_cls_positive_only", False)).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if partial_pos_only and det_class_count is not None:
+            # Person/face-only images do not prove that every unmatched anchor is background for that class. In
+            # mixed-domain pose stages this otherwise pushes person confidence down, so keep full background BCE
+            # for complete detection sources and use positive cls supervision only for single-class partial labels.
+            partial_images = det_class_count <= 1
+            if partial_images.any():
+                positive_anchors = target_scores.detach().amax(dim=-1).gt(0)
+                keep_anchors = (~partial_images[:, None]) | positive_anchors
+                bce_loss *= keep_anchors[:, :, None].to(dtype)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
@@ -1198,9 +1223,9 @@ class YOLO26PS25DLoss:
             valid3d = gt_kpts3d[..., 3].gt(0) & pos3d.unsqueeze(-1)
             if valid3d.any():
                 z_scale = bbox_h.unsqueeze(-1).clamp(min=1.0)
+                pose_z_loss = F.smooth_l1_loss(pred_pose[..., 2][valid3d], gt_kpts3d[..., 2][valid3d])
                 pred_z_norm = pred_pose[..., 2] / z_scale
                 gt_z_norm = gt_kpts3d[..., 2] / z_scale
-                pose_z_loss = F.smooth_l1_loss(pred_z_norm[valid3d], gt_z_norm[valid3d])
                 bone_loss = self._bone_loss(pred_pose[..., :2], pred_z_norm, gt_kpts3d[..., :2], gt_z_norm, valid3d, bbox_h)
 
         return pose2d_loss, pose_z_loss, pose_vis_loss, bone_loss
@@ -1330,13 +1355,24 @@ class YOLO26PS25DLoss:
         target = batch.get("scene_seg")
         if not torch.is_tensor(target):
             return zero
-        pred = preds["scene_seg"][image_mask]
+        pred = preds["scene_seg"][image_mask].float()
         target = target.to(self.device)[image_mask].long()
         if target.ndim == 4 and target.shape[1] == 1:
             target = target[:, 0]
         if tuple(target.shape[-2:]) != tuple(pred.shape[-2:]):
             target = F.interpolate(target[:, None].float(), pred.shape[-2:], mode="nearest")[:, 0].long()
-        return F.cross_entropy(pred, target, ignore_index=255)
+        ignore_index = 255
+        num_classes = pred.shape[1]
+        invalid = (target != ignore_index) & ((target < 0) | (target >= num_classes))
+        if invalid.any():
+            target = target.clone()
+            target[invalid] = ignore_index
+        flat_target = target.reshape(-1)
+        valid = flat_target != ignore_index
+        if not valid.any():
+            return zero
+        flat_pred = pred.permute(0, 2, 3, 1).reshape(-1, num_classes)
+        return F.cross_entropy(flat_pred[valid], flat_target[valid])
 
     def _task_image_mask(
         self, batch: dict[str, torch.Tensor], key: str, batch_size: int, default: bool = False
