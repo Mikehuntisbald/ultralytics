@@ -1169,6 +1169,7 @@ class YOLO26PS25DLoss:
             return zero, zero, zero, zero
 
         pred_pose = self._decode_pose25d(task_preds, anchor_points, stride_tensor)
+        pred_pose_grid = self._decode_pose25d_grid(task_preds, anchor_points)
         selected_cls = self._select_target_instances(task_batch["cls"].to(self.device), task_batch["batch_idx"], target_gt_idx, fg_mask)
         is_person = selected_cls.squeeze(-1).long() == self.person_cls if self.person_cls >= 0 else torch.ones_like(fg_mask)
 
@@ -1189,6 +1190,8 @@ class YOLO26PS25DLoss:
 
         imgsz = torch.tensor(task_preds["feats"][0].shape[2:], device=self.device, dtype=pred_pose.dtype) * self.det.stride[0]
         bbox_h = (target_bboxes[..., 3] - target_bboxes[..., 1]).clamp(min=1.0)
+        target_bboxes_grid = target_bboxes / stride_tensor.view(1, -1, 1)
+        bbox_h_grid = (target_bboxes_grid[..., 3] - target_bboxes_grid[..., 1]).clamp(min=1.0)
 
         pose2d_loss = zero
         pose_vis_loss = zero
@@ -1198,19 +1201,18 @@ class YOLO26PS25DLoss:
             keypoints[..., 0] *= imgsz[1]
             keypoints[..., 1] *= imgsz[0]
             gt_kpts = self._select_target_instances(keypoints, task_batch["batch_idx"], target_gt_idx, fg_mask)
-            kpt_present = gt_kpts[..., 2].gt(0) & pos2d.unsqueeze(-1)
-            if kpt_present.any():
-                xy_error = (pred_pose[..., :2] - gt_kpts[..., :2]) / bbox_h.unsqueeze(-1).unsqueeze(-1)
-                pose2d_l1 = F.smooth_l1_loss(xy_error[kpt_present], torch.zeros_like(xy_error[kpt_present]))
-                positive = pos2d & kpt_present.any(-1)
-                area = xyxy2xywh(target_bboxes[positive])[:, 2:].prod(1, keepdim=True)
-                pose_oks = self.keypoint_loss(pred_pose[..., :2][positive], gt_kpts[positive], kpt_present[positive], area)
-                pose2d_loss = pose2d_l1 + pose_oks
+            gt_kpts_grid = gt_kpts.clone()
+            gt_kpts_grid[..., :2] /= stride_tensor.view(1, -1, 1, 1)
+            kpt_present = gt_kpts_grid[..., 2].gt(0) & pos2d.unsqueeze(-1)
+            positive = pos2d & kpt_present.any(-1)
+            if positive.any():
+                area = xyxy2xywh(target_bboxes_grid[positive])[:, 2:].prod(1, keepdim=True)
+                pose2d_loss = self.keypoint_loss(
+                    pred_pose_grid[..., :2][positive], gt_kpts_grid[positive], kpt_present[positive], area
+                )
 
-                visible_target = gt_kpts[..., 2].gt(1).to(pred_pose.dtype)
-                visible_weight = torch.where(visible_target > 0, 2.0, 1.0)
-                vis_loss = self.bce_pose(pred_pose[..., 3], visible_target) * visible_weight
-                pose_vis_loss = vis_loss[kpt_present].mean()
+                visible_target = gt_kpts_grid[..., 2].gt(0).to(pred_pose_grid.dtype)
+                pose_vis_loss = self.bce_pose(pred_pose_grid[..., 3], visible_target)[kpt_present].mean()
 
         pose_z_loss = zero
         bone_loss = zero
@@ -1220,13 +1222,23 @@ class YOLO26PS25DLoss:
             kpts3d[..., 0] *= imgsz[1]
             kpts3d[..., 1] *= imgsz[0]
             gt_kpts3d = self._select_target_instances(kpts3d, task_batch["batch_idx"], target_gt_idx, fg_mask)
+            gt_kpts3d_grid = gt_kpts3d.clone()
+            gt_kpts3d_grid[..., :2] /= stride_tensor.view(1, -1, 1, 1)
             valid3d = gt_kpts3d[..., 3].gt(0) & pos3d.unsqueeze(-1)
             if valid3d.any():
                 z_scale = bbox_h.unsqueeze(-1).clamp(min=1.0)
                 pose_z_loss = F.smooth_l1_loss(pred_pose[..., 2][valid3d], gt_kpts3d[..., 2][valid3d])
-                pred_z_norm = pred_pose[..., 2] / z_scale
-                gt_z_norm = gt_kpts3d[..., 2] / z_scale
-                bone_loss = self._bone_loss(pred_pose[..., :2], pred_z_norm, gt_kpts3d[..., :2], gt_z_norm, valid3d, bbox_h)
+                z_scale_grid = bbox_h_grid.unsqueeze(-1).clamp(min=1.0)
+                pred_z_norm = pred_pose_grid[..., 2] / z_scale_grid
+                gt_z_norm = gt_kpts3d_grid[..., 2] / z_scale_grid
+                bone_loss = self._bone_loss(
+                    pred_pose_grid[..., :2],
+                    pred_z_norm,
+                    gt_kpts3d_grid[..., :2],
+                    gt_z_norm,
+                    valid3d,
+                    bbox_h_grid,
+                )
 
         return pose2d_loss, pose_z_loss, pose_vis_loss, bone_loss
 
@@ -1234,9 +1246,17 @@ class YOLO26PS25DLoss:
         self, preds: dict[str, torch.Tensor], anchor_points: torch.Tensor, stride_tensor: torch.Tensor
     ) -> torch.Tensor:
         """Decode raw pose maps to image-space x/y, raw z, and confidence logits."""
+        pred_pose = self._decode_pose25d_grid(preds, anchor_points)
+        xy = pred_pose[..., :2] * stride_tensor.view(1, -1, 1, 1)
+        return torch.cat((xy, pred_pose[..., 2:4]), dim=-1)
+
+    def _decode_pose25d_grid(
+        self, preds: dict[str, torch.Tensor], anchor_points: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode raw pose maps to stride-space x/y, raw z, and confidence logits."""
         bs = preds["pose25d"].shape[0]
         pred_pose = preds["pose25d"].permute(0, 2, 1).contiguous().view(bs, -1, *self.kpt_shape)
-        xy = (pred_pose[..., :2] + anchor_points.view(1, -1, 1, 2)) * stride_tensor.view(1, -1, 1, 1)
+        xy = pred_pose[..., :2] + anchor_points.view(1, -1, 1, 2)
         return torch.cat((xy, pred_pose[..., 2:4]), dim=-1)
 
     def _bone_loss(
