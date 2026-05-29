@@ -224,6 +224,7 @@ CFG_INT_KEYS = frozenset(
         "vid_stride",
         "line_width",
         "nbs",
+        "val_batch",
         "tal_topk_one2many",
         "tal_topk_one2one",
         "tal_topk2_one2one",

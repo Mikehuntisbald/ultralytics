@@ -98,10 +98,11 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle and not np.all(dataset.batch_shapes == dataset.batch_shapes[0]):
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        val_workers = getattr(self.args, "val_workers", None)
         return build_dataloader(
             dataset,
             batch=batch_size,
-            workers=self.args.workers if mode == "train" else self.args.workers * 2,
+            workers=self.args.workers if mode == "train" else int(val_workers if val_workers is not None else self.args.workers * 2),
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",

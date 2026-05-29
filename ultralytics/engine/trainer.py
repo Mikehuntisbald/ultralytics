@@ -283,9 +283,11 @@ class BaseTrainer:
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
         # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+        default_val_batch = batch_size if self.args.task == "obb" else batch_size * 2
+        val_batch_size = int(self.args.val_batch or default_val_batch)
         self.test_loader = self.get_dataloader(
             self.data.get("val") or self.data.get("test"),
-            batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
+            batch_size=val_batch_size,
             rank=LOCAL_RANK,
             mode="val",
         )
@@ -493,6 +495,9 @@ class BaseTrainer:
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
                     last_opt_step = ni
+                    criterion = getattr(unwrap_model(self.model), "criterion", None)
+                    if hasattr(criterion, "update"):
+                        criterion.update()
 
                     # Timed stopping
                     if self.args.time:
@@ -530,9 +535,6 @@ class BaseTrainer:
 
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
-
-            if hasattr(unwrap_model(self.model).criterion, "update"):
-                unwrap_model(self.model).criterion.update()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 

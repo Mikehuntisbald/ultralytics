@@ -37,6 +37,7 @@ STAGE_DATA_YAMLS = {
     "B_pose2d_det_probe": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "B_pose2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_det_reanchor": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml",
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
     "E_scene_seg": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml",
     "F_full_finetune": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
@@ -113,6 +114,24 @@ def normalize_cache(value: Any) -> bool | str | None:
     return text
 
 
+def parse_sampling_weights(value: Any) -> dict[str, float] | None:
+    """Parse sampling weights from YAML dicts or CLI strings like source=weight,source2=weight."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): float(v) for k, v in value.items()}
+    weights: dict[str, float] = {}
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(f"sampling weight '{item}' must be formatted as name=weight")
+        name, weight = item.split("=", 1)
+        weights[name.strip()] = float(weight)
+    return weights
+
+
 def train_flag_enabled(train: dict[str, Any], key: str, default: bool = True) -> bool:
     """Read train/freeze booleans while allowing legacy string values such as partial."""
     if train.get("all"):
@@ -122,6 +141,13 @@ def train_flag_enabled(train: dict[str, Any], key: str, default: bool = True) ->
     value = train[key]
     if isinstance(value, str):
         return value.strip().lower() not in {"false", "0", "no", "off", "freeze", "frozen"}
+    return bool(value)
+
+
+def truthy(value: Any) -> bool:
+    """Read boolean-like YAML/CLI values."""
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "no", "off", "none", "null"}
     return bool(value)
 
 
@@ -176,7 +202,7 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
     model_cfg = plan.get("model", {})
     optimizer_cfg = plan.get("optimizer_scheduler") or {}
     defaults: dict[str, Any] = {}
-    for key in ("epochs", "samples_per_epoch", "sampling", "sampling_weights", "val_samples"):
+    for key in ("epochs", "samples_per_epoch", "sampling", "sampling_weights", "val_samples", "plots"):
         if stage.get(key) is not None:
             defaults[key] = stage[key]
     for key in (
@@ -230,18 +256,28 @@ class YOLO26PSStageValidator(DetectionValidator):
             "objects365_person",
             "crowdhuman_person",
             "wider_face",
+            "coco_person",
+            "3dpw_person",
+            "agora_person",
             "small",
         )
 
     @staticmethod
     def _source_name(im_file: str | Path) -> str:
         parts = {p.lower() for p in Path(im_file).parts}
+        normalized = str(im_file).replace("\\", "/").lower()
         if "objects365" in parts:
             return "objects365"
         if "crowdhuman" in parts:
             return "crowdhuman"
         if "wider_face" in parts or "wider" in parts:
             return "wider_face"
+        if "coco_wholebody" in parts or "coco_2017" in parts or "coco2017" in normalized:
+            return "coco_wholebody"
+        if "3dpw" in parts or "3dpw" in normalized:
+            return "3dpw"
+        if "agora" in parts or "agora" in normalized:
+            return "agora"
         return "unknown"
 
     def _bucket_update(
@@ -321,6 +357,12 @@ class YOLO26PSStageValidator(DetectionValidator):
                 self._bucket_update("crowdhuman_person", predn, pbatch, class_id=self.person_cls)
             elif source == "wider_face":
                 self._bucket_update("wider_face", predn, pbatch, class_id=self.face_cls)
+            elif source == "coco_wholebody":
+                self._bucket_update("coco_person", predn, pbatch, class_id=self.person_cls)
+            elif source == "3dpw":
+                self._bucket_update("3dpw_person", predn, pbatch, class_id=self.person_cls)
+            elif source == "agora":
+                self._bucket_update("agora_person", predn, pbatch, class_id=self.person_cls)
             if pbatch["bboxes"].numel():
                 boxes_scaled = self.scale_preds({"bboxes": pbatch["bboxes"].clone()}, pbatch)["bboxes"]
                 small = (boxes_scaled[:, 2] - boxes_scaled[:, 0]) * (boxes_scaled[:, 3] - boxes_scaled[:, 1]) < 32**2
@@ -409,6 +451,9 @@ class YOLO26PSStageValidator(DetectionValidator):
             "objects365_person": "metrics/stage_a/objects365/person",
             "crowdhuman_person": "metrics/stage_a/crowdhuman/person",
             "wider_face": "metrics/stage_a/wider_face/face",
+            "coco_person": "metrics/stage_c/coco/person",
+            "3dpw_person": "metrics/stage_c/3dpw/person",
+            "agora_person": "metrics/stage_c/agora/person",
             "small": "metrics/stage_a/small",
         }
         for name, metric in self.stage_metric_buckets.items():
@@ -447,6 +492,8 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         model.loss_weights = complete_loss_weights(self.stage_cfg)
         frozen_groups = self._apply_model_trainability(model, freeze=freeze)
         frozen = self._apply_branch_trainability(head, tasks, freeze=freeze)
+        if truthy((self.stage_cfg.get("train_runtime") or {}).get("freeze_trainable_bn", False)):
+            self._freeze_trainable_norm_stats(model)
         if log:
             LOGGER.info(f"Stage active tasks: {sorted(tasks)}")
             LOGGER.info(f"Stage task loss weights: {model.loss_weights}")
@@ -503,6 +550,14 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                         p.requires_grad = bool(trainable)
         return frozen
 
+    @staticmethod
+    def _freeze_trainable_norm_stats(model: nn.Module) -> None:
+        """Keep normalization statistics fixed while allowing affine weights to train."""
+        norm_types = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+        for module in model.modules():
+            if isinstance(module, norm_types):
+                module.eval()
+
     def _setup_train(self):
         super()._setup_train()
         self.apply_stage_controls(log=False)
@@ -552,6 +607,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--imgsz", type=int, nargs="+", help="one square size or two values: height width")
     parser.add_argument("--batch", type=int)
+    parser.add_argument("--val-batch", type=int, help="validation batch size; defaults to train batch x2")
+    parser.add_argument("--val-workers", type=int, help="validation dataloader workers; defaults to workers x2")
     parser.add_argument("--accumulate", type=int)
     parser.add_argument("--cache", nargs="?", const="ram", help="cache images: ram, disk, true, or false")
     parser.add_argument("--device")
@@ -563,6 +620,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-samples", type=positive_int, help="limit validation to N evenly spaced images")
     parser.add_argument("--samples-per-epoch", type=positive_int)
     parser.add_argument("--sampling")
+    parser.add_argument("--sampling-weights", type=parse_sampling_weights, help="override sampler weights: name=weight,...")
     parser.add_argument("--optimizer")
     parser.add_argument("--lr0", type=float)
     parser.add_argument("--lrf", type=float)
@@ -573,6 +631,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tal-topk-one2many", type=positive_int)
     parser.add_argument("--tal-topk-one2one", type=positive_int)
     parser.add_argument("--tal-topk2-one2one", type=positive_int)
+    parser.add_argument("--det-class-mask-normalization", choices=("sqrt", "linear", "none", "off"))
+    parser.add_argument("--det-partial-cls-positive-only", action="store_true")
+    parser.add_argument("--no-det-partial-cls-positive-only", action="store_true")
     parser.add_argument("--cos-lr", action="store_true", help="force cosine LR scheduler")
     parser.add_argument("--no-cos-lr", action="store_true", help="force non-cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", help="force AMP on")
@@ -580,6 +641,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prepare", action="store_true", help="run Stage A data preparation before training")
     parser.add_argument("--no-val", action="store_true", help="disable validation")
+    parser.add_argument("--plots", action="store_true", help="force train/val plots on")
+    parser.add_argument("--no-plots", action="store_true", help="force train/val plots off")
     parser.add_argument("--no-save", action="store_true", help="disable checkpoint saving")
     parser.add_argument("--skip-crowdhuman-extract", action="store_true")
     return parser.parse_args()
@@ -625,15 +688,25 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     augment = stage.get("augment") or {}
     imgsz = normalize_imgsz(args.imgsz if args.imgsz is not None else defaults.get("imgsz", 640))
     batch = int(args.batch if args.batch is not None else defaults.get("batch", 8))
+    val_batch = args.val_batch if args.val_batch is not None else defaults.get("val_batch")
+    val_workers = args.val_workers if args.val_workers is not None else defaults.get("val_workers")
     accumulate = int(args.accumulate if args.accumulate is not None else defaults.get("accumulate", 1))
     no_val = bool(args.no_val or defaults.get("no_val", False))
     val_samples = args.val_samples if args.val_samples is not None else defaults.get("val_samples")
+    plots_default = defaults.get("plots")
+    plots = False if no_val else (truthy(plots_default) if plots_default is not None else True)
+    if args.plots:
+        plots = True
+    if args.no_plots:
+        plots = False
 
     overrides = dict(
         data=str(args.data),
         epochs=int(args.epochs if args.epochs is not None else defaults.get("epochs", stage.get("epochs", 50))),
         imgsz=imgsz,
         batch=batch,
+        val_batch=int(val_batch) if val_batch is not None else None,
+        val_workers=int(val_workers) if val_workers is not None else None,
         nbs=batch * accumulate,
         workers=int(args.workers if args.workers is not None else defaults.get("workers", 8)),
         freeze=int(args.freeze if args.freeze is not None else defaults.get("freeze", 0)),
@@ -646,11 +719,11 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         fraction=args.fraction,
         sampling=args.sampling or defaults.get("sampling") or stage.get("sampling") or "sequential",
         samples_per_epoch=args.samples_per_epoch or defaults.get("samples_per_epoch") or stage.get("samples_per_epoch"),
-        sampling_weights=defaults.get("sampling_weights") or stage.get("sampling_weights") or {},
+        sampling_weights=args.sampling_weights or defaults.get("sampling_weights") or stage.get("sampling_weights") or {},
         val=not no_val,
         val_samples=val_samples,
         save=not args.no_save,
-        plots=not no_val,
+        plots=plots,
         multi_scale=0.0 if stage.get("multi_scale") is False else float(defaults.get("multi_scale", 0.0)),
     )
     cache = normalize_cache(args.cache if args.cache is not None else defaults.get("cache"))
@@ -686,6 +759,15 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         value = cli_value if cli_value is not None else defaults.get(key)
         if value is not None:
             overrides[key] = int(value)
+    det_mask_norm = args.det_class_mask_normalization or defaults.get("det_class_mask_normalization")
+    if det_mask_norm is not None:
+        overrides["det_class_mask_normalization"] = str(det_mask_norm)
+    if args.det_partial_cls_positive_only:
+        overrides["det_partial_cls_positive_only"] = True
+    elif args.no_det_partial_cls_positive_only:
+        overrides["det_partial_cls_positive_only"] = False
+    elif defaults.get("det_partial_cls_positive_only") is not None:
+        overrides["det_partial_cls_positive_only"] = bool(defaults.get("det_partial_cls_positive_only"))
     if args.cos_lr:
         overrides["cos_lr"] = True
     elif args.no_cos_lr:
