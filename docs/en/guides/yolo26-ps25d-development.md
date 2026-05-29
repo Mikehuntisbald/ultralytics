@@ -150,6 +150,98 @@ They point to `/home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_M
 `labels/stage_<letter>/...` JSON labels. The generic stage trainer reads the selected stage's `data_yaml` from the plan,
 so `--stage B_pose2d` automatically uses the Stage B YAML unless `--data` is explicitly passed.
 
+## Dataset Preparation Debug Ledger
+
+This section records the data-preparation reasoning as observable engineering decisions: symptoms, causes, fixes, and
+verification steps. It intentionally avoids hidden mental notes; keep future entries reproducible from files, commands,
+and logs.
+
+Canonical roots:
+
+```bash
+repo=/home/haoyi/Downloads/ultralytics
+vision=/home/haoyi/Downloads/datasets/vision_benchmarks
+human=/home/haoyi/Downloads/datasets/human_benchmarks
+stage_a=$vision/YOLO26PS_STAGE_A
+stage_multi=$vision/YOLO26PS_STAGE_MULTI
+```
+
+Stage data dependencies:
+
+| Stage | Prepared from | Important output files |
+| --- | --- | --- |
+| A detection | Objects365, CrowdHuman, WIDER FACE | `$stage_a/train.txt`, `$stage_a/val.txt`, `$stage_a/yolo26ps_stage_a.yaml` |
+| B pose2d | Stage A detection lists plus COCO-WholeBody records | `stage_b_train.txt`, `stage_b_val.txt`, `manifests/stage_b_*.jsonl` |
+| C pose25d | Stage B manifests plus 3DPW and AGORA | `stage_c_train.txt`, `stage_c_val.txt`, `manifests/stage_c_*.jsonl` |
+| D person mask | Stage C manifests plus COCO person masks, OCHuman, detection guard lists | `stage_d_train.txt`, `stage_d_val.txt`, `manifests/stage_d_*.jsonl` |
+| E scene seg | Stage D manifests plus ADEChallengeData2016 scene records | `stage_e_train.txt`, `stage_e_val.txt`, `manifests/stage_e_*.jsonl` |
+| F finetune | Same prepared multi-stage pool, with final sampling weights | `stage_f_train.txt`, `stage_f_val.txt` when prepared |
+
+Core invariants discovered during preparation:
+
+- List files are source inventories, not pre-weighted downsampled lists. Sampling ratios live in the stage plan through
+  `sampling_weights` and `samples_per_epoch`.
+- Unified records must keep `has_det`, `has_pose2d`, `has_pose3d`, `has_person_mask`, and `has_scene_seg` independent.
+- ADEChallengeData2016 records are scene-only: `has_det=false` and `has_scene_seg=true`.
+- Partial detection sources must carry `det_class_mask`; they must not create Objects365 negative labels.
+- Multi-supervision records need `sampling_sources`, not just one `source`, because a merged COCO record may carry both
+  pose and mask supervision.
+- After changing schema, source inference, scene mapping, or mask representation, bump `UNIFIED_CACHE_VERSION` and
+  delete stale `*.cache` files for the affected stage.
+
+Current local summary checks:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("/home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI")
+for name in ("stage_b_summary.json", "stage_c_summary.json", "stage_d_summary.json", "stage_e_summary.json"):
+    p = root / name
+    print("\n##", name, p.exists())
+    if p.exists():
+        d = json.loads(p.read_text())
+        for k in ("train_total", "val_total", "manifest_train", "manifest_val", "train_sources", "val_sources", "note"):
+            if k in d:
+                print(k, d[k])
+PY
+```
+
+At the last verification, Stage E contained `165220` training images and `20383` validation images. ADEChallengeData2016
+contributed `20210` train and `2000` validation images; 3DPW and AGORA were also present in the merged source counts.
+
+ADEChallengeData2016 verification:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+from PIL import Image
+import numpy as np
+
+root = Path("/home/haoyi/Downloads/datasets/vision_benchmarks/ADEChallengeData2016")
+print("train jpg", len(list((root / "images/training").glob("*.jpg"))))
+print("val jpg", len(list((root / "images/validation").glob("*.jpg"))))
+for rel in ("annotations/training/ADE_train_00000001.png", "annotations/validation/ADE_val_00000001.png"):
+    arr = np.array(Image.open(root / rel))
+    print(rel, arr.dtype, arr.shape, int(arr.min()), int(arr.max()))
+PY
+```
+
+Expected result: masks are `uint8` with values in `0..150`. The data YAML maps source `0` to ignore `255` and source
+`1..150` to train IDs `0..149`.
+
+Stage E smoke requirements before a long run:
+
+- `stage_e_val.txt` exists and includes ADE validation images.
+- `ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml` has `scene_nc: 150` and
+  `scene_label_mapping: ade20k_150`.
+- ADE samples in the unified cache have `has_det=false`, `has_scene_seg=true`, and `scene_seg` pointing at
+  `ADEChallengeData2016/annotations/...`.
+- A mixed validation batch has finite `scene_seg_loss`; if not, inspect dtype and invalid labels before changing data.
+- Live training columns `box_loss`, `cls_loss`, and `dfl_loss` are the detection loss. A tiny `dfl_loss` is expected for
+  the no-DFL/reg-max-1 design and is not the same as detector loss being zero.
+
 ## Stage A Training
 
 Stage A freezes pose/mask/scene auxiliary branches and uses the unified loss with detection weight only:
@@ -389,15 +481,509 @@ For B-F, add or inspect task-specific metrics at stage boundaries:
 | B pose2d | pose AP/PCK or normalized xy error on COCO/OCHuman-style sources |
 | C pose25d | normalized z error and 3D consistency on 3DPW/AGORA |
 | D person mask | person mask AP/Dice on COCO person mask and OCHuman |
-| E scene seg | ADE20K mIoU and detection AP retention |
-| F finetune | all task metrics with ADE20K weight kept small |
+| E scene seg | ADEChallengeData2016 150-class mIoU and detection AP retention |
+| F finetune | all task metrics with ADEChallengeData2016 weight kept small |
+
+## Training Issue Log
+
+This section is the debugging ledger for the current YOLO26s-PS-2.5D branch. Keep new failures here in the same shape:
+symptom, cause, fix, and the guardrail that prevents the same failure from coming back.
+
+### 1. Development Workspace Drift
+
+Symptom: changes were sometimes made in `/home/haoyi/Downloads/ultralytics-gitee` while the real development branch was
+`/home/haoyi/Downloads/ultralytics`.
+
+Cause: both repositories have the same project layout, so shell commands and IDE tabs can look valid in either tree.
+
+Fix: all implementation, training, validation, and documentation work for this model should happen in:
+
+```bash
+/home/haoyi/Downloads/ultralytics
+```
+
+Guardrail: before editing, committing, or launching a long run, check `pwd` and `git status --short`. Only sync to other
+remotes or mirrors after the real branch is clean.
+
+### 2. Dynamic Input And Stride Padding
+
+Symptom: early design notes mixed fixed logical sizes, dynamic resolution, and padded dense outputs.
+
+Cause: detection can decode dynamically from feature-map shapes, but mask prototypes and semantic logits are dense maps
+and therefore inherit the padded tensor shape.
+
+Fix: remove the separate `logical_size` concept. The contract is:
+
+- `dynamic_input: true`
+- `pad_stride: 32`, because the model uses P5
+- default deployment/training size `imgsz=[448,768]`
+- detection decode derives anchors and strides from current feature maps
+- mask and scene outputs are `[padded_H/4, padded_W/4]`
+- postprocess inverse-letterboxes boxes, keypoints, masks, and scene maps back to the original image
+
+Guardrail: never hard-code `768x432`, `448x768`, or a fixed feature-map size inside decode or postprocess. Only defaults
+and stage recipes may mention a fixed size.
+
+### 3. Dense Stride-4 Outputs Versus Original Detection
+
+Symptom: `mask_proto` and `scene_seg` output shapes looked different from original YOLO26 detection outputs.
+
+Cause: original detection does not expose a dense image-aligned output. Person masks and scene segmentation need dense
+stride-4 maps, so they naturally scale with padded input size.
+
+Fix: keep `mask_proto=[B,32,padded_H/4,padded_W/4]` and `scene_seg=[B,150,padded_H/4,padded_W/4]`. This is expected and
+is not a regression from the original detector.
+
+Guardrail: compare detection AP using decoded boxes, and compare mask/scene quality after inverse letterbox. Do not
+compare dense map shapes to original detection head outputs.
+
+### 4. Stage A Auxiliary Branch Waste And BN Pollution
+
+Symptom: Stage A spent memory and time computing pose, mask, P2 refine, and scene branches even though only detection was
+being trained.
+
+Cause: freezing `requires_grad=False` alone does not prevent forward compute, and `trainer.model.train()` can re-enable
+BatchNorm updates on frozen branches.
+
+Fix: set `head.active_tasks={"det"}` for Stage A. The head skips `p2_refine`, `proto`, `scene_seg`, `cv4`, and `cv5`
+when the corresponding task is inactive. The stage trainer also forces inactive modules to `eval()` after every
+`model.train()` call.
+
+Guardrail: Stage A must show active tasks as detection only. Frozen auxiliary branches should have no train-time BN stat
+updates and no forward memory cost.
+
+### 5. Weighted Downsampled `train.txt`
+
+Symptom: early Stage A preparation generated a weighted/downsampled training list, which permanently discarded many
+Objects365 images before the sampler ever ran.
+
+Cause: sampling ratio was encoded into the file list instead of the sampler.
+
+Fix: `train.txt` and `train_all.txt` are full source lists. Every stage uses weighted random sampling with replacement:
+
+```python
+dataset_name = sample_by_weight(stage_cfg["sampling_weights"])
+sample = dataset[dataset_name].random_sample()
+```
+
+Guardrail: stage YAML controls `epochs`, `samples_per_epoch`, and `sampling_weights`. The list files should stay full
+source inventories unless a file name explicitly says it is legacy or diagnostic.
+
+### 6. Rectangular Training Was Being Treated Like Square Training
+
+Symptom: using square `704` or `768` made training heavier than the intended deployment aspect ratio, and validation or
+multi-scale paths could accidentally squash `[h,w]` into a square.
+
+Cause: the original training path assumes a scalar `imgsz` in many places.
+
+Fix: the stage trainer, dataloader, validator, and LetterBox path accept `[height,width]`. Stage defaults use
+`[448,768]`, and `[480,768]` is the preferred exact 16:10 probe if the stable recipe has memory headroom.
+
+Guardrail: do not enable multi-scale while debugging rectangular training. Keep `pad_stride=32` and use `val_batch` to
+control validation memory separately from train batch.
+
+### 7. LVIS To Objects365 Migration
+
+Symptom: the original plan used LVIS, then the training source changed to Objects365.
+
+Cause: local detection data availability and the target category base changed.
+
+Fix: the plan now uses:
+
+```yaml
+det_classes:
+  base: Objects365_remapped
+  extra: [face]
+```
+
+`Objects365 Person` maps to the shared `person` class. `C_det = len(remapped_Objects365_classes) + 1`, where `+1` is
+`face`.
+
+Guardrail: do not leave `LVIS`, `remapped_LVIS`, or MPI-INF-3DHP/Human3.6M/H3WB references in active stage recipes.
+Only add optional datasets after the converter, labels, cache, and stage weights exist.
+
+### 8. Partial Detection Labels As Full-Class Negatives
+
+Symptom: person-only and face-only datasets could silently train all unannotated Objects365 classes as background.
+
+Cause: standard detection BCE assumes every class not annotated in the image is a negative class. That is valid for
+complete detection sources, but false for CrowdHuman, WIDER FACE, COCO-WholeBody, 3DPW, and AGORA.
+
+Fix: carry `det_class_mask` in each label and batch. Objects365 supervises the full base class set. Person-only sources
+supervise only `person`. WIDER FACE supervises only `face`.
+
+Guardrail: `det_class_mask` must survive caching, collation, mosaic, and loss. If a source is partial-label, it must not
+produce full Objects365 negative BCE.
+
+### 9. Single-Class Partial Images Still Suppressed Person Confidence
+
+Symptom: C_det_reanchor looked numerically stable but person AP collapsed after longer runs. The bad run had
+`mAP50=0.01425`, `Objects365/person=0.00240`, `COCO/person=0.00129`, `3DPW/person=0.00001`, and
+`AGORA/person=0.00044`.
+
+Cause: class masks prevented unannotated Objects365 classes from becoming negatives, but single-class partial images
+still treated unmatched anchors as negative for the supervised class itself. In person-only images, an unmatched anchor
+is not proof that no person exists there when the dataset has partial boxes or detector/pose matching is imperfect.
+
+Fix: add `det_partial_cls_positive_only`. For images with only one supervised detection class, class BCE is applied to
+assigned positives only. Complete Objects365 images still train full background negatives normally.
+
+Guardrail: C_det_reanchor keeps:
+
+```yaml
+det_class_mask_normalization: sqrt
+det_partial_cls_positive_only: true
+loss.det: 0.04
+samples_per_epoch: 1024
+```
+
+The accepted short reanchor run is
+`runs/detect/yolo26ps_stage_c_det_reanchor_short_official/weights/best.pt`:
+
+| Run | mAP50 | Objects365/person | Small | COCO/person | 3DPW/person | AGORA/person | `val/pose_z_loss` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline no update | 0.03133 | 0.50864 | 0.01261 | 0.56541 | 0.27409 | 0.76238 | 0.01113 |
+| fixed short reanchor | 0.03039 | 0.50741 | 0.01272 | 0.55943 | 0.26483 | 0.76312 | 0.01101 |
+
+Do not promote the longer `partial_pos_official` run without another stability pass; it was better than the failed run
+but still pulled person AP down.
+
+### 10. Stage B All-Zero Detection Validation
+
+Symptom: some Stage B runs produced all-zero or near-zero detection AP even though pose losses were moving.
+
+Cause: Stage B was allowing detection updates while most samples were partial person labels. This amplified the partial
+negative-label problem and made detector confidence collapse. A separate same-checkpoint validation proved the validator
+itself was not the reason for all zeros.
+
+Fix: Stage B is pose-first:
+
+- `det_head: false`
+- `loss.det: 0.0`
+- backbone and neck frozen for the stable pose head warmup
+- run small smoke tests from the Stage A checkpoint before official Stage B
+
+Guardrail: if Stage B detection AP suddenly goes to zero, stop and run a no-update validation from the input checkpoint.
+If no-update AP is healthy, the training recipe is damaging the detector; do not continue that run.
+
+### 11. Stage C Depth Loss And NaN Diagnosis
+
+Symptom: Stage C debugging showed NaN-looking `pose_z` values in some logs and unstable 2.5D behavior.
+
+Cause: two different cases were mixed together:
+
+- Stage B has no 3D supervision, so `val/pose_z_loss=nan` can mean "no valid 3D samples in this validation subset", not
+  a training NaN.
+- Stage C depth loss must compare raw `z_rel` targets to raw z predictions. Only bone consistency should use normalized
+  z.
+
+Fix: `pose_z_loss = SmoothL1(pred_z_raw, gt_z_rel_raw)`. Bone loss builds pseudo-3D coordinates with normalized
+`x`, `y`, and `z`. COCO-WholeBody and OCHuman train `x/y/conf` only; 3DPW and AGORA train `x/y/z/conf`.
+
+Guardrail: when checking NaNs, inspect both tensor finiteness and source flags. A missing task subset is not the same as
+an invalid loss. Keep `pose_z` gated by `has_pose3d`.
+
+### 12. AGORA Data Availability
+
+Symptom: Stage C needed AGORA for 2.5D stability, but not every AGORA archive was initially extracted.
+
+Cause: Stage C depends on the prepared unified manifests and image paths; missing AGORA files reduce or break 3D
+coverage.
+
+Fix: extract only the AGORA splits referenced by the stage converter and verify the generated `stage_c_*` manifests
+resolve to existing images and labels.
+
+Guardrail: before Stage C official training, sample the manifest and check source counts for `3dpw` and `agora`.
+Human3.6M/H3WB is not part of the current active recipe.
+
+### 13. ADE20K Class Count Confusion
+
+Symptom: scene segmentation was described as ADE20K, which can be confused with the full ADE20K object vocabulary.
+
+Cause: the intended training set is the MIT Scene Parsing Benchmark layout, not every ADE20K object annotation.
+
+Fix: use `ADEChallengeData2016` with 150 semantic classes. Source masks use `0` as ignore/background and `1..150` as
+class IDs; the loader remaps to train IDs `0..149` and ignore `255`.
+
+Guardrail: scene head stays `classes: 150`. Do not train scene segmentation with a 3000-class ADE20K vocabulary.
+
+### 14. Stage E Manifest And Validation List Missing
+
+Symptom: the first Stage E launch failed before training because `stage_e_val.txt` did not exist.
+
+Cause: Stage E had a plan entry and data YAML, but no converter had materialized the Stage E list files and manifests
+from Stage D plus ADEChallengeData2016.
+
+Fix: add `tools/prepare_yolo26ps_stage_e.py`. It reads Stage D train/val lists and manifests, appends ADE scene-only
+records, and writes:
+
+```text
+stage_e_train.txt
+stage_e_val.txt
+manifests/stage_e_train.jsonl
+manifests/stage_e_val.jsonl
+stage_e_summary.json
+```
+
+Guardrail: before starting any stage, check that the stage YAML's `train`, `val`, and `unified_manifest` targets all
+exist. Do not rely on the generic trainer to discover missing stage preparation late.
+
+### 15. Scene Segmentation Labels Collated As Mixed Types
+
+Symptom: after preparing Stage E, dataloader collation failed when a batch mixed ADE images with non-ADE images.
+
+Cause: ADE samples carried a `scene_seg` path/string before formatting, while non-scene samples had no dense scene
+tensor. The default collate path tried to stack or carry incompatible values.
+
+Fix:
+
+- `Format.__call__` loads scene masks into a tensor field and clears non-tensor `scene_seg` values.
+- `YOLODataset.collate_fn` special-cases `scene_seg`: if any sample has a tensor scene target, non-scene samples are
+  filled with a same-shaped `255` ignore tensor.
+- `_scene_seg_loss` returns a safe zero if no valid scene pixels exist in the selected image subset.
+
+Guardrail: a mixed Stage E batch should contain `scene_seg` as a tensor of shape `[B,H/4,W/4]` or equivalent resized
+target shape, with non-ADE samples entirely `255`.
+
+### 16. ADE Scene Loss Produced `inf` Or `nan` Under AMP
+
+Symptom: Stage E validation initially wrote `val/scene_seg_loss=nan` even though ADE masks existed and model logits were
+finite.
+
+Cause: dense semantic cross entropy over half-precision logits could overflow to `inf` during validation. Invalid or
+out-of-range labels also needed to be forced to ignore before flattening.
+
+Fix: compute scene CE in float32 and only over valid pixels:
+
+```python
+pred = preds["scene_seg"][image_mask].float()
+target = target.long()
+invalid = (target != 255) & ((target < 0) | (target >= num_classes))
+target[invalid] = 255
+valid = target.reshape(-1) != 255
+loss = F.cross_entropy(flat_pred[valid], flat_target[valid])
+```
+
+Guardrail: before a long Stage E run, run one small ADE validation batch and confirm `_scene_seg_loss` is finite. If it
+is not finite, inspect logits, target min/max, ignore index, and dtype before changing sampling weights.
+
+### 17. Multi-Supervision Records Were Invisible To Weighted Sampling
+
+Symptom: Stage E sampler counts showed `coco_wholebody=0` even though the plan gave COCO-WholeBody a nonzero sampling
+weight.
+
+Cause: Stage D merges COCO-WholeBody pose records with COCO person-mask records by image. A single `source` string was
+not enough to represent every supervision domain on a merged record, so the sampler only saw `coco_person_mask`.
+
+Fix: add `sampling_sources` to unified cached labels and teach the weighted replacement sampler to count every listed
+domain. A merged COCO record can now contribute to both `coco_wholebody` and `coco_person_mask` sampling buckets.
+
+Guardrail: after rebuilding a unified cache, print source counts from labels and make sure every nonzero stage sampling
+weight has available samples. If a source count is unexpectedly zero, inspect `sampling_sources` before altering data
+ratios.
+
+### 18. Unified Cache Version Must Move With Data Semantics
+
+Symptom: source counts, task flags, or scene labels could stay wrong after code fixes because old cache files were still
+being reused.
+
+Cause: unified cache files outlive converter and loader changes. A matching image-path hash is not sufficient when the
+meaning of `source`, `sampling_sources`, `scene_seg`, or `det_class_mask` changes.
+
+Fix: bump `UNIFIED_CACHE_VERSION` whenever unified label semantics change and delete affected stage caches. The current
+cache version that includes multi-source sampling is `1.0.8`.
+
+Guardrail: if a training run contradicts the manifest or the plan, inspect cache metadata first. Rebuild cache before
+debugging model code.
+
+### 19. OCHuman Split And Archive Assumptions
+
+Symptom: Stage D needed OCHuman masks, but the local OCHuman layout did not provide a conventional train split.
+
+Cause: the available local OCHuman package exposes val/test annotations for this workflow. Treating missing train files
+as a converter failure would incorrectly block mask training.
+
+Fix: Stage D uses OCHuman val as training data and OCHuman test as validation data, and records this in
+`stage_d_summary.json`:
+
+```text
+OCHuman provides val/test annotations only here; val is used as Stage D train and test as Stage D validation.
+```
+
+Guardrail: keep this split policy documented and visible in the summary. If a full OCHuman train split is later added,
+update the converter and summary together.
+
+### 20. AGORA Extraction Must Match Converter Paths
+
+Symptom: Stage C could not fully use AGORA until the required AGORA archives were extracted.
+
+Cause: `tools/prepare_yolo26ps_stage_c.py` expects AGORA under:
+
+```text
+/home/haoyi/Downloads/datasets/human_benchmarks/AGORA/extracted/AGORA
+```
+
+with the image files and SMPL dataframe pickle files referenced by the converter. Partial extraction silently lowers the
+3D data pool or produces missing-image records.
+
+Fix: extract only the AGORA splits referenced by the Stage C converter, then regenerate Stage C manifests and check
+`stage_c_summary.json` source counts. The verified local Stage C train counts include `agora: 14411` and `3dpw: 8832`.
+
+Guardrail: before official Stage C, sample both `3dpw` and `agora` records from the manifest, assert image paths exist,
+and assert at least one instance has `has_body3d=true`.
+
+### 21. Detection Loss "0" Can Mean Gating Or Log Misread
+
+Symptom: during Stage E, `det loss 0` was suspected while training output still showed nonzero `box_loss` and
+`cls_loss`.
+
+Cause: there are three different cases:
+
+- ADE-only images correctly gate detection loss off because `has_det=false`.
+- Mixed Stage E batches still compute detection loss on the images that have detection labels.
+- The live training columns name detection as `box_loss`, `cls_loss`, and `dfl_loss`; there is no single `det_loss`
+  column. The small `dfl_loss` value is expected because this branch keeps the no-DFL/reg-max-1 design.
+
+Fix: interpret detection training from the first three loss columns, and inspect `has_det` if a whole batch appears to
+skip detector supervision.
+
+Guardrail: if `box_loss` and `cls_loss` are exactly zero in a mixed stage where `loss.det>0`, check `has_det` collation,
+`sampling_sources`, and whether the current sampled batch is ADE-only before changing the loss.
+
+### 22. Cross-Source Mosaic And Inherited Mixed Augmentation
+
+Symptom: mixed augmentations could combine Objects365, person-only, and face-only samples into one mosaic, causing class
+supervision masks to intersect incorrectly or become too narrow. Stages without an `augment` block could also inherit
+Ultralytics default mosaic unexpectedly.
+
+Cause: standard mosaic does not know about partial-label supervision domains, and default augmentation inheritance is
+unsafe for multi-task partial labels.
+
+Fix: source-aware mixed augmentation samples companions from the same `det_class_mask` supervision domain as the anchor
+image. The stage trainer also closes `mosaic`, `mixup`, `copy_paste`, and `cutmix` when a stage does not explicitly set
+augmentation.
+
+Guardrail: C/D/E/F keep mixed augmentation at `0.0`. Stage A also currently keeps mosaic off for stability. Re-enable
+mixed augmentation only with source-aware sampling and a small smoke run.
+
+### 23. TaskAlignedAssigner CPU Fallback And GPU Utilization
+
+Symptom: larger batches filled memory but reduced speed, with intermittent low GPU utilization.
+
+Cause: P2-P5 at `[448,768]` creates about 28.5k anchor points per image. Dense sources with many GT boxes can make TAL
+assignment tensors peak above available GPU memory. Ultralytics catches the OOM and retries assignment on CPU, which
+keeps training alive but slows the run.
+
+Fix: prefer a smaller batch that keeps TAL on GPU over a larger batch that falls back to CPU. Stage A settled on
+`batch=16`, `accumulate=4`, `workers=20`, and TAL `8/5/1`. The plan exposes:
+
+```yaml
+tal_topk_one2many
+tal_topk_one2one
+tal_topk2_one2one
+```
+
+Guardrail: when utilization drops, first search logs for `TaskAlignedAssigner`, `CUDA OutOfMemoryError`, or `using CPU`.
+Do not reduce workers unless dataloader starvation is visible. Do not raise resolution while TAL is falling back.
+
+### 24. E2E Loss Decay Was Not Updating At The Right Time
+
+Symptom: the intended one-to-many decay could be ineffective or misleading if `criterion.update()` was not tied to
+optimizer steps.
+
+Cause: YOLO26-PS E2E training has one-to-many and one-to-one branches. The decay should track optimizer updates, not
+only epoch boundaries.
+
+Fix: call `criterion.update()` immediately after `optimizer_step()`. Loss logging keeps the weighted task items so
+stage changes are visible in `results.csv`.
+
+Guardrail: after changing gradient accumulation or resuming with a different batch, confirm that update-driven schedules
+still move per optimizer step.
+
+### 25. Repeated Assignment For Pose And Mask Losses
+
+Symptom: pose and mask losses repeatedly recomputed detector assignment for the same person positives.
+
+Cause: every task loss originally called its own assignment path.
+
+Fix: cache assignment results inside the unified loss by image subset. Pose and person mask losses reuse the detection
+assignment when the subset matches, or slice from a cached superset when possible.
+
+Guardrail: any new person-bound task should request assignment through the shared cache, not call TAL directly.
+
+### 26. Unified Label Cache Staleness
+
+Symptom: changing source mapping, manifest paths, or task flags could leave stale cache records that made later runs look
+broken.
+
+Cause: unified labels are cached separately from legacy YOLO labels, and old cache files may still match image paths if
+the schema version is not bumped.
+
+Fix: unified cache includes a dedicated `UNIFIED_CACHE_VERSION`, manifest-aware hashes, source names, task flags,
+`det_class_mask`, 2D/3D keypoints, masks, and scene paths. Bump the unified cache version after schema or source-mask
+changes and rebuild caches.
+
+Guardrail: if a training result contradicts expectations, inspect the cache version and source counts before changing
+model code.
+
+### 27. Validation Was Too Coarse
+
+Symptom: total mAP or total loss hid source-specific regressions. In particular, detector person confidence could drop
+while the aggregate mAP looked only slightly worse.
+
+Cause: the validation mix includes many classes and sources; a regression in `person` can be diluted by the rest of the
+Objects365 class set.
+
+Fix: stage validation reports source buckets such as Objects365, Objects365/person, small objects, COCO person, 3DPW
+person, and AGORA person. Routine training uses `val_samples=2000` for speed; full validation is reserved for stage
+boundaries.
+
+Guardrail: monitor at least `mAP50`, `small mAP50`, `Objects365/person`, and the relevant stage source metrics before
+accepting a checkpoint.
+
+### 28. Pretrain, Freeze, And Resume Semantics
+
+Symptom: `freeze=10`, `--weights`, and `--pretrain` were easy to mix up.
+
+Cause: official YOLO26 detection weights are not the same architecture as YOLO26s-PS-2.5D, while stage checkpoints are
+same-architecture PS-2.5D checkpoints.
+
+Fix:
+
+- use `--pretrain pretrains/yolo26s-det.pt` only when building PS-2.5D from YAML and partially transferring compatible
+  weights
+- use `--weights runs/.../weights/last.pt` or `best.pt` when chaining PS-2.5D stages
+- keep `freeze=0` for Stage A unless transfer is confirmed
+- prefer active task gating over freezing as the first way to save memory
+- use a new `--weights last.pt` run, not `resume=True`, when changing plan settings such as batch, augmentation, or
+  stage losses
+
+Guardrail: the log must show transferred items when using official pretrain. If transfer fails, freezing early layers is
+actively harmful.
+
+### 29. Stage C Reanchor Should Preserve 3D
+
+Symptom: after 2.5D became stable, det reanchor was needed, but det-only reanchor could lose the 3D improvements.
+
+Cause: detection and pose share person positives; changing detection confidence without any pose losses can drift away
+from the 2.5D objective.
+
+Fix: `C_det_reanchor` keeps both active tasks and small pose weights:
+
+```yaml
+active_tasks: [det, pose]
+loss: {det: 0.04, pose2d: 0.3, pose_z: 0.1, pose_vis: 0.05, bone: 0.01}
+```
+
+Guardrail: accept a reanchor checkpoint only if source person AP is near baseline and `val/pose_z_loss` remains stable.
 
 ## Known Work Items
 
 These are deliberate engineering items, not model-contract changes:
 
-- Cache person-positive assignment for pose and mask losses in B-F so the same matching result is reused across task
-  heads.
-- Expand validation dashboards so each stage reports its own primary task metrics by source.
+- Extend assignment-cache reuse and source metrics as new person-bound heads are added; pose and person mask already use
+  the shared cache path.
+- Expand validation dashboards so each stage reports its own primary task metrics by source, especially mask Dice/AP and
+  scene mIoU.
 - Consider a strict "resume with plan overrides" path if interrupted runs need to preserve optimizer state while changing
   augmentation controls.
