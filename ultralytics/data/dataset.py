@@ -50,7 +50,7 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
-UNIFIED_CACHE_VERSION = "1.0.6"
+UNIFIED_CACHE_VERSION = "1.0.8"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
 ADE20K_150_LABEL_MAPPING = {0: 255, **{i: i - 1 for i in range(1, 151)}}
@@ -88,7 +88,7 @@ PATH_SOURCE_MARKERS = (
     ("h3wb", ("h3wb", "human36m", "human3.6m")),
     ("ade20k", ("ade20k", "adechallenge", "adechallengedata2016")),
     ("coco_person_mask", ("coco_person_mask",)),
-    ("coco_wholebody", ("coco_wholebody", "coco-wholebody")),
+    ("coco_wholebody", ("coco_wholebody", "coco-wholebody", "coco_2017", "coco2017")),
 )
 PERSON_ONLY_SOURCES = {
     "crowdhuman",
@@ -355,7 +355,7 @@ class YOLODataset(BaseDataset):
         pbar = TQDM(list(pending), desc=desc, total=len(pending))
         for im_file in pbar:
             im_file_abs = str(Path(im_file).absolute())
-            record = records.get(im_file_abs) or records.get(Path(im_file).name)
+            record = records.get(im_file_abs)
             if record is not None:
                 record.setdefault("source", self._source_from_record(record, im_file))
                 label = self._parse_unified_record(record, im_file)
@@ -550,7 +550,6 @@ class YOLODataset(BaseDataset):
             path = Path(image)
             abs_path = path if path.is_absolute() else root / path
             out[str(abs_path.absolute())] = rec
-            out[path.name] = rec
         return out
 
     def _unified_label_from_yolo_file(self, im_file: str | Path) -> dict | None:
@@ -585,6 +584,7 @@ class YOLODataset(BaseDataset):
             "instance_flags": None,
             "scene_seg": None,
             "source": source,
+            "sampling_sources": self._sampling_sources(source, {"has_det": bool(n)}),
             "det_class_mask": self._det_class_mask_for_source(source, im_file),
             "has_det": np.array(bool(n), dtype=bool),
             "has_pose2d": np.array(False, dtype=bool),
@@ -614,6 +614,7 @@ class YOLODataset(BaseDataset):
             "instance_flags": None,
             "scene_seg": None,
             "source": source,
+            "sampling_sources": self._sampling_sources(source, {"has_det": bool(n)}),
             "det_class_mask": self._det_class_mask_for_source(source, im_file),
             "has_det": np.array(bool(n), dtype=bool),
             "has_pose2d": np.array(False, dtype=bool),
@@ -694,6 +695,9 @@ class YOLODataset(BaseDataset):
             if isinstance(person_mask, list):
                 seg = self._normalize_segment(person_mask, width, height)
                 segments.append(seg if seg is not None else np.zeros((0, 2), dtype=np.float32))
+            elif isinstance(person_mask, dict):
+                seg = self._rle_to_segment(person_mask, width, height)
+                segments.append(seg if seg is not None else self._dummy_segment_from_box(box))
             elif isinstance(person_mask, str):
                 seg = self._mask_file_to_segment(person_mask, width, height)
                 segments.append(seg if seg is not None else self._dummy_segment_from_box(box))
@@ -734,6 +738,7 @@ class YOLODataset(BaseDataset):
             "instance_flags": instance_flags,
             "scene_seg": scene_seg,
             "source": source,
+            "sampling_sources": self._sampling_sources(source, task_flags),
             "det_class_mask": self._det_class_mask_for_source(source, im_file),
             **{k: np.array(task_flags[k], dtype=bool) for k in UNIFIED_TASK_FLAG_KEYS},
             "normalized": True,
@@ -743,6 +748,31 @@ class YOLODataset(BaseDataset):
     def _det_class_mask_for_image(self, im_file: str | Path) -> np.ndarray:
         """Return per-image detection class supervision mask for partial-label sources."""
         return self._det_class_mask_for_source(self._source_from_path(im_file), im_file)
+
+    @staticmethod
+    def _sampling_sources(source: str | None, task_flags: dict[str, Any] | None = None) -> list[str]:
+        """Return all supervision domains that should be visible to the weighted replacement sampler."""
+        source = YOLODataset._canonical_source(source)
+        sources = [source] if source else []
+        flags = task_flags or {}
+        if bool(flags.get("has_scene_seg")):
+            sources.append("ade20k")
+        if bool(flags.get("has_person_mask")):
+            sources.append("coco_person_mask")
+        if bool(flags.get("has_pose3d")):
+            if source in {"3dpw", "agora", "h3wb"}:
+                sources.append(source)
+        if bool(flags.get("has_pose2d")):
+            if source in {"coco_wholebody", "ochuman", "3dpw", "agora", "h3wb"}:
+                sources.append(source)
+            else:
+                sources.append("coco_wholebody")
+        if bool(flags.get("has_det")):
+            if source in {"objects365", "crowdhuman", "wider_face"}:
+                sources.append(source)
+            elif source in {"coco_wholebody", "coco_person_mask", "ochuman", "3dpw", "agora", "h3wb"}:
+                sources.append(source)
+        return list(dict.fromkeys(s for s in sources if s))
 
     def _det_class_mask_for_source(self, source: str | None, im_file: str | Path | None = None) -> np.ndarray:
         """Return per-image detection class supervision mask from a normalized source name."""
@@ -968,6 +998,31 @@ class YOLODataset(BaseDataset):
         return contour
 
     @staticmethod
+    def _rle_to_segment(rle: dict, width: int, height: int) -> np.ndarray | None:
+        """Approximate a COCO RLE mask as its largest contour polygon."""
+        try:
+            from pycocotools import mask as mask_utils
+
+            mask = mask_utils.decode(rle)
+        except Exception:
+            return None
+        if mask is None:
+            return None
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+        if len(contour) < 3:
+            return None
+        contour[:, 0] /= width
+        contour[:, 1] /= height
+        return contour
+
+    @staticmethod
     def _dummy_segment_from_box(box: list[float]) -> np.ndarray:
         """Return a zero-area polygon inside a bbox for non-mask instances."""
         cx, cy, bw, bh = box
@@ -1098,7 +1153,17 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "sem_masks", "scene_seg"} and torch.is_tensor(value[0]):
+            if k == "scene_seg":
+                tensor_value = next((v for v in value if torch.is_tensor(v)), None)
+                if tensor_value is not None:
+                    value = torch.stack(
+                        [
+                            v if torch.is_tensor(v) else torch.full_like(tensor_value, 255, dtype=torch.long)
+                            for v in value
+                        ],
+                        0,
+                    )
+            elif k in {"img", "text_feats", "sem_masks"} and torch.is_tensor(value[0]):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)

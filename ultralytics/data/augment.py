@@ -2369,8 +2369,8 @@ class Format(BaseTransform):
                 body_kpts_3d[..., :2] = labels["keypoints"][..., :2]
                 body_kpts_3d[..., 3] = labels["keypoints"][..., 2]
             labels["body_kpts_3d"] = body_kpts_3d
-        if labels.get("scene_mask") is not None:
-            scene_mask = labels["scene_mask"]
+        scene_mask = labels.pop("scene_mask", None)
+        if scene_mask is not None:
             if scene_mask.ndim == 3:
                 scene_mask = scene_mask[..., 0]
             scene_mask = torch.from_numpy(np.ascontiguousarray(scene_mask)).long()
@@ -2381,6 +2381,8 @@ class Format(BaseTransform):
                     mode="nearest",
                 )[0, 0].long()
             labels["scene_seg"] = scene_mask
+        elif "scene_seg" in labels and not torch.is_tensor(labels["scene_seg"]):
+            labels["scene_seg"] = None
         if "instance_flags" in labels and labels["instance_flags"] is not None:
             labels["instance_flags"] = torch.from_numpy(labels["instance_flags"]).bool()
         if self.return_obb:

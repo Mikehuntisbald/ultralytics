@@ -123,15 +123,40 @@ def _path_source(path: str, weights: dict[str, float]) -> str:
 
 def _label_source(label: dict[str, Any] | None, weights: dict[str, float]) -> str:
     """Return a sampler source from cached labels, falling back to empty when unavailable."""
+    sources = _label_sources(label, weights)
+    return max(sources, key=lambda source: weights[source]) if sources else ""
+
+
+def _label_sources(label: dict[str, Any] | None, weights: dict[str, float]) -> list[str]:
+    """Return all weighted sampler sources represented by a cached label."""
     if not isinstance(label, dict):
-        return ""
+        return []
+    sources = label.get("sampling_sources") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    normalized_sources = []
+    for source in sources:
+        source = _normalize_source_name(source)
+        if source in weights:
+            normalized_sources.append(source)
+    if normalized_sources:
+        return list(dict.fromkeys(normalized_sources))
     source = str(label.get("source") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    source = _normalize_source_name(source)
+    if source in weights:
+        return [source]
+    return []
+
+
+def _normalize_source_name(source: Any) -> str:
+    """Normalize dataset/source names used by weighted replacement sampling."""
+    source = str(source or "").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "object365": "objects365",
         "wider": "wider_face",
         "widerface": "wider_face",
         "coco": "coco_wholebody",
-        "coco-wholebody": "coco_wholebody",
+        "coco_wholebody": "coco_wholebody",
         "human36m": "h3wb",
         "human3.6m": "h3wb",
         "adechallenge": "ade20k",
@@ -139,10 +164,7 @@ def _label_source(label: dict[str, Any] | None, weights: dict[str, float]) -> st
         "adechallengedata2016": "ade20k",
         "ade_challenge_data_2016": "ade20k",
     }
-    source = aliases.get(source, source)
-    if source in weights:
-        return source
-    return ""
+    return aliases.get(source, source)
 
 
 def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], samples_per_epoch: int) -> WeightedRandomSampler:
@@ -154,19 +176,26 @@ def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], sa
     im_files = getattr(dataset, "im_files", None)
     if not im_files:
         raise ValueError("weighted_random_with_replacement requires a dataset with im_files.")
-    weights = {str(k).lower(): float(v) for k, v in weights.items()}
+    weights = {_normalize_source_name(k): float(v) for k, v in weights.items()}
     counts = {source: 0 for source in weights}
     labels = getattr(dataset, "labels", None) or []
-    sources = []
+    sources_per_image = []
     for i, path in enumerate(im_files):
-        source = _label_source(labels[i] if i < len(labels) else None, weights) or _path_source(path, weights)
-        sources.append(source)
-        if source in counts:
-            counts[source] += 1
+        sources = _label_sources(labels[i] if i < len(labels) else None, weights)
+        if not sources:
+            source = _path_source(path, weights)
+            sources = [source] if source else []
+        sources_per_image.append(sources)
+        for source in sources:
+            if source in counts:
+                counts[source] += 1
     sample_weights = []
-    for source in sources:
-        count = counts.get(source, 0)
-        sample_weights.append(weights.get(source, 0.0) / count if count else 0.0)
+    for sources in sources_per_image:
+        weight = 0.0
+        for source in sources:
+            count = counts.get(source, 0)
+            weight += weights.get(source, 0.0) / count if count else 0.0
+        sample_weights.append(weight)
     if not any(sample_weights):
         raise ValueError("Could not match sampling_weights to any dataset image path segments.")
     LOGGER.info(
