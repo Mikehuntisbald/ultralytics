@@ -2366,8 +2366,9 @@ class Format(BaseTransform):
         if "body_kpts_3d" in labels and labels["body_kpts_3d"] is not None:
             body_kpts_3d = torch.from_numpy(labels["body_kpts_3d"]).float()
             if self.return_keypoint and body_kpts_3d.numel() and labels["keypoints"].numel():
+                valid3d = body_kpts_3d[..., 3].clone()
                 body_kpts_3d[..., :2] = labels["keypoints"][..., :2]
-                body_kpts_3d[..., 3] = labels["keypoints"][..., 2]
+                body_kpts_3d[..., 3] = valid3d * labels["keypoints"][..., 2].gt(0).to(valid3d.dtype)
             labels["body_kpts_3d"] = body_kpts_3d
         scene_mask = labels.pop("scene_mask", None)
         if scene_mask is not None:

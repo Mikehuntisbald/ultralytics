@@ -958,7 +958,6 @@ class YOLODataset(BaseDataset):
     def _normalize_kpts3d(kpts: list | None, kpts2d: np.ndarray, width: int, height: int, nkpt: int) -> np.ndarray:
         arr = np.zeros((nkpt, 4), dtype=np.float32)
         arr[:, :2] = kpts2d[:, :2]
-        arr[:, 3] = kpts2d[:, 2]
         if not kpts:
             return arr
         src = np.asarray(kpts, dtype=np.float32).reshape(-1, 4)
