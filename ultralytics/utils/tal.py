@@ -37,6 +37,10 @@ class TaskAlignedAssigner(nn.Module):
         stride: list = [8, 16, 32],
         eps: float = 1e-9,
         topk2=None,
+        high_gt_threshold: int = 0,
+        high_gt_topk: int | None = None,
+        high_gt_topk2: int | None = None,
+        metric_chunk_gt: int = 0,
     ):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters.
 
@@ -48,16 +52,29 @@ class TaskAlignedAssigner(nn.Module):
             stride (list, optional): List of stride values for different feature levels.
             eps (float, optional): A small value to prevent division by zero.
             topk2 (int, optional): Secondary topk value for additional filtering.
+            high_gt_threshold (int, optional): Total GT count above which high-GT top-k limits are used.
+            high_gt_topk (int, optional): Top-k to use for high-GT batches.
+            high_gt_topk2 (int, optional): Secondary top-k to use for high-GT batches.
+            metric_chunk_gt (int, optional): Number of GT boxes per chunk for TAL metric computation.
         """
         super().__init__()
-        self.topk = topk
-        self.topk2 = topk2 or topk
+        self.topk = int(topk)
+        self.topk2 = int(topk2 or topk)
         self.num_classes = num_classes
         self.alpha = alpha
         self.beta = beta
         self.stride = stride
         self.stride_val = self.stride[1] if len(self.stride) > 1 else self.stride[0]
         self.eps = eps
+        self.high_gt_threshold = int(high_gt_threshold or 0)
+        self.high_gt_topk = int(high_gt_topk) if high_gt_topk is not None else None
+        self.high_gt_topk2 = int(high_gt_topk2) if high_gt_topk2 is not None else None
+        self.metric_chunk_gt = int(metric_chunk_gt or 0)
+        self._active_topk = self.topk
+        self._active_topk2 = self.topk2
+        self._active_imagewise = False
+        self._active_total_gt = 0
+        self._high_gt_guard_logged = False
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
@@ -94,16 +111,84 @@ class TaskAlignedAssigner(nn.Module):
                 torch.zeros_like(pd_scores[..., 0]),
             )
 
+        self._set_active_topk(mask_gt)
         try:
+            if self._active_imagewise:
+                return self._forward_imagewise(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
             return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
+                if not self._active_imagewise and self.bs > 1:
+                    LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, retrying image-wise on GPU")
+                    if torch.cuda.is_available() and pd_scores.is_cuda:
+                        torch.cuda.empty_cache()
+                    try:
+                        return self._forward_imagewise(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+                    except RuntimeError as retry_e:
+                        if "out of memory" not in str(retry_e).lower():
+                            raise
                 # Move tensors to CPU, compute, then move back to original device
                 LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
                 cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
                 result = self._forward(*cpu_tensors)
                 return tuple(t.to(device) for t in result)
             raise
+
+    def _set_active_topk(self, mask_gt: torch.Tensor) -> None:
+        """Select per-call TAL top-k values, shrinking only on high-GT batches."""
+        self._active_topk = self.topk
+        self._active_topk2 = self.topk2
+        self._active_imagewise = False
+        self._active_total_gt = int(mask_gt.sum().item())
+        if self.high_gt_threshold <= 0:
+            return
+        if self._active_total_gt <= self.high_gt_threshold:
+            return
+        high_topk = self.high_gt_topk if self.high_gt_topk is not None else self.topk
+        high_topk2 = self.high_gt_topk2 if self.high_gt_topk2 is not None else min(self.topk2, high_topk)
+        self._active_topk = max(1, min(self.topk, int(high_topk)))
+        self._active_topk2 = max(1, min(self.topk2, int(high_topk2), self._active_topk))
+        self._active_imagewise = self.bs > 1
+        if not self._high_gt_guard_logged:
+            LOGGER.info(
+                "TAL high-GT guard enabled: "
+                f"gt>{self.high_gt_threshold}, topk {self.topk}/{self.topk2} -> "
+                f"{self._active_topk}/{self._active_topk2}, metric_chunk_gt={self.metric_chunk_gt or 'off'}, "
+                f"imagewise={self._active_imagewise}"
+            )
+            self._high_gt_guard_logged = True
+
+    def _forward_imagewise(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Run assignment one image at a time to avoid high-GT batch padding peaks."""
+        saved_bs, saved_n_max_boxes = self.bs, self.n_max_boxes
+        outputs = [[] for _ in range(5)]
+        na = pd_scores.shape[1]
+        try:
+            for i in range(saved_bs):
+                valid = mask_gt[i, :, 0].bool()
+                n_valid = int(valid.sum().item())
+                if n_valid == 0:
+                    outputs[0].append(torch.full((1, na), self.num_classes, device=pd_scores.device, dtype=torch.long))
+                    outputs[1].append(torch.zeros((1, na, 4), device=pd_bboxes.device, dtype=pd_bboxes.dtype))
+                    outputs[2].append(torch.zeros((1, na, self.num_classes), device=pd_scores.device, dtype=pd_scores.dtype))
+                    outputs[3].append(torch.zeros((1, na), device=pd_scores.device, dtype=torch.bool))
+                    outputs[4].append(torch.zeros((1, na), device=pd_scores.device, dtype=torch.long))
+                    continue
+                self.bs = 1
+                self.n_max_boxes = n_valid
+                result = self._forward(
+                    pd_scores[i : i + 1],
+                    pd_bboxes[i : i + 1],
+                    anc_points,
+                    gt_labels[i : i + 1, valid],
+                    gt_bboxes[i : i + 1, valid],
+                    torch.ones((1, n_valid, 1), dtype=mask_gt.dtype, device=mask_gt.device),
+                )
+                for out, value in zip(outputs, result):
+                    out.append(value)
+        finally:
+            self.bs, self.n_max_boxes = saved_bs, saved_n_max_boxes
+        return tuple(torch.cat(items, dim=0) for items in outputs)
 
     def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
         """Compute the task-aligned assignment.
@@ -138,7 +223,9 @@ class TaskAlignedAssigner(nn.Module):
         align_metric *= mask_pos
         pos_align_metrics = align_metric.amax(dim=-1, keepdim=True)  # b, max_num_obj
         pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
-        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
+        eps = max(self.eps, torch.finfo(align_metric.dtype).tiny)
+        norm_align_metric = (align_metric * pos_overlaps / pos_align_metrics.clamp_min(eps)).amax(-2).unsqueeze(-1)
+        norm_align_metric = norm_align_metric.nan_to_num_(0.0)
         target_scores = target_scores * norm_align_metric
 
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
@@ -163,7 +250,8 @@ class TaskAlignedAssigner(nn.Module):
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
-        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        topk = min(self._active_topk, align_metric.shape[-1])
+        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, topk).bool())
         # Merge all mask to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_topk * mask_in_gts * mask_gt
 
@@ -187,19 +275,29 @@ class TaskAlignedAssigner(nn.Module):
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
         overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
         bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+        chunk = self.metric_chunk_gt if self.metric_chunk_gt and self.n_max_boxes > self.metric_chunk_gt else self.n_max_boxes
+        batch_idx = torch.arange(end=self.bs, device=pd_scores.device).view(-1, 1)
+        for start in range(0, self.n_max_boxes, chunk):
+            end = min(start + chunk, self.n_max_boxes)
+            mask_chunk = mask_gt[:, start:end]
+            if not mask_chunk.any():
+                continue
+            labels_chunk = gt_labels[:, start:end].squeeze(-1).long()
+            batch_chunk = batch_idx.expand(-1, end - start)
+            score_chunk = torch.zeros([self.bs, end - start, na], dtype=pd_scores.dtype, device=pd_scores.device)
+            score_chunk[mask_chunk] = pd_scores[batch_chunk, :, labels_chunk][mask_chunk]
+            bbox_scores[:, start:end] = score_chunk
 
-        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
-        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
-        ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        # Get the scores of each grid for each gt cls
-        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
+            overlap_chunk = torch.zeros([self.bs, end - start, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+            pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, end - start, -1, -1)[mask_chunk]
+            gt_boxes = gt_bboxes[:, start:end].unsqueeze(2).expand(-1, -1, na, -1)[mask_chunk]
+            overlap_chunk[mask_chunk] = self.iou_calculation(gt_boxes, pd_boxes)
+            overlaps[:, start:end] = overlap_chunk
 
-        # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
-        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
-        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
-
-        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+        bbox_scores.nan_to_num_(0.0)
+        overlaps.nan_to_num_(0.0)
+        align_metric = bbox_scores.clamp_min_(0).pow_(self.alpha)
+        align_metric *= overlaps.clamp_min(0).pow(self.beta)
         return align_metric, overlaps
 
     def iou_calculation(self, gt_bboxes, pd_bboxes):
@@ -228,7 +326,8 @@ class TaskAlignedAssigner(nn.Module):
             (torch.Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
         """
         # (b, max_num_obj, topk)
-        topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=True)
+        topk = min(self._active_topk, metrics.shape[-1])
+        topk_metrics, topk_idxs = torch.topk(metrics, topk, dim=-1, largest=True)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
         # (b, max_num_obj, topk)
@@ -237,7 +336,7 @@ class TaskAlignedAssigner(nn.Module):
         # (b, max_num_obj, topk, h*w) -> (b, max_num_obj, h*w)
         count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=topk_idxs.device)
         ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=topk_idxs.device)
-        for k in range(self.topk):
+        for k in range(topk):
             # Expand topk_idxs for each value of k and add 1 at the specified positions
             count_tensor.scatter_add_(-1, topk_idxs[:, :, k : k + 1], ones)
         # Filter invalid bboxes
@@ -313,9 +412,16 @@ class TaskAlignedAssigner(nn.Module):
 
         n_anchors = xy_centers.shape[0]
         bs, n_boxes, _ = gt_bboxes.shape
-        lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
-        bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
-        return bbox_deltas.amin(3).gt_(eps)
+        chunk = self.metric_chunk_gt if self.metric_chunk_gt and n_boxes > self.metric_chunk_gt else n_boxes
+        masks = []
+        for start in range(0, n_boxes, chunk):
+            end = min(start + chunk, n_boxes)
+            lt, rb = gt_bboxes[:, start:end].reshape(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
+            bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(
+                bs, end - start, n_anchors, -1
+            )
+            masks.append(bbox_deltas.amin(3).gt_(eps))
+        return torch.cat(masks, dim=1)
 
     def select_highest_overlaps(self, mask_pos, overlaps, n_max_boxes, align_metric):
         """Select anchor boxes with highest IoU when assigned to multiple ground truths.
@@ -343,9 +449,10 @@ class TaskAlignedAssigner(nn.Module):
 
             fg_mask = mask_pos.sum(-2)
 
-        if self.topk2 != self.topk:
+        topk2 = min(self._active_topk2, align_metric.shape[-1])
+        if topk2 != min(self._active_topk, align_metric.shape[-1]):
             align_metric = align_metric * mask_pos  # update overlaps
-            max_overlaps_idx = torch.topk(align_metric, self.topk2, dim=-1, largest=True).indices  # (b, n_max_boxes)
+            max_overlaps_idx = torch.topk(align_metric, topk2, dim=-1, largest=True).indices  # (b, n_max_boxes)
             topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)  # update mask_pos
             topk_idx.scatter_(-1, max_overlaps_idx, 1.0)
             mask_pos *= topk_idx

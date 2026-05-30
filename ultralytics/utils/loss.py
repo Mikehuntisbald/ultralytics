@@ -334,7 +334,16 @@ class KeypointLoss(nn.Module):
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
-    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):  # model must be de-paralleled
+    def __init__(
+        self,
+        model,
+        tal_topk: int = 10,
+        tal_topk2: int | None = None,
+        tal_high_gt_threshold: int = 0,
+        tal_high_gt_topk: int | None = None,
+        tal_high_gt_topk2: int | None = None,
+        tal_metric_chunk_gt: int = 0,
+    ):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -362,6 +371,10 @@ class v8DetectionLoss:
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            high_gt_threshold=tal_high_gt_threshold,
+            high_gt_topk=tal_high_gt_topk,
+            high_gt_topk2=tal_high_gt_topk2,
+            metric_chunk_gt=tal_metric_chunk_gt,
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
@@ -1019,9 +1032,26 @@ class YOLO26PS25DLoss:
 
     INSTANCE_KEYS = {"batch_idx", "cls", "bboxes", "keypoints", "body_kpts_3d", "instance_flags", "segments", "obb"}
 
-    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+    def __init__(
+        self,
+        model,
+        tal_topk: int = 10,
+        tal_topk2: int | None = None,
+        tal_high_gt_threshold: int = 0,
+        tal_high_gt_topk: int | None = None,
+        tal_high_gt_topk2: int | None = None,
+        tal_metric_chunk_gt: int = 0,
+    ):
         """Initialize detection loss, auxiliary criteria, and multi-task scalar weights."""
-        self.det = v8DetectionLoss(model, tal_topk=tal_topk, tal_topk2=tal_topk2)
+        self.det = v8DetectionLoss(
+            model,
+            tal_topk=tal_topk,
+            tal_topk2=tal_topk2,
+            tal_high_gt_threshold=tal_high_gt_threshold,
+            tal_high_gt_topk=tal_high_gt_topk,
+            tal_high_gt_topk2=tal_high_gt_topk2,
+            tal_metric_chunk_gt=tal_metric_chunk_gt,
+        )
         self.device = self.det.device
         self.model = model
         head = model.model[-1]
@@ -1575,9 +1605,37 @@ class YOLO26PS25DE2ELoss:
         o2m_topk = int(getattr(args, "tal_topk_one2many", 10) or 10)
         o2o_topk = int(getattr(args, "tal_topk_one2one", 7) or 7)
         o2o_topk2 = int(getattr(args, "tal_topk2_one2one", 1) or 1)
-        self.one2many = YOLO26PS25DLoss(model, tal_topk=o2m_topk)
-        self.one2one = YOLO26PS25DLoss(model, tal_topk=o2o_topk, tal_topk2=o2o_topk2)
-        self.tal_topk = {"one2many": o2m_topk, "one2one": o2o_topk, "one2one_topk2": o2o_topk2}
+        high_gt_threshold = int(getattr(args, "tal_high_gt_threshold", 0) or 0)
+        metric_chunk_gt = int(getattr(args, "tal_metric_chunk_gt", 0) or 0)
+        o2m_high_topk = int(getattr(args, "tal_high_gt_topk_one2many", o2m_topk) or o2m_topk)
+        o2o_high_topk = int(getattr(args, "tal_high_gt_topk_one2one", o2o_topk) or o2o_topk)
+        o2o_high_topk2 = int(getattr(args, "tal_high_gt_topk2_one2one", o2o_topk2) or o2o_topk2)
+        self.one2many = YOLO26PS25DLoss(
+            model,
+            tal_topk=o2m_topk,
+            tal_high_gt_threshold=high_gt_threshold,
+            tal_high_gt_topk=o2m_high_topk,
+            tal_metric_chunk_gt=metric_chunk_gt,
+        )
+        self.one2one = YOLO26PS25DLoss(
+            model,
+            tal_topk=o2o_topk,
+            tal_topk2=o2o_topk2,
+            tal_high_gt_threshold=high_gt_threshold,
+            tal_high_gt_topk=o2o_high_topk,
+            tal_high_gt_topk2=o2o_high_topk2,
+            tal_metric_chunk_gt=metric_chunk_gt,
+        )
+        self.tal_topk = {
+            "one2many": o2m_topk,
+            "one2one": o2o_topk,
+            "one2one_topk2": o2o_topk2,
+            "high_gt_threshold": high_gt_threshold,
+            "high_gt_one2many": o2m_high_topk,
+            "high_gt_one2one": o2o_high_topk,
+            "high_gt_one2one_topk2": o2o_high_topk2,
+            "metric_chunk_gt": metric_chunk_gt,
+        }
         self.updates = 0
         self.total = 1.0
         self.o2m = 0.8
