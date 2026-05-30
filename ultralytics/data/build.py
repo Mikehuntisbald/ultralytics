@@ -167,7 +167,34 @@ def _normalize_source_name(source: Any) -> str:
     return aliases.get(source, source)
 
 
-def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], samples_per_epoch: int) -> WeightedRandomSampler:
+def _label_class_ids(label: dict[str, Any] | None) -> list[int]:
+    """Return unique non-negative class ids from a cached YOLO label."""
+    if not isinstance(label, dict) or "cls" not in label:
+        return []
+    cls = label.get("cls")
+    if torch.is_tensor(cls):
+        cls = cls.detach().cpu().numpy()
+    try:
+        cls = np.asarray(cls).reshape(-1)
+    except Exception:
+        return []
+    if cls.size == 0:
+        return []
+    cls = cls[np.isfinite(cls)]
+    cls = cls[cls >= 0]
+    return sorted({int(c) for c in cls.tolist()})
+
+
+def weighted_replacement_sampler(
+    dataset: Dataset,
+    weights: dict[str, float],
+    samples_per_epoch: int,
+    class_aware_sampling: bool = False,
+    class_aware_source: str = "objects365",
+    class_aware_power: float = 0.5,
+    class_aware_min_multiplier: float = 0.5,
+    class_aware_max_multiplier: float = 8.0,
+) -> WeightedRandomSampler:
     """Create a weighted replacement sampler from cached source names or image path segments."""
     if samples_per_epoch <= 0:
         raise ValueError(f"samples_per_epoch must be positive, got {samples_per_epoch}.")
@@ -180,8 +207,12 @@ def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], sa
     counts = {source: 0 for source in weights}
     labels = getattr(dataset, "labels", None) or []
     sources_per_image = []
+    classes_per_image: list[list[int]] = []
+    class_counts: dict[int, int] = {}
+    class_aware_source = _normalize_source_name(class_aware_source)
     for i, path in enumerate(im_files):
-        sources = _label_sources(labels[i] if i < len(labels) else None, weights)
+        label = labels[i] if i < len(labels) else None
+        sources = _label_sources(label, weights)
         if not sources:
             source = _path_source(path, weights)
             sources = [source] if source else []
@@ -189,6 +220,10 @@ def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], sa
         for source in sources:
             if source in counts:
                 counts[source] += 1
+        class_ids = _label_class_ids(label) if class_aware_source in sources else []
+        classes_per_image.append(class_ids)
+        for class_id in class_ids:
+            class_counts[class_id] = class_counts.get(class_id, 0) + 1
     sample_weights = []
     for sources in sources_per_image:
         weight = 0.0
@@ -198,6 +233,39 @@ def weighted_replacement_sampler(dataset: Dataset, weights: dict[str, float], sa
         sample_weights.append(weight)
     if not any(sample_weights):
         raise ValueError("Could not match sampling_weights to any dataset image path segments.")
+    if class_aware_sampling:
+        if class_aware_source not in weights:
+            raise ValueError(f"class_aware_source='{class_aware_source}' is not present in sampling_weights.")
+        if not class_counts:
+            LOGGER.warning(f"Class-aware sampler requested for source='{class_aware_source}', but no class labels matched.")
+        else:
+            class_aware_power = max(float(class_aware_power), 0.0)
+            class_aware_min_multiplier = max(float(class_aware_min_multiplier), 0.0)
+            class_aware_max_multiplier = max(float(class_aware_max_multiplier), class_aware_min_multiplier)
+            median_count = float(np.median(list(class_counts.values())))
+            raw_multipliers = [1.0] * len(sample_weights)
+            target_indices = []
+            for i, (sources, class_ids) in enumerate(zip(sources_per_image, classes_per_image)):
+                if class_aware_source not in sources:
+                    continue
+                target_indices.append(i)
+                if not class_ids:
+                    continue
+                multiplier = max((median_count / max(class_counts[class_id], 1)) ** class_aware_power for class_id in class_ids)
+                raw_multipliers[i] = min(max(multiplier, class_aware_min_multiplier), class_aware_max_multiplier)
+            mean_multiplier = float(np.mean([raw_multipliers[i] for i in target_indices])) if target_indices else 1.0
+            mean_multiplier = mean_multiplier if mean_multiplier > 0.0 else 1.0
+            effective = []
+            for i in target_indices:
+                multiplier = raw_multipliers[i] / mean_multiplier
+                sample_weights[i] *= multiplier
+                effective.append(multiplier)
+            LOGGER.info(
+                "Class-aware sampler: "
+                f"source={class_aware_source}, classes={len(class_counts)}, images={len(target_indices)}, "
+                f"power={class_aware_power:g}, raw_median_count={median_count:g}, "
+                f"multiplier={min(effective):.3g}-{max(effective):.3g} mean={np.mean(effective):.3g}"
+            )
     LOGGER.info(
         "Weighted replacement sampler: "
         + ", ".join(f"{source}={counts[source]} images, weight={weights[source]:g}" for source in weights)
@@ -394,6 +462,11 @@ def build_dataloader(
     sampling: str | None = None,
     samples_per_epoch: int | None = None,
     sampling_weights: dict[str, float] | None = None,
+    class_aware_sampling: bool = False,
+    class_aware_source: str = "objects365",
+    class_aware_power: float = 0.5,
+    class_aware_min_multiplier: float = 0.5,
+    class_aware_max_multiplier: float = 8.0,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -420,7 +493,16 @@ def build_dataloader(
     if sampling == "weighted_random_with_replacement":
         if rank != -1:
             raise NotImplementedError("weighted_random_with_replacement is currently implemented for single-GPU only.")
-        sampler = weighted_replacement_sampler(dataset, sampling_weights or {}, int(samples_per_epoch or 0))
+        sampler = weighted_replacement_sampler(
+            dataset,
+            sampling_weights or {},
+            int(samples_per_epoch or 0),
+            class_aware_sampling=class_aware_sampling,
+            class_aware_source=class_aware_source,
+            class_aware_power=class_aware_power,
+            class_aware_min_multiplier=class_aware_min_multiplier,
+            class_aware_max_multiplier=class_aware_max_multiplier,
+        )
         shuffle = False
     else:
         sampler = (

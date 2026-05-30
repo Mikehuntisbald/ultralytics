@@ -183,6 +183,9 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "class_aware_power",
+        "class_aware_min_multiplier",
+        "class_aware_max_multiplier",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -228,6 +231,11 @@ CFG_INT_KEYS = frozenset(
         "tal_topk_one2many",
         "tal_topk_one2one",
         "tal_topk2_one2one",
+        "tal_high_gt_threshold",
+        "tal_high_gt_topk_one2many",
+        "tal_high_gt_topk_one2one",
+        "tal_high_gt_topk2_one2one",
+        "tal_metric_chunk_gt",
         "save_period",
     }
 )
@@ -266,6 +274,7 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "end2end",
+        "class_aware_sampling",
     }
 )
 

@@ -109,6 +109,11 @@ class DetectionTrainer(BaseTrainer):
             sampling=self.args.sampling if mode == "train" else None,
             samples_per_epoch=self.args.samples_per_epoch if mode == "train" else None,
             sampling_weights=self.args.sampling_weights if mode == "train" else None,
+            class_aware_sampling=bool(getattr(self.args, "class_aware_sampling", False)) if mode == "train" else False,
+            class_aware_source=getattr(self.args, "class_aware_source", "objects365"),
+            class_aware_power=float(getattr(self.args, "class_aware_power", 0.5)),
+            class_aware_min_multiplier=float(getattr(self.args, "class_aware_min_multiplier", 0.5)),
+            class_aware_max_multiplier=float(getattr(self.args, "class_aware_max_multiplier", 8.0)),
         )
 
     def preprocess_batch(self, batch: dict) -> dict:

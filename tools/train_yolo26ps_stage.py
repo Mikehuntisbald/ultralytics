@@ -39,6 +39,8 @@ STAGE_DATA_YAMLS = {
     "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
     "C_det_reanchor": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml",
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
+    "D_det_recover_objects365": DATA_YAML,
+    "D_det_recover_objects365_unfreeze": DATA_YAML,
     "E_scene_seg": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml",
     "F_full_finetune": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
     "F_full_finetune_pose_heavy": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
@@ -621,6 +623,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-epoch", type=positive_int)
     parser.add_argument("--sampling")
     parser.add_argument("--sampling-weights", type=parse_sampling_weights, help="override sampler weights: name=weight,...")
+    parser.add_argument("--class-aware-sampling", action="store_true", help="enable rare-class reweighting inside one source")
+    parser.add_argument("--no-class-aware-sampling", action="store_true", help="disable rare-class reweighting")
+    parser.add_argument("--class-aware-source", help="source name for class-aware reweighting")
+    parser.add_argument("--class-aware-power", type=float)
+    parser.add_argument("--class-aware-min-multiplier", type=float)
+    parser.add_argument("--class-aware-max-multiplier", type=float)
     parser.add_argument("--optimizer")
     parser.add_argument("--lr0", type=float)
     parser.add_argument("--lrf", type=float)
@@ -631,6 +639,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tal-topk-one2many", type=positive_int)
     parser.add_argument("--tal-topk-one2one", type=positive_int)
     parser.add_argument("--tal-topk2-one2one", type=positive_int)
+    parser.add_argument("--tal-high-gt-threshold", type=positive_int)
+    parser.add_argument("--tal-high-gt-topk-one2many", type=positive_int)
+    parser.add_argument("--tal-high-gt-topk-one2one", type=positive_int)
+    parser.add_argument("--tal-high-gt-topk2-one2one", type=positive_int)
+    parser.add_argument("--tal-metric-chunk-gt", type=positive_int)
     parser.add_argument("--det-class-mask-normalization", choices=("sqrt", "linear", "none", "off"))
     parser.add_argument("--det-partial-cls-positive-only", action="store_true")
     parser.add_argument("--no-det-partial-cls-positive-only", action="store_true")
@@ -726,6 +739,24 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         plots=plots,
         multi_scale=0.0 if stage.get("multi_scale") is False else float(defaults.get("multi_scale", 0.0)),
     )
+    if args.class_aware_sampling and args.no_class_aware_sampling:
+        raise ValueError("Use only one of --class-aware-sampling or --no-class-aware-sampling.")
+    if args.class_aware_sampling:
+        overrides["class_aware_sampling"] = True
+    elif args.no_class_aware_sampling:
+        overrides["class_aware_sampling"] = False
+    elif defaults.get("class_aware_sampling") is not None:
+        overrides["class_aware_sampling"] = bool(defaults["class_aware_sampling"])
+    for key, cli_key in (
+        ("class_aware_source", "class_aware_source"),
+        ("class_aware_power", "class_aware_power"),
+        ("class_aware_min_multiplier", "class_aware_min_multiplier"),
+        ("class_aware_max_multiplier", "class_aware_max_multiplier"),
+    ):
+        cli_value = getattr(args, cli_key)
+        value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = value
     cache = normalize_cache(args.cache if args.cache is not None else defaults.get("cache"))
     if cache is not None:
         overrides["cache"] = cache
@@ -754,6 +785,11 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("tal_topk_one2many", "tal_topk_one2many"),
         ("tal_topk_one2one", "tal_topk_one2one"),
         ("tal_topk2_one2one", "tal_topk2_one2one"),
+        ("tal_high_gt_threshold", "tal_high_gt_threshold"),
+        ("tal_high_gt_topk_one2many", "tal_high_gt_topk_one2many"),
+        ("tal_high_gt_topk_one2one", "tal_high_gt_topk_one2one"),
+        ("tal_high_gt_topk2_one2one", "tal_high_gt_topk2_one2one"),
+        ("tal_metric_chunk_gt", "tal_metric_chunk_gt"),
     ):
         cli_value = getattr(args, cli_key, None)
         value = cli_value if cli_value is not None else defaults.get(key)
@@ -794,7 +830,11 @@ def main() -> None:
     stage = stage_config(plan, args.stage)
     if args.data is None:
         data_yaml = stage.get("data_yaml")
-        args.data = (ROOT / data_yaml) if data_yaml else STAGE_DATA_YAMLS.get(args.stage, DATA_YAML)
+        if data_yaml:
+            data_yaml = Path(data_yaml)
+            args.data = data_yaml if data_yaml.is_absolute() else ROOT / data_yaml
+        else:
+            args.data = STAGE_DATA_YAMLS.get(args.stage, DATA_YAML)
     YOLO26PSStageTrainer.stage_cfg = stage
     maybe_prepare(args)
     model = YOLO(str(args.weights or args.model))
