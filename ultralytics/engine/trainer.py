@@ -28,7 +28,7 @@ from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
 from ultralytics.nn.tasks import load_checkpoint
-from ultralytics.optim import MuSGD
+from ultralytics.optim import MuSGD, get_prodigy_optimizer
 from ultralytics.utils import (
     DEFAULT_CFG,
     GIT,
@@ -1042,9 +1042,11 @@ class BaseTrainer:
         if not use_muon:
             g = [x.values() for x in g[:3]]  # convert to list of params
 
-        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"}
+        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "Prodigy", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
+            optim_args = dict(lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
+        elif name == "Prodigy":
             optim_args = dict(lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
         elif name == "RMSProp":
             optim_args = dict(lr=lr, momentum=momentum)
@@ -1075,7 +1077,8 @@ class BaseTrainer:
                 p2 = [v for k, v in p.items() if not pattern.search(k)]
                 g_.extend([{"params": p1, **x, "lr": lr * 3}, {"params": p2, **x}])
             g = g_
-        optimizer = getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))(params=g)
+        optimizer_cls = get_prodigy_optimizer() if name == "Prodigy" else getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))
+        optimizer = optimizer_cls(params=g)
 
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "

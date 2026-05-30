@@ -115,6 +115,9 @@ logging = [
     "tensorboard",  # https://docs.ultralytics.com/integrations/tensorboard/
     "mlflow",  # https://docs.ultralytics.com/integrations/mlflow/
 ]
+prodigy = [
+    "prodigyopt>=1.1.2",
+]
 extra = [
     "ipython", # interactive notebook
     "albumentations>=1.4.6", # training augmentations
