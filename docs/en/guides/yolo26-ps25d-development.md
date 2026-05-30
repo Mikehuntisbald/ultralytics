@@ -454,6 +454,34 @@ Avoid `resume=True` when intentionally changing augmentation, image size, batch 
 `--weights runs/.../last.pt` load starts a new run with the current plan settings. True resume is only for continuing the
 same run configuration after interruption.
 
+## Detection Recovery After Stage D
+
+`D_det_recover_objects365` is a narrow recovery stage for the case where Stage D protects or improves mask quality but
+Objects365 detection quality needs to come back up. It is meant to start from a Stage D PS-2.5D checkpoint and update
+only the detection head:
+
+```bash
+python tools/train_yolo26ps_stage.py \
+  --stage D_det_recover_objects365 \
+  --weights runs/detect/<stage_d_run>/weights/best.pt \
+  --device 0 \
+  --name yolo26ps_stage_d_det_recover_objects365
+```
+
+The stage uses the Stage A detection dataset YAML, with weighted replacement sampling biased toward Objects365:
+
+```yaml
+sampling_weights: {objects365: 80, crowdhuman: 15, wider_face: 5}
+active_tasks: [det]
+train: {backbone: false, neck: false, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
+loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, scene_seg: 0.0}
+```
+
+This intentionally freezes backbone, neck, pose, mask, and scene heads. The goal is to improve the Objects365 classifier
+and detector regressors without moving the features that the person pose and mask branches depend on. Use a conservative
+LR and watch `Objects365/person`, CrowdHuman person, WIDER face, and small-object buckets; if person detection drops, cut
+the LR or increase the CrowdHuman share before continuing.
+
 ## Validation Contract
 
 Stage validation is meant to catch source-specific regressions, not just total loss movement. The Stage A validator
@@ -976,6 +1004,21 @@ loss: {det: 0.04, pose2d: 0.3, pose_z: 0.1, pose_vis: 0.05, bone: 0.01}
 ```
 
 Guardrail: accept a reanchor checkpoint only if source person AP is near baseline and `val/pose_z_loss` remains stable.
+
+### 30. Stage D Detection Recovery Should Not Move Pose Or Mask Features
+
+Symptom: after Stage D, Objects365 detection can lag behind the person mask branch, but full finetuning risks moving
+backbone/neck features used by pose and mask.
+
+Cause: pose, mask, and detection share the same feature pyramid. Updating the backbone or neck for general object
+detection can disturb person-bound heads that are already stable.
+
+Fix: use `D_det_recover_objects365` from the Stage D checkpoint. It uses Stage A detection data, activates only `det`,
+and freezes backbone, neck, body25d, mask, and scene branches. Objects365 gets most of the samples, with a small
+CrowdHuman/WIDER share to keep person and face detection anchored.
+
+Guardrail: this stage should not change pose or mask weights. Validate detection by source, and only promote the
+checkpoint if Objects365 improves without person or face regression.
 
 ## Known Work Items
 
