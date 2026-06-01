@@ -1047,7 +1047,19 @@ class BaseTrainer:
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
             optim_args = dict(lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
         elif name == "Prodigy":
-            optim_args = dict(lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
+            growth_rate = float(getattr(self.args, "prodigy_growth_rate", 0.0) or 0.0)
+            optim_args = dict(
+                lr=lr,
+                betas=(momentum, 0.999),
+                weight_decay=0.0,
+                d0=float(getattr(self.args, "prodigy_d0", 1e-6)),
+                d_coef=float(getattr(self.args, "prodigy_d_coef", 1.0)),
+                growth_rate=float("inf") if growth_rate <= 0.0 else growth_rate,
+                slice_p=int(getattr(self.args, "prodigy_slice_p", 1)),
+                decouple=bool(getattr(self.args, "prodigy_decouple", True)),
+                use_bias_correction=bool(getattr(self.args, "prodigy_use_bias_correction", False)),
+                safeguard_warmup=bool(getattr(self.args, "prodigy_safeguard_warmup", False)),
+            )
         elif name == "RMSProp":
             optim_args = dict(lr=lr, momentum=momentum)
         elif name == "SGD" or name == "MuSGD":

@@ -186,6 +186,9 @@ CFG_FLOAT_KEYS = frozenset(
         "class_aware_power",
         "class_aware_min_multiplier",
         "class_aware_max_multiplier",
+        "prodigy_d0",
+        "prodigy_d_coef",
+        "prodigy_growth_rate",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -236,6 +239,7 @@ CFG_INT_KEYS = frozenset(
         "tal_high_gt_topk_one2one",
         "tal_high_gt_topk2_one2one",
         "tal_metric_chunk_gt",
+        "prodigy_slice_p",
         "save_period",
     }
 )
@@ -266,6 +270,9 @@ CFG_BOOL_KEYS = frozenset(
         "agnostic_nms",
         "retina_masks",
         "show_boxes",
+        "prodigy_decouple",
+        "prodigy_use_bias_correction",
+        "prodigy_safeguard_warmup",
         "keras",
         "optimize",
         "int8",

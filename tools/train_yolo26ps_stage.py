@@ -214,6 +214,13 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
         "weight_decay",
         "warmup_epochs",
         "warmup_bias_lr",
+        "prodigy_d0",
+        "prodigy_d_coef",
+        "prodigy_growth_rate",
+        "prodigy_slice_p",
+        "prodigy_decouple",
+        "prodigy_use_bias_correction",
+        "prodigy_safeguard_warmup",
         "scheduler",
         "cos_lr",
         "amp",
@@ -636,6 +643,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--warmup-epochs", type=float)
     parser.add_argument("--warmup-bias-lr", type=float)
+    parser.add_argument("--prodigy-d0", type=float)
+    parser.add_argument("--prodigy-d-coef", type=float)
+    parser.add_argument("--prodigy-growth-rate", type=float)
+    parser.add_argument("--prodigy-slice-p", type=positive_int)
+    parser.add_argument("--prodigy-decouple", action="store_true")
+    parser.add_argument("--no-prodigy-decouple", action="store_true")
+    parser.add_argument("--prodigy-use-bias-correction", action="store_true")
+    parser.add_argument("--no-prodigy-use-bias-correction", action="store_true")
+    parser.add_argument("--prodigy-safeguard-warmup", action="store_true")
+    parser.add_argument("--no-prodigy-safeguard-warmup", action="store_true")
     parser.add_argument("--tal-topk-one2many", type=positive_int)
     parser.add_argument("--tal-topk-one2one", type=positive_int)
     parser.add_argument("--tal-topk2-one2one", type=positive_int)
@@ -776,11 +793,28 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("weight_decay", "weight_decay"),
         ("warmup_epochs", "warmup_epochs"),
         ("warmup_bias_lr", "warmup_bias_lr"),
+        ("prodigy_d0", "prodigy_d0"),
+        ("prodigy_d_coef", "prodigy_d_coef"),
+        ("prodigy_growth_rate", "prodigy_growth_rate"),
+        ("prodigy_slice_p", "prodigy_slice_p"),
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)
         if value is not None:
             overrides[key] = value
+    for key, cli_on, cli_off in (
+        ("prodigy_decouple", "prodigy_decouple", "no_prodigy_decouple"),
+        ("prodigy_use_bias_correction", "prodigy_use_bias_correction", "no_prodigy_use_bias_correction"),
+        ("prodigy_safeguard_warmup", "prodigy_safeguard_warmup", "no_prodigy_safeguard_warmup"),
+    ):
+        if getattr(args, cli_on) and getattr(args, cli_off):
+            raise ValueError(f"Use only one of --{cli_on.replace('_', '-')} or --{cli_off.replace('_', '-')}.")
+        if getattr(args, cli_on):
+            overrides[key] = True
+        elif getattr(args, cli_off):
+            overrides[key] = False
+        elif defaults.get(key) is not None:
+            overrides[key] = bool(defaults[key])
     for key, cli_key in (
         ("tal_topk_one2many", "tal_topk_one2many"),
         ("tal_topk_one2one", "tal_topk_one2one"),

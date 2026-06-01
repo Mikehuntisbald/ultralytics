@@ -25,7 +25,7 @@ project: # (str, optional) project name for results root
 name: # (str, optional) experiment name; results in 'project/name'
 exist_ok: False # (bool) overwrite existing 'project/name' if True
 pretrained: True # (bool | str) use pretrained weights (bool) or load weights from path (str)
-optimizer: auto # (str) optimizer: SGD, MuSGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
+optimizer: auto # (str) optimizer: SGD, MuSGD, Prodigy, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
 verbose: True # (bool) print verbose logs during training/val
 seed: 0 # (int) random seed for reproducibility
 deterministic: True # (bool) enable deterministic ops; reproducible but may be slower
@@ -117,6 +117,13 @@ lr0: 0.01 # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
 lrf: 0.01 # (float) final LR fraction; final LR = lr0 * lrf
 momentum: 0.937 # (float) SGD momentum or Adam beta1
 weight_decay: 0.0005 # (float) weight decay (L2 regularization)
+prodigy_d0: 0.000001 # (float) Prodigy initial D estimate
+prodigy_d_coef: 1.0 # (float) Prodigy D-estimate coefficient
+prodigy_growth_rate: 0.0 # (float) Prodigy max D growth rate per step; 0 disables the cap
+prodigy_slice_p: 1 # (int) Prodigy adaptation-stat slice stride; higher saves memory
+prodigy_decouple: True # (bool) Prodigy decoupled AdamW-style weight decay
+prodigy_use_bias_correction: False # (bool) Prodigy Adam bias correction
+prodigy_safeguard_warmup: False # (bool) Prodigy warmup safeguard
 warmup_epochs: 3.0 # (float) warmup epochs (fractions allowed)
 warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
