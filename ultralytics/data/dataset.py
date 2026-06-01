@@ -250,8 +250,7 @@ class YOLODataset(BaseDataset):
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
             pbar.close()
 
-        if msgs:
-            LOGGER.info("\n".join(msgs))
+        self._log_cache_messages(msgs)
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
         x["hash"] = get_hash(self.label_files + self.im_files)
@@ -273,7 +272,7 @@ class YOLODataset(BaseDataset):
             return self.get_unified_labels()
 
         self.label_files = img2label_paths(self.im_files)
-        cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        cache_path = self._yolo_cache_path()
         try:
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
@@ -286,8 +285,7 @@ class YOLODataset(BaseDataset):
         if exists and LOCAL_RANK in {-1, 0}:
             d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
             TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
-            if cache["msgs"]:
-                LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+            self._log_cache_messages(cache["msgs"])  # display warnings
 
         # Read cache
         labels = cache["labels"]
@@ -313,6 +311,26 @@ class YOLODataset(BaseDataset):
         if len_cls == 0:
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
+
+    def _yolo_cache_path(self) -> Path:
+        """Return label cache path, isolating ad-hoc probe list files from full train/val caches."""
+        img_paths = self.img_path if isinstance(self.img_path, list) else [self.img_path]
+        if len(img_paths) == 1:
+            list_path = Path(img_paths[0])
+            if list_path.is_file() and list_path.stem not in {"train", "val", "test", "train_all"}:
+                return list_path.with_suffix(".cache")
+        return Path(self.label_files[0]).parent.with_suffix(".cache")
+
+    @staticmethod
+    def _log_cache_messages(msgs: list[str], limit: int = 50) -> None:
+        """Log a bounded number of cache warnings to avoid huge duplicate-label dumps."""
+        if not msgs:
+            return
+        shown = msgs[:limit]
+        remaining = len(msgs) - len(shown)
+        if remaining > 0:
+            shown.append(f"... {remaining} additional label messages omitted")
+        LOGGER.info("\n".join(shown))
 
     def get_unified_labels(self) -> list[dict]:
         """Return labels parsed from the YOLO26-PS unified JSON schema."""
