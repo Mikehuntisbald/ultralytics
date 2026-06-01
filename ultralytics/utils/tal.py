@@ -440,22 +440,23 @@ class TaskAlignedAssigner(nn.Module):
         # Convert (b, n_max_boxes, h*w) -> (b, h*w)
         fg_mask = mask_pos.sum(-2)
         if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
-
             max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
-            is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
-            is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
-
+            multi_anchors = fg_mask > 1  # (b, h*w)
+            for b in range(mask_pos.shape[0]):
+                anchor_idx = multi_anchors[b].nonzero(as_tuple=False).squeeze(1)
+                if anchor_idx.numel():
+                    gt_idx = max_overlaps_idx[b, anchor_idx]
+                    mask_pos[b, :, anchor_idx] = 0
+                    mask_pos[b, gt_idx, anchor_idx] = 1
             fg_mask = mask_pos.sum(-2)
 
         topk2 = min(self._active_topk2, align_metric.shape[-1])
         if topk2 != min(self._active_topk, align_metric.shape[-1]):
-            align_metric = align_metric * mask_pos  # update overlaps
-            max_overlaps_idx = torch.topk(align_metric, topk2, dim=-1, largest=True).indices  # (b, n_max_boxes)
-            topk_idx = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)  # update mask_pos
-            topk_idx.scatter_(-1, max_overlaps_idx, 1.0)
-            mask_pos *= topk_idx
+            align_metric.mul_(mask_pos)  # update overlaps without allocating another full [B, GT, anchors] tensor
+            topk_metric, max_overlaps_idx = torch.topk(align_metric, topk2, dim=-1, largest=True)
+            valid_topk = topk_metric > self.eps
+            mask_pos.zero_()
+            mask_pos.scatter_(-1, max_overlaps_idx, valid_topk.to(mask_pos.dtype))
             fg_mask = mask_pos.sum(-2)
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
