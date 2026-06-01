@@ -454,6 +454,63 @@ Avoid `resume=True` when intentionally changing augmentation, image size, batch 
 `--weights runs/.../last.pt` load starts a new run with the current plan settings. True resume is only for continuing the
 same run configuration after interruption.
 
+## Detection Local-Best Escape Plan
+
+The current Stage D recovery basin is useful but too narrow for the `Objects365 mAP50 > 0.30` target. The best stable
+Stage D detection-recovery checkpoint reached about:
+
+- overall `mAP50=0.1559`
+- Objects365 `mAP50=0.1682`
+- small-object `mAP50=0.0465`
+- Objects365 person `mAP50=0.6858`
+- CrowdHuman person `mAP50=0.7632`
+- WIDER face `mAP50=0.7547`
+
+Several high-resolution continuations around `lr0=1e-4..3e-4` either stayed flat or raised train loss without improving
+Objects365. Treat that as a local best for the Stage D checkpoint, not as a reason to keep lowering LR indefinitely.
+
+The escape route is a detection-mainline bootstrap from the official YOLO26s detector:
+
+1. Build the PS-2.5D architecture from YAML and partial-load the official detector with `--pretrain`.
+2. Freeze the transferred backbone for a short bridge while the random PS-2.5D P2-P5 neck and 366-class det heads learn.
+3. Unfreeze the full detection path and train mostly on Objects365.
+4. Use a final rare/small pass only after Objects365 mAP is clearly rising.
+
+Run order:
+
+```bash
+python tools/train_yolo26ps_stage.py \
+  --stage A_det_escape_bridge \
+  --model ultralytics/cfg/models/26/yolo26s-ps25d.yaml \
+  --pretrain pretrains/yolo26s-det.pt \
+  --device 0 \
+  --name yolo26ps_a_det_escape_bridge
+
+python tools/train_yolo26ps_stage.py \
+  --stage A_det_escape_main \
+  --weights runs/detect/yolo26ps_a_det_escape_bridge/weights/best.pt \
+  --device 0 \
+  --name yolo26ps_a_det_escape_main
+
+python tools/train_yolo26ps_stage.py \
+  --stage A_det_escape_rare_small \
+  --weights runs/detect/yolo26ps_a_det_escape_main/weights/best.pt \
+  --device 0 \
+  --name yolo26ps_a_det_escape_rare_small
+```
+
+Gate the run by real trends, not one noisy validation:
+
+- continue bridge if train box/cls loss drops and person/face anchors remain healthy
+- promote main if Objects365 mAP rises for at least 3 validations
+- start rare/small only after general Objects365 mAP is rising
+- reject a run if train cls loss rises for 2 epochs and Objects365 mAP is flat or down
+- use `val_samples>=8000` for decisions near the target; `val_samples=2000` is fast but noisy
+
+This path intentionally does not preserve a Stage D mask/pose optimum. Once detection is strong enough, either continue
+through B/C/D again from the new detector or merge the strong detection path back into a multitask checkpoint and run a
+short pose/mask repair stage.
+
 ## Detection Recovery After Stage D
 
 `D_det_recover_objects365` is a narrow recovery stage for the case where Stage D protects or improves mask quality but
@@ -481,6 +538,48 @@ This intentionally freezes backbone, neck, pose, mask, and scene heads. The goal
 and detector regressors without moving the features that the person pose and mask branches depend on. Use a conservative
 LR and watch `Objects365/person`, CrowdHuman person, WIDER face, and small-object buckets; if person detection drops, cut
 the LR or increase the CrowdHuman share before continuing.
+
+`D_det_recover_objects365_prodigy_unfreeze_fast` is the aggressive variant used when the goal is to move Objects365 fast
+and temporary pose/mask preservation is not the priority. It starts from the current Stage D detector-recovery checkpoint,
+activates only `det`, but unfreezes backbone, neck, and the detection head:
+
+```yaml
+sampling_weights: {objects365: 92, crowdhuman: 2, wider_face: 6}
+imgsz: [576, 768]
+batch: 18
+accumulate: 4
+optimizer: Prodigy
+lr0: 1.0
+lrf: 1.0
+prodigy_d0: 0.000001
+prodigy_d_coef: 1.0
+prodigy_growth_rate: 1.02
+prodigy_slice_p: 11
+prodigy_decouple: true
+prodigy_use_bias_correction: false
+prodigy_safeguard_warmup: true
+mosaic: 0.1
+tal_topk: {one2many: 7, one2one: 5, topk2_one2one: 1}
+tal_high_gt_threshold: 900
+tal_metric_chunk_gt: 256
+det_class_mask_normalization: none
+```
+
+The first 400k-sample epoch of the `576x768_mosaic01_talfix_b18` run improved the paused baseline:
+
+| Metric | New epoch 1 | Paused baseline | Delta |
+| --- | ---: | ---: | ---: |
+| overall mAP50 | 0.23050 | 0.22108 | +0.00942 |
+| overall mAP50-95 | 0.15695 | 0.14936 | +0.00759 |
+| Objects365 mAP50 | 0.24652 | 0.23529 | +0.01123 |
+| Objects365 mAP50-95 | 0.16726 | 0.15838 | +0.00888 |
+| small mAP50 | 0.05084 | 0.04286 | +0.00798 |
+| CrowdHuman person mAP50 | 0.75273 | 0.76802 | -0.01529 |
+| WIDER face mAP50 | 0.68932 | 0.65123 | +0.03809 |
+
+Guardrail: this profile intentionally uses nearly all available 32 GB GPU memory. After the TAL allocation fix, high-GT
+batches with about 2000 instances stayed on GPU, but `batch=18` is already near the safe limit. Do not raise batch or
+resolution unless a full epoch finishes without repeated OOM fallback.
 
 ## Validation Contract
 
@@ -914,6 +1013,28 @@ tal_topk2_one2one
 Guardrail: when utilization drops, first search logs for `TaskAlignedAssigner`, `CUDA OutOfMemoryError`, or `using CPU`.
 Do not reduce workers unless dataloader starvation is visible. Do not raise resolution while TAL is falling back.
 
+### 23b. High-GT TAL Overlap Resolution Can OOM
+
+Symptom: the aggressive Objects365 recovery profile fit the forward and backward pass, then failed inside
+`TaskAlignedAssigner.select_highest_overlaps()` on a crowd-heavy/high-GT batch. The failing allocation was a dense
+`[B, max_gt, anchors]` helper tensor of roughly 1 GB; the fallback path could also fail because it rebuilt the same
+temporary tensors on CPU.
+
+Cause: the original overlap resolution allocated full-size helper tensors for two narrow operations:
+
+- resolving anchors assigned to multiple GT boxes with `is_max_overlaps`
+- applying the one-to-one/secondary `topk2` mask with `topk_idx`
+
+At `[576,768]`, P2-P5 anchors and large Objects365 instance counts make those helpers dominate peak assignment memory.
+
+Fix: keep the existing assignment semantics but update `mask_pos` in place:
+
+- for multi-GT anchors, iterate per batch over only the conflicting anchor indices and zero/set those entries
+- for `topk2`, multiply `align_metric` in place, compute top-k, zero `mask_pos`, and scatter valid top-k entries back
+
+Guardrail: after changing TAL memory code, run a small synthetic assigner smoke test and then one real high-instance
+training probe. The fix should remove OOM fallback without changing output shapes.
+
 ### 24. E2E Loss Decay Was Not Updating At The Right Time
 
 Symptom: the intended one-to-many decay could be ineffective or misleading if `criterion.update()` was not tied to
@@ -953,6 +1074,22 @@ changes and rebuild caches.
 
 Guardrail: if a training result contradicts expectations, inspect the cache version and source counts before changing
 model code.
+
+### 26b. Probe Lists Should Not Reuse Full Train Caches
+
+Symptom: small probe or escape-list runs could reuse a full `labels.cache` built from a different image list, making a
+short smoke test look like it had the wrong sample population. Large duplicate-label warning dumps also made training
+logs hard to read.
+
+Cause: the legacy YOLO label cache path was based on the label directory, not on the specific list file. Any list under
+the same label directory could collide with the full train/val cache.
+
+Fix: when the dataset is created from a single ad-hoc list file whose stem is not `train`, `val`, `test`, or `train_all`,
+write the cache beside that list as `<list>.cache`. Cache warning logs are also capped to the first 50 messages with an
+omitted-count summary.
+
+Guardrail: full stage train/val lists continue to use the shared directory cache. Probe lists get isolated caches so
+they can be deleted or regenerated without touching the main stage cache.
 
 ### 27. Validation Was Too Coarse
 
@@ -1019,6 +1156,46 @@ CrowdHuman/WIDER share to keep person and face detection anchored.
 
 Guardrail: this stage should not change pose or mask weights. Validate detection by source, and only promote the
 checkpoint if Objects365 improves without person or face regression.
+
+### 31. Stage D Detection Recovery Can Hit A Local Best
+
+Symptom: after several Stage D recovery runs, Objects365 detection stopped improving around `mAP50=0.16..0.17` while
+person and face stayed strong. Higher LR runs caused loss or validation regressions; smaller LR runs mostly produced
+flat metrics.
+
+Cause: Stage D is a multitask checkpoint whose shared features were shaped by person pose and mask objectives. Updating
+only the detection head preserves those heads but does not give the 366-class Objects365 detector enough freedom. Full
+unfreeze from that checkpoint still stays near the same basin because the starting classifier and P2-P5 detection neck
+are already specialized.
+
+Fix: stop using Stage D recovery as the path to `Objects365 mAP50 > 0.30`. Use the `A_det_escape_*` stages instead:
+bootstrap the PS-2.5D detector from official YOLO26s detection pretrain, train a detection-only mainline, then re-enter
+B/C/D or merge the strong detector back into the multitask checkpoint.
+
+Guardrail: if the goal is general Objects365 ability, compare against the escape mainline metrics, not just Stage D
+recovery metrics. Keep Stage D recovery for preserving person pose/mask while making small detector repairs.
+
+### 32. Official Pretrain Transfers Only Part Of PS-2.5D
+
+Symptom: Stage A from `pretrains/yolo26s-det.pt` improves person and face quickly, but Objects365 all-class mAP starts
+very low and climbs slowly.
+
+Cause: official YOLO26s detection pretrain is an 80-class P3-P5 `Detect` model. YOLO26s-PS-2.5D is a 366-class P2-P5
+head with 192-channel neck outputs and auxiliary branches. A direct partial transfer loaded `270/1172` state-dict items
+in the current local check, leaving much of the PS-2.5D neck and detection head randomly initialized.
+
+Fix: use a bridge stage before the full detection mainline:
+
+```yaml
+A_det_escape_bridge:
+  train: {backbone: false, neck: true, det_head: true}
+  sampling_weights: {objects365: 95, crowdhuman: 3, wider_face: 2}
+```
+
+Then continue with `A_det_escape_main` and `A_det_escape_rare_small`.
+
+Guardrail: `--pretrain` should print a transferred-items log. Do not assume a high transfer count from the official
+checkpoint; the bridge stage exists because the compatible subset is intentionally limited.
 
 ## Known Work Items
 
