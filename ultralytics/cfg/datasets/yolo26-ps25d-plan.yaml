@@ -94,9 +94,8 @@ outputs:
 
 keypoints:
   schema: COCO-17
-  names:
-    [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder, left_elbow, right_elbow,
-     left_wrist, right_wrist, left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]
+  names: [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder, left_elbow, right_elbow,
+        left_wrist, right_wrist, left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]
   root_joint: pelvis
   root_definition: mean(left_hip, right_hip)
   z_rel: z_camera[j] - z_camera[pelvis]
@@ -190,7 +189,10 @@ stages:
     train_all_list: train_all.txt
     legacy_weighted_list: train_weighted_legacy.txt
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 45, crowdhuman: 35, wider_face: 20}
+    sampling_weights:
+      objects365: 45
+      crowdhuman: 35
+      wider_face: 20
     train_runtime:
       active_tasks: [det]
       imgsz: [448, 768]
@@ -216,9 +218,21 @@ stages:
       ema: true
       amp: true
       det_class_mask_normalization: none
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.5, 1.5]
   A_detection_stable:
     epochs: 15
     samples_per_epoch: 40000
@@ -227,7 +241,10 @@ stages:
     train_all_list: train_all.txt
     legacy_weighted_list: train_weighted_legacy.txt
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 75, crowdhuman: 15, wider_face: 10}
+    sampling_weights:
+      objects365: 75
+      crowdhuman: 15
+      wider_face: 10
     train_runtime:
       active_tasks: [det]
       imgsz: [448, 768]
@@ -253,9 +270,21 @@ stages:
       ema: true
       amp: true
       det_class_mask_normalization: none
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.5]}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.5, 1.5]
   A_det_escape_bridge:
     epochs: 5
     samples_per_epoch: 60000
@@ -263,7 +292,10 @@ stages:
     train_list: train.txt
     train_all_list: train_all.txt
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 95, crowdhuman: 3, wider_face: 2}
+    sampling_weights:
+      objects365: 95
+      crowdhuman: 3
+      wider_face: 2
     train_runtime:
       active_tasks: [det]
       imgsz: [512, 832]
@@ -296,10 +328,31 @@ stages:
       ema: true
       amp: true
       det_class_mask_normalization: none
-    train: {backbone: false, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.1, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.6, 1.4], rotate: [-2, 2], flip: 0.5}
-    note: Build PS25D from --model and --pretrain official YOLO26s-det.pt, freeze the transferred backbone, and train the random P2-P5 neck/det heads out of the weak-init basin.
+    train:
+      backbone: false
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.1
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.6, 1.4]
+      rotate: [-2, 2]
+      flip: 0.5
+    note: Build PS25D from --model and --pretrain official YOLO26s-det.pt, freeze the transferred backbone, and train
+      the random P2-P5 neck/det heads out of the weak-init basin.
   A_det_escape_main:
     epochs: 45
     samples_per_epoch: 60000
@@ -307,7 +360,10 @@ stages:
     train_list: train.txt
     train_all_list: train_all.txt
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 94, crowdhuman: 3, wider_face: 3}
+    sampling_weights:
+      objects365: 94
+      crowdhuman: 3
+      wider_face: 3
     train_runtime:
       active_tasks: [det]
       imgsz: [512, 832]
@@ -342,10 +398,32 @@ stages:
       amp: true
       det_class_mask_normalization: none
       class_aware_sampling: false
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.1, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.6, 1.4], rotate: [-2, 2], flip: 0.5}
-    promote_if: {objects365_mAP50: "rising for 3 consecutive validations", train_cls_loss: "not increasing for 2 consecutive epochs"}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.1
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.6, 1.4]
+      rotate: [-2, 2]
+      flip: 0.5
+    promote_if:
+      objects365_mAP50: "rising for 3 consecutive validations"
+      train_cls_loss: "not increasing for 2 consecutive epochs"
   A_det_escape_rare_small:
     epochs: 20
     samples_per_epoch: 50000
@@ -353,7 +431,10 @@ stages:
     train_list: train.txt
     train_all_list: train_all.txt
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 90, crowdhuman: 5, wider_face: 5}
+    sampling_weights:
+      objects365: 90
+      crowdhuman: 5
+      wider_face: 5
     train_runtime:
       active_tasks: [det]
       imgsz: [576, 928]
@@ -392,17 +473,43 @@ stages:
       class_aware_power: 0.8
       class_aware_min_multiplier: 0.3
       class_aware_max_multiplier: 12.0
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.8, 1.2], rotate: [-2, 2], flip: 0.5}
-    promote_if: {objects365_mAP50: ">0.30 target", small_mAP50: "rising or flat within noise", person_face_mAP50: "no large regression"}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.8, 1.2]
+      rotate: [-2, 2]
+      flip: 0.5
+    promote_if:
+      objects365_mAP50: ">0.30 target"
+      small_mAP50: "rising or flat within noise"
+      person_face_mAP50: "no large regression"
   A_det_escape_probe:
     epochs: 1
     samples_per_epoch: 2048
     val_samples: 1000
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a_probe_escape.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 94, crowdhuman: 3, wider_face: 3}
+    sampling_weights:
+      objects365: 94
+      crowdhuman: 3
+      wider_face: 3
     train_runtime:
       active_tasks: [det]
       imgsz: [512, 832]
@@ -437,71 +544,307 @@ stages:
       amp: true
       det_class_mask_normalization: none
       class_aware_sampling: false
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.8, 1.2], rotate: [-2, 2], flip: 0.5}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.8, 1.2]
+      rotate: [-2, 2]
+      flip: 0.5
   B_pose2d:
     epochs: 45
     samples_per_epoch: 40000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {coco_wholebody: 55, objects365: 25, crowdhuman: 10, wider_face: 10}
-    train_runtime: {active_tasks: [det, pose], imgsz: [448, 768], pad_stride: 32, batch: 18, accumulate: 4, workers: 20, optimizer: SGD, lr0: 0.0008, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.001, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: false, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.0, pose2d: 1.0, pose_z: 0.0, pose_vis: 0.3}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-10, 10], flip: 0.5}
+    sampling_weights:
+      coco_wholebody: 55
+      objects365: 25
+      crowdhuman: 10
+      wider_face: 10
+    train_runtime:
+      active_tasks: [det, pose]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 18
+      accumulate: 4
+      workers: 20
+      optimizer: SGD
+      lr0: 0.0008
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.001
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.0
+      pose2d: 1.0
+      pose_z: 0.0
+      pose_vis: 0.3
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-10, 10]
+      flip: 0.5
   B_pose2d_probe:
     epochs: 1
     samples_per_epoch: 2000
     val_samples: 512
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {coco_wholebody: 55, objects365: 25, crowdhuman: 10, wider_face: 10}
-    train_runtime: {active_tasks: [det, pose], imgsz: [448, 768], pad_stride: 32, batch: 18, accumulate: 4, workers: 20, optimizer: SGD, lr0: 0.0008, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.001, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: false, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.0, pose2d: 1.0, pose_z: 0.0, pose_vis: 0.3}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.9, 1.1], rotate: [-5, 5], flip: 0.5}
+    sampling_weights:
+      coco_wholebody: 55
+      objects365: 25
+      crowdhuman: 10
+      wider_face: 10
+    train_runtime:
+      active_tasks: [det, pose]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 18
+      accumulate: 4
+      workers: 20
+      optimizer: SGD
+      lr0: 0.0008
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.001
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.0
+      pose2d: 1.0
+      pose_z: 0.0
+      pose_vis: 0.3
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.9, 1.1]
+      rotate: [-5, 5]
+      flip: 0.5
   B_pose2d_det_probe:
     epochs: 1
     samples_per_epoch: 4000
     val_samples: 1000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 55, coco_wholebody: 25, crowdhuman: 10, wider_face: 10}
-    train_runtime: {active_tasks: [det, pose], imgsz: [448, 768], pad_stride: 32, batch: 18, accumulate: 4, workers: 20, optimizer: SGD, lr0: 0.0004, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.001, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.2, pose2d: 1.0, pose_z: 0.0, pose_vis: 0.3}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.9, 1.1], rotate: [-5, 5], flip: 0.5}
+    sampling_weights:
+      objects365: 55
+      coco_wholebody: 25
+      crowdhuman: 10
+      wider_face: 10
+    train_runtime:
+      active_tasks: [det, pose]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 18
+      accumulate: 4
+      workers: 20
+      optimizer: SGD
+      lr0: 0.0004
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.001
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: true
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.2
+      pose2d: 1.0
+      pose_z: 0.0
+      pose_vis: 0.3
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.9, 1.1]
+      rotate: [-5, 5]
+      flip: 0.5
   C_pose25d_warmup:
     epochs: 3
     samples_per_epoch: 20000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {coco_wholebody: 38, 3dpw: 30, agora: 32}
-    train_runtime: {active_tasks: [det, pose], imgsz: [448, 768], pad_stride: 32, batch: 20, accumulate: 4, workers: 20, optimizer: MuSGD, lr0: 0.002, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: false, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.0, pose2d: 1.0, pose_z: 0.7, pose_vis: 0.3, bone: 0.1}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
+    sampling_weights:
+      coco_wholebody: 38
+      3dpw: 30
+      agora: 32
+    train_runtime:
+      active_tasks: [det, pose]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 20
+      accumulate: 4
+      workers: 20
+      optimizer: MuSGD
+      lr0: 0.002
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.0
+      pose2d: 1.0
+      pose_z: 0.7
+      pose_vis: 0.3
+      bone: 0.1
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.8, 1.2]
+      rotate: [-10, 10]
+      flip: 0.5
   C_pose25d:
     epochs: 15
     samples_per_epoch: 40000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {coco_wholebody: 32, 3dpw: 24, agora: 28, ochuman: 6, objects365: 5, crowdhuman: 3, wider_face: 2}
-    train_runtime: {active_tasks: [det, pose], imgsz: [448, 768], pad_stride: 32, batch: 48, val_batch: 40, accumulate: 4, workers: 20, optimizer: MuSGD, lr0: 0.002, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: false, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.0, pose2d: 1.0, pose_z: 0.7, pose_vis: 0.3, bone: 0.1}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
+    sampling_weights:
+      coco_wholebody: 32
+      3dpw: 24
+      agora: 28
+      ochuman: 6
+      objects365: 5
+      crowdhuman: 3
+      wider_face: 2
+    train_runtime:
+      active_tasks: [det, pose]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 48
+      val_batch: 40
+      accumulate: 4
+      workers: 20
+      optimizer: MuSGD
+      lr0: 0.002
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.0
+      pose2d: 1.0
+      pose_z: 0.7
+      pose_vis: 0.3
+      bone: 0.1
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.8, 1.2]
+      rotate: [-10, 10]
+      flip: 0.5
   C_det_reanchor:
     epochs: 3
     samples_per_epoch: 1024
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 30, crowdhuman: 25, wider_face: 10, coco_wholebody: 20, 3dpw: 7, agora: 8}
+    sampling_weights:
+      objects365: 30
+      crowdhuman: 25
+      wider_face: 10
+      coco_wholebody: 20
+      3dpw: 7
+      agora: 8
 
     train_runtime:
       active_tasks: [det, pose]
@@ -525,16 +868,40 @@ stages:
       det_class_mask_normalization: sqrt
       det_partial_cls_positive_only: true
 
-    train: {backbone: false, neck: false, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.04, pose2d: 0.3, pose_z: 0.1, pose_vis: 0.05, bone: 0.01}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.9, 1.1], rotate: [-5, 5], flip: 0.5}
+    train:
+      backbone: false
+      neck: false
+      det_head: true
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.04
+      pose2d: 0.3
+      pose_z: 0.1
+      pose_vis: 0.05
+      bone: 0.01
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.9, 1.1]
+      rotate: [-5, 5]
+      flip: 0.5
   C_neck_adapter:
     epochs: 1
     samples_per_epoch: 2048
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 45, crowdhuman: 25, wider_face: 10, coco_wholebody: 10, 3dpw: 5, agora: 5}
+    sampling_weights:
+      objects365: 45
+      crowdhuman: 25
+      wider_face: 10
+      coco_wholebody: 10
+      3dpw: 5
+      agora: 5
 
     train_runtime:
       active_tasks: [det, pose]
@@ -559,16 +926,40 @@ stages:
       det_class_mask_normalization: sqrt
       det_partial_cls_positive_only: true
 
-    train: {backbone: false, neck: true, det_head: false, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.04, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, bone: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.95, 1.05], rotate: [-3, 3], flip: 0.5}
+    train:
+      backbone: false
+      neck: true
+      det_head: false
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.04
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      bone: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.95, 1.05]
+      rotate: [-3, 3]
+      flip: 0.5
   C_full_micro_unfreeze:
     epochs: 1
     samples_per_epoch: 2048
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 30, crowdhuman: 15, wider_face: 8, coco_wholebody: 20, 3dpw: 13, agora: 14}
+    sampling_weights:
+      objects365: 30
+      crowdhuman: 15
+      wider_face: 8
+      coco_wholebody: 20
+      3dpw: 13
+      agora: 14
 
     train_runtime:
       active_tasks: [det, pose]
@@ -593,9 +984,27 @@ stages:
       det_class_mask_normalization: sqrt
       det_partial_cls_positive_only: true
 
-    train: {backbone: true, neck: true, det_head: true, body25d_head: true, mask_head: false, scene_seg_head: false}
-    loss: {det: 0.04, pose2d: 0.3, pose_z: 0.1, pose_vis: 0.05, bone: 0.01}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.95, 1.05], rotate: [-3, 3], flip: 0.5}
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: true
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 0.04
+      pose2d: 0.3
+      pose_z: 0.1
+      pose_vis: 0.05
+      bone: 0.01
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.95, 1.05]
+      rotate: [-3, 3]
+      flip: 0.5
   D_person_mask:
     epochs: 35
     samples_per_epoch: 40000
@@ -603,11 +1012,61 @@ stages:
     plots: false
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {coco_person_mask: 50, ochuman: 18, coco_wholebody: 0, 3dpw: 10, agora: 11, objects365: 5, crowdhuman: 3, wider_face: 3}
-    train_runtime: {active_tasks: [det, mask], imgsz: [448, 768], pad_stride: 32, batch: 28, val_batch: 20, accumulate: 4, workers: 20, val_workers: 4, optimizer: MuSGD, lr0: 0.002, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 1.0, warmup_bias_lr: 0.001, freeze_trainable_bn: true, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: false, body25d_head: false, mask_head: true, scene_seg_head: false}
-    loss: {det: 0.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 1.0, bone: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-10, 10], flip: 0.5}
+    sampling_weights:
+      coco_person_mask: 50
+      ochuman: 18
+      coco_wholebody: 0
+      3dpw: 10
+      agora: 11
+      objects365: 5
+      crowdhuman: 3
+      wider_face: 3
+    train_runtime:
+      active_tasks: [det, mask]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 28
+      val_batch: 20
+      accumulate: 4
+      workers: 20
+      val_workers: 4
+      optimizer: MuSGD
+      lr0: 0.002
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 1.0
+      warmup_bias_lr: 0.001
+      freeze_trainable_bn: true
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: false
+      mask_head: true
+      scene_seg_head: false
+    loss:
+      det: 0.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 1.0
+      bone: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-10, 10]
+      flip: 0.5
   D_det_recover_objects365:
     epochs: 15
     samples_per_epoch: 40000
@@ -615,11 +1074,56 @@ stages:
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 85, crowdhuman: 5, wider_face: 10}
-    train_runtime: {active_tasks: [det], imgsz: [448, 768], pad_stride: 32, batch: 16, val_batch: 20, accumulate: 4, workers: 20, val_workers: 4, optimizer: SGD, lr0: 0.0005, lrf: 0.1, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.5, warmup_bias_lr: 0.0005, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-3, 3], flip: 0.5}
+    sampling_weights:
+      objects365: 85
+      crowdhuman: 5
+      wider_face: 10
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      val_batch: 20
+      accumulate: 4
+      workers: 20
+      val_workers: 4
+      optimizer: SGD
+      lr0: 0.0005
+      lrf: 0.1
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.5
+      warmup_bias_lr: 0.0005
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-3, 3]
+      flip: 0.5
   D_det_recover_objects365_unfreeze:
     epochs: 100
     samples_per_epoch: 40000
@@ -627,11 +1131,68 @@ stages:
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 90, crowdhuman: 3, wider_face: 7}
-    train_runtime: {active_tasks: [det], imgsz: [448, 768], pad_stride: 32, batch: 16, val_batch: 20, accumulate: 4, workers: 20, val_workers: 4, optimizer: SGD, lr0: 0.0001, lrf: 1.0, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.0001, freeze_trainable_bn: true, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, tal_high_gt_threshold: 900, tal_high_gt_topk_one2many: 7, tal_high_gt_topk_one2one: 5, tal_high_gt_topk2_one2one: 1, tal_metric_chunk_gt: 256, det_class_mask_normalization: none, class_aware_sampling: true, class_aware_source: objects365, class_aware_power: 0.5, class_aware_min_multiplier: 0.5, class_aware_max_multiplier: 8.0, scheduler: constant, cos_lr: false, ema: true, amp: true}
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-3, 3], flip: 0.5}
+    sampling_weights:
+      objects365: 90
+      crowdhuman: 3
+      wider_face: 7
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      val_batch: 20
+      accumulate: 4
+      workers: 20
+      val_workers: 4
+      optimizer: SGD
+      lr0: 0.0001
+      lrf: 1.0
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0001
+      freeze_trainable_bn: false
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 7
+      tal_high_gt_topk_one2one: 5
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      det_class_mask_normalization: none
+      class_aware_sampling: true
+      class_aware_source: objects365
+      class_aware_power: 0.5
+      class_aware_min_multiplier: 0.5
+      class_aware_max_multiplier: 8.0
+      scheduler: constant
+      cos_lr: false
+      ema: true
+      amp: true
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-3, 3]
+      flip: 0.5
   D_det_recover_objects365_shock:
     epochs: 3
     samples_per_epoch: 80000
@@ -639,11 +1200,68 @@ stages:
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 98, crowdhuman: 1, wider_face: 1}
-    train_runtime: {active_tasks: [det], imgsz: [576, 768], pad_stride: 32, batch: 12, val_batch: 22, accumulate: 6, workers: 20, val_workers: 4, optimizer: MuSGD, lr0: 0.0025, lrf: 0.2, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 0.3, warmup_bias_lr: 0.0005, freeze_trainable_bn: true, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, tal_high_gt_threshold: 900, tal_high_gt_topk_one2many: 7, tal_high_gt_topk_one2one: 5, tal_high_gt_topk2_one2one: 1, tal_metric_chunk_gt: 256, det_class_mask_normalization: none, class_aware_sampling: true, class_aware_source: objects365, class_aware_power: 1.0, class_aware_min_multiplier: 0.5, class_aware_max_multiplier: 12.0, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.2, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.5, 1.6], rotate: [-3, 3], flip: 0.5}
+    sampling_weights:
+      objects365: 98
+      crowdhuman: 1
+      wider_face: 1
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [576, 768]
+      pad_stride: 32
+      batch: 12
+      val_batch: 22
+      accumulate: 6
+      workers: 20
+      val_workers: 4
+      optimizer: MuSGD
+      lr0: 0.0025
+      lrf: 0.2
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 0.3
+      warmup_bias_lr: 0.0005
+      freeze_trainable_bn: false
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 7
+      tal_high_gt_topk_one2one: 5
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      det_class_mask_normalization: none
+      class_aware_sampling: true
+      class_aware_source: objects365
+      class_aware_power: 1.0
+      class_aware_min_multiplier: 0.5
+      class_aware_max_multiplier: 12.0
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.2
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.5, 1.6]
+      rotate: [-3, 3]
+      flip: 0.5
   D_det_recover_objects365_prodigy_fast:
     epochs: 30
     samples_per_epoch: 400000
@@ -651,35 +1269,215 @@ stages:
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 90, crowdhuman: 5, wider_face: 5}
-    train_runtime: {active_tasks: [det], imgsz: [448, 768], pad_stride: 32, batch: 16, val_batch: 20, accumulate: 4, workers: 20, val_workers: 4, optimizer: Prodigy, lr0: 1.0, lrf: 1.0, momentum: 0.9, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.0, prodigy_d0: 0.000001, prodigy_d_coef: 1.0, prodigy_growth_rate: 1.02, prodigy_slice_p: 11, prodigy_decouple: true, prodigy_use_bias_correction: false, prodigy_safeguard_warmup: true, freeze_trainable_bn: true, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, tal_high_gt_threshold: 900, tal_high_gt_topk_one2many: 7, tal_high_gt_topk_one2one: 5, tal_high_gt_topk2_one2one: 1, tal_metric_chunk_gt: 256, det_class_mask_normalization: none, scheduler: constant, cos_lr: false, ema: true, amp: true}
-    train: {backbone: false, neck: false, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-3, 3], flip: 0.5}
+    sampling_weights:
+      objects365: 90
+      crowdhuman: 5
+      wider_face: 5
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      val_batch: 20
+      accumulate: 4
+      workers: 20
+      val_workers: 4
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: false
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 7
+      tal_high_gt_topk_one2one: 5
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      det_class_mask_normalization: none
+      scheduler: constant
+      cos_lr: false
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      neck: false
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-3, 3]
+      flip: 0.5
   D_det_recover_objects365_prodigy_unfreeze_fast:
     epochs: 100
-    samples_per_epoch: 400000
+    samples_per_epoch: 100000
     val_samples: 10000
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 92, crowdhuman: 2, wider_face: 6}
-    train_runtime: {active_tasks: [det], imgsz: [576, 768], pad_stride: 32, batch: 16, val_batch: 22, accumulate: 4, workers: 20, val_workers: 4, optimizer: Prodigy, lr0: 1.0, lrf: 1.0, momentum: 0.9, weight_decay: 0.0005, warmup_epochs: 0.0, warmup_bias_lr: 0.0, prodigy_d0: 0.000001, prodigy_d_coef: 1.0, prodigy_growth_rate: 1.02, prodigy_slice_p: 11, prodigy_decouple: true, prodigy_use_bias_correction: false, prodigy_safeguard_warmup: true, freeze_trainable_bn: true, tal_topk_one2many: 12, tal_topk_one2one: 7, tal_topk2_one2one: 1, tal_high_gt_threshold: 900, tal_high_gt_topk_one2many: 12, tal_high_gt_topk_one2one: 7, tal_high_gt_topk2_one2one: 1, tal_metric_chunk_gt: 256, det_class_mask_normalization: none, class_aware_sampling: true, class_aware_source: objects365, class_aware_power: 0.5, class_aware_min_multiplier: 0.5, class_aware_max_multiplier: 8.0, scheduler: constant, cos_lr: false, ema: true, amp: true}
-    train: {backbone: true, neck: true, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
-    loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, bone: 0.0, scene_seg: 0.0}
-    augment: {mosaic: 0.2, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-3, 3], flip: 0.5}
+    sampling_weights:
+      objects365: 92
+      crowdhuman: 2
+      wider_face: 6
+    train_runtime:
+      active_tasks: [det]
+      imgsz: [576, 768]
+      pad_stride: 32
+      batch: 16
+      val_batch: 22
+      accumulate: 4
+      workers: 20
+      val_workers: 4
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: false
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
+      tal_topk2_one2one: 1
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      det_class_mask_normalization: none
+      class_aware_sampling: true
+      class_aware_source: objects365
+      class_aware_power: 0.5
+      class_aware_min_multiplier: 0.5
+      class_aware_max_multiplier: 8.0
+      small_object_sampling: true
+      small_object_source: objects365
+      small_object_area: 1024.0
+      small_object_boost: 3.0
+      small_object_crop: 0.3
+      small_object_crop_source: objects365
+      small_object_crop_area: 1024.0
+      small_object_crop_scale: 0.72
+      small_object_crop_min_keep: 1
+      det_area_loss_weight: false
+      det_area_loss_weight_max: 2.0
+      scheduler: constant
+      cos_lr: false
+      ema: true
+      amp: true
+    train:
+      backbone: true
+      neck: true
+      det_head: true
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: false
+    loss:
+      det: 1.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 0.0
+      bone: 0.0
+      scene_seg: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-3, 3]
+      flip: 0.5
   E_scene_seg:
     epochs: 30
     samples_per_epoch: 40000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {ade20k: 12, coco_wholebody: 22, coco_person_mask: 14, ochuman: 8, 3dpw: 12, agora: 12, objects365: 12, crowdhuman: 5, wider_face: 3}
-    train_runtime: {active_tasks: [det, pose, mask, scene], imgsz: [448, 768], pad_stride: 32, batch: 16, accumulate: 4, workers: 20, optimizer: MuSGD, lr0: 0.0015, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    train: {all: true}
-    loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, pose_vis: 0.2, bone: 0.05, person_mask: 0.8, scene_seg: 0.3}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.7, 1.3], rotate: [-5, 5], flip: 0.5}
-    fallback_if_det_drops: {ADE20K: "6-8", scene_seg: 0.2}
+    sampling_weights:
+      ade20k: 12
+      coco_wholebody: 22
+      coco_person_mask: 14
+      ochuman: 8
+      3dpw: 12
+      agora: 12
+      objects365: 12
+      crowdhuman: 5
+      wider_face: 3
+    train_runtime:
+      active_tasks: [det, pose, mask, scene]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      accumulate: 4
+      workers: 20
+      optimizer: MuSGD
+      lr0: 0.0015
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    train:
+      all: true
+    loss:
+      det: 1.0
+      pose2d: 1.0
+      pose_z: 0.5
+      pose_vis: 0.2
+      bone: 0.05
+      person_mask: 0.8
+      scene_seg: 0.3
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-5, 5]
+      flip: 0.5
+    fallback_if_det_drops:
+      ADE20K: "6-8"
+      scene_seg: 0.2
   F_full_finetune:
     epochs: 20
     samples_per_epoch: 40000
@@ -688,19 +1486,96 @@ stages:
     sampling: weighted_random_with_replacement
     default_imgsz: [448, 768]
     multi_scale: false
-    sampling_weights: {objects365: 15, crowdhuman: 10, wider_face: 8, coco_wholebody: 22, 3dpw: 17, agora: 17, coco_person_mask: 6, ochuman: 3, ade20k: 2}
-    train_runtime: {active_tasks: [det, pose, mask, scene], imgsz: [448, 768], pad_stride: 32, batch: 16, accumulate: 4, workers: 20, optimizer: MuSGD, lr0: 0.001, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.9, 1.1], flip: 0.5}
-    loss: {det: 1.0, pose2d: 1.0, pose_z: 0.5, pose_vis: 0.3, bone: 0.1, person_mask: 0.7, scene_seg: 0.2}
+    sampling_weights:
+      objects365: 15
+      crowdhuman: 10
+      wider_face: 8
+      coco_wholebody: 22
+      3dpw: 17
+      agora: 17
+      coco_person_mask: 6
+      ochuman: 3
+      ade20k: 2
+    train_runtime:
+      active_tasks: [det, pose, mask, scene]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      accumulate: 4
+      workers: 20
+      optimizer: MuSGD
+      lr0: 0.001
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.9, 1.1]
+      flip: 0.5
+    loss:
+      det: 1.0
+      pose2d: 1.0
+      pose_z: 0.5
+      pose_vis: 0.3
+      bone: 0.1
+      person_mask: 0.7
+      scene_seg: 0.2
   F_full_finetune_pose_heavy:
     epochs: 50
     samples_per_epoch: 40000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml
     sampling: weighted_random_with_replacement
-    sampling_weights: {objects365: 12, crowdhuman: 8, wider_face: 6, coco_wholebody: 24, 3dpw: 21, agora: 21, coco_person_mask: 5, ochuman: 3, ade20k: 0}
-    train_runtime: {active_tasks: [det, pose, mask, scene], imgsz: [448, 768], pad_stride: 32, batch: 16, accumulate: 4, workers: 20, optimizer: MuSGD, lr0: 0.001, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_bias_lr: 0.1, tal_topk_one2many: 7, tal_topk_one2one: 5, tal_topk2_one2one: 1, scheduler: cosine, cos_lr: true, ema: true, amp: true}
-    augment: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, cutmix: 0.0, scale: [0.9, 1.1], flip: 0.5}
+    sampling_weights:
+      objects365: 12
+      crowdhuman: 8
+      wider_face: 6
+      coco_wholebody: 24
+      3dpw: 21
+      agora: 21
+      coco_person_mask: 5
+      ochuman: 3
+      ade20k: 0
+    train_runtime:
+      active_tasks: [det, pose, mask, scene]
+      imgsz: [448, 768]
+      pad_stride: 32
+      batch: 16
+      accumulate: 4
+      workers: 20
+      optimizer: MuSGD
+      lr0: 0.001
+      lrf: 0.01
+      momentum: 0.937
+      weight_decay: 0.0005
+      warmup_epochs: 3.0
+      warmup_bias_lr: 0.1
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: cosine
+      cos_lr: true
+      ema: true
+      amp: true
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.9, 1.1]
+      flip: 0.5
 
 sampling_final:
   Objects365: 15
@@ -719,12 +1594,40 @@ augmentation:
     applies_to: [mosaic, mixup, copy_paste_mixup]
     domain_key: det_class_mask
     rule: mix only samples with the same detection supervision domain
-    note: prevents Objects365, person-only, and face-only sources from collapsing class supervision by mask intersection.
-  det_aug: {mosaic: 0.7, mixup: 0.1, copy_paste: 0.1, scale: [0.5, 1.5], hsv: true, blur: 0.05}
-  pose_mask_aug: {mosaic: 0.1, mixup: 0.0, scale: [0.7, 1.3], rotate: [-10, 10], flip: 0.5}
-  pose25d_aug: {mosaic: 0.0, mixup: 0.0, copy_paste: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5}
-  agora_aug: {mosaic: 0.0, mixup: 0.0, scale: [0.8, 1.2], rotate: [-10, 10], flip: 0.5, occlusion_aug: mild}
-  scene_aug: {random_crop: true, scale: [0.5, 2.0], flip: 0.5, color_jitter: true}
+    note: prevents Objects365, person-only, and face-only sources from collapsing class supervision by mask
+      intersection.
+  det_aug:
+    mosaic: 0.7
+    mixup: 0.1
+    copy_paste: 0.1
+    scale: [0.5, 1.5]
+    hsv: true
+    blur: 0.05
+  pose_mask_aug:
+    mosaic: 0.1
+    mixup: 0.0
+    scale: [0.7, 1.3]
+    rotate: [-10, 10]
+    flip: 0.5
+  pose25d_aug:
+    mosaic: 0.0
+    mixup: 0.0
+    copy_paste: 0.0
+    scale: [0.8, 1.2]
+    rotate: [-10, 10]
+    flip: 0.5
+  agora_aug:
+    mosaic: 0.0
+    mixup: 0.0
+    scale: [0.8, 1.2]
+    rotate: [-10, 10]
+    flip: 0.5
+    occlusion_aug: mild
+  scene_aug:
+    random_crop: true
+    scale: [0.5, 2.0]
+    flip: 0.5
+    color_jitter: true
 
 optimizer_batch:
   prefer_native_yolo26_optimizer_scheduler: true
