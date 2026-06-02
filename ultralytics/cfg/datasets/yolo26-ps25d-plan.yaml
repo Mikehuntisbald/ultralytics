@@ -6,7 +6,7 @@ model:
   cfg: ultralytics/cfg/models/26/yolo26s-ps25d.yaml
   dynamic_input: true
   pad_stride: 32
-  default_imgsz: [448, 768] # Ultralytics height, width
+  default_imgsz: [576, 768] # Ultralytics height, width
   neck:
     outputs: [P2, P3, P4, P5]
     channels: 192
@@ -158,27 +158,29 @@ loss:
     AGORA: person class only; do not supervise Objects365 negatives
 
 optimizer_scheduler:
-  optimizer: MuSGD # SGD is also supported from the CLI when needed.
-  scheduler: cosine
-  lrf: 0.01
-  momentum: 0.937
+  optimizer: Prodigy
+  scheduler: constant
+  lrf: 1.0
+  momentum: 0.9
   weight_decay: 0.0005
-  warmup_epochs: 3.0
-  warmup_bias_lr: 0.1
+  warmup_epochs: 0.0
+  warmup_bias_lr: 0.0
+  prodigy_d0: 0.000001
+  prodigy_d_coef: 1.0
+  prodigy_growth_rate: 1.02
+  prodigy_slice_p: 11
+  prodigy_decouple: true
+  prodigy_use_bias_correction: false
+  prodigy_safeguard_warmup: true
   ema: true
   amp: true
   stage_lr0:
-    A_detection_stable: 0.006
-    A_det_escape_bridge: 0.002
-    A_det_escape_main: 0.0015
-    A_det_escape_rare_small: 0.0006
-    A_det_escape_probe: 0.001
-    A_detection: 0.006
-    B_pose2d: 0.003
-    C_pose25d: 0.002
-    D_person_mask: 0.002
-    E_scene_seg: 0.0015
-    F_full_finetune: 0.001
+    A_detection: 1.0
+    B_pose2d: 1.0
+    C_pose25d: 1.0
+    D_person_mask: 1.0
+    E_scene_seg: 1.0
+    F_full_finetune: 1.0
 
 stages:
   A_detection:
@@ -190,12 +192,12 @@ stages:
     legacy_weighted_list: train_weighted_legacy.txt
     sampling: weighted_random_with_replacement
     sampling_weights:
-      objects365: 45
-      crowdhuman: 35
-      wider_face: 20
+      objects365: 90
+      crowdhuman: 4
+      wider_face: 6
     train_runtime:
       active_tasks: [det]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       accumulate: 4
@@ -203,201 +205,51 @@ stages:
       freeze: 0
       no_val: false
       sampling: weighted_random_with_replacement
-      optimizer: SGD
-      lr0: 0.006
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
-      tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
-      ema: true
-      amp: true
-      det_class_mask_normalization: none
-    train:
-      backbone: true
-      neck: true
-      det_head: true
-      body25d_head: false
-      mask_head: false
-      scene_seg_head: false
-    loss:
-      det: 1.0
-    augment:
-      mosaic: 0.0
-      mixup: 0.0
-      copy_paste: 0.0
-      cutmix: 0.0
-      scale: [0.5, 1.5]
-  A_detection_stable:
-    epochs: 15
-    samples_per_epoch: 40000
-    val_samples: 2000
-    train_list: train.txt # full Objects365 + CrowdHuman + WIDER_FACE source list
-    train_all_list: train_all.txt
-    legacy_weighted_list: train_weighted_legacy.txt
-    sampling: weighted_random_with_replacement
-    sampling_weights:
-      objects365: 75
-      crowdhuman: 15
-      wider_face: 10
-    train_runtime:
-      active_tasks: [det]
-      imgsz: [448, 768]
-      pad_stride: 32
-      batch: 16
-      accumulate: 4
-      workers: 20
-      freeze: 0
-      no_val: false
-      sampling: weighted_random_with_replacement
-      optimizer: SGD
-      lr0: 0.006
-      lrf: 0.01
-      momentum: 0.937
-      weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
-      tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
-      ema: true
-      amp: true
-      det_class_mask_normalization: none
-    train:
-      backbone: true
-      neck: true
-      det_head: true
-      body25d_head: false
-      mask_head: false
-      scene_seg_head: false
-    loss:
-      det: 1.0
-    augment:
-      mosaic: 0.0
-      mixup: 0.0
-      copy_paste: 0.0
-      cutmix: 0.0
-      scale: [0.5, 1.5]
-  A_det_escape_bridge:
-    epochs: 5
-    samples_per_epoch: 60000
-    val_samples: 8000
-    train_list: train.txt
-    train_all_list: train_all.txt
-    sampling: weighted_random_with_replacement
-    sampling_weights:
-      objects365: 95
-      crowdhuman: 3
-      wider_face: 2
-    train_runtime:
-      active_tasks: [det]
-      imgsz: [512, 832]
-      pad_stride: 32
-      batch: 14
-      val_batch: 24
-      accumulate: 4
-      workers: 20
-      val_workers: 4
-      freeze: 0
-      no_val: false
-      sampling: weighted_random_with_replacement
-      optimizer: SGD
-      lr0: 0.002
-      lrf: 0.1
-      momentum: 0.937
-      weight_decay: 0.0005
-      warmup_epochs: 1.0
-      warmup_bias_lr: 0.001
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
-      tal_topk2_one2one: 1
-      tal_high_gt_threshold: 900
-      tal_high_gt_topk_one2many: 7
-      tal_high_gt_topk_one2one: 5
-      tal_high_gt_topk2_one2one: 1
-      tal_metric_chunk_gt: 256
-      scheduler: cosine
-      cos_lr: true
-      ema: true
-      amp: true
-      det_class_mask_normalization: none
-    train:
-      backbone: false
-      neck: true
-      det_head: true
-      body25d_head: false
-      mask_head: false
-      scene_seg_head: false
-    loss:
-      det: 1.0
-      pose2d: 0.0
-      pose_z: 0.0
-      pose_vis: 0.0
-      person_mask: 0.0
-      bone: 0.0
-      scene_seg: 0.0
-    augment:
-      mosaic: 0.1
-      mixup: 0.0
-      copy_paste: 0.0
-      cutmix: 0.0
-      scale: [0.6, 1.4]
-      rotate: [-2, 2]
-      flip: 0.5
-    note: Build PS25D from --model and --pretrain official YOLO26s-det.pt, freeze the transferred backbone, and train
-      the random P2-P5 neck/det heads out of the weak-init basin.
-  A_det_escape_main:
-    epochs: 45
-    samples_per_epoch: 60000
-    val_samples: 8000
-    train_list: train.txt
-    train_all_list: train_all.txt
-    sampling: weighted_random_with_replacement
-    sampling_weights:
-      objects365: 94
-      crowdhuman: 3
-      wider_face: 3
-    train_runtime:
-      active_tasks: [det]
-      imgsz: [512, 832]
-      pad_stride: 32
-      batch: 12
-      val_batch: 20
-      accumulate: 4
-      workers: 20
-      val_workers: 4
-      freeze: 0
-      no_val: false
-      sampling: weighted_random_with_replacement
-      optimizer: SGD
-      lr0: 0.0015
-      lrf: 0.05
-      momentum: 0.937
-      weight_decay: 0.0005
-      warmup_epochs: 1.0
-      warmup_bias_lr: 0.001
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
       freeze_trainable_bn: false
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
       tal_high_gt_threshold: 900
-      tal_high_gt_topk_one2many: 7
-      tal_high_gt_topk_one2one: 5
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
       tal_high_gt_topk2_one2one: 1
       tal_metric_chunk_gt: 256
-      scheduler: cosine
-      cos_lr: true
+      det_class_mask_normalization: none
+      class_aware_sampling: true
+      class_aware_source: objects365
+      class_aware_power: 0.5
+      class_aware_min_multiplier: 0.5
+      class_aware_max_multiplier: 8.0
+      small_object_sampling: true
+      small_object_source: objects365
+      small_object_area: 1024.0
+      small_object_boost: 3.0
+      small_object_crop: 0.1
+      small_object_crop_source: objects365
+      small_object_crop_area: 1024.0
+      small_object_crop_scale: 0.72
+      small_object_crop_min_keep: 1
+      det_area_loss_weight: false
+      det_area_loss_weight_max: 2.0
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
       det_class_mask_normalization: none
-      class_aware_sampling: false
     train:
       backbone: true
       neck: true
@@ -407,23 +259,12 @@ stages:
       scene_seg_head: false
     loss:
       det: 1.0
-      pose2d: 0.0
-      pose_z: 0.0
-      pose_vis: 0.0
-      person_mask: 0.0
-      bone: 0.0
-      scene_seg: 0.0
     augment:
-      mosaic: 0.1
+      mosaic: 0.05
       mixup: 0.0
       copy_paste: 0.0
       cutmix: 0.0
-      scale: [0.6, 1.4]
-      rotate: [-2, 2]
-      flip: 0.5
-    promote_if:
-      objects365_mAP50: "rising for 3 consecutive validations"
-      train_cls_loss: "not increasing for 2 consecutive epochs"
+      scale: [0.5, 1.5]
   A_det_escape_rare_small:
     epochs: 20
     samples_per_epoch: 50000
@@ -437,7 +278,7 @@ stages:
       wider_face: 5
     train_runtime:
       active_tasks: [det]
-      imgsz: [576, 928]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 8
       val_batch: 16
@@ -512,7 +353,7 @@ stages:
       wider_face: 3
     train_runtime:
       active_tasks: [det]
-      imgsz: [512, 832]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 12
       val_batch: 20
@@ -580,23 +421,31 @@ stages:
       wider_face: 10
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 18
       accumulate: 4
       workers: 20
-      optimizer: SGD
-      lr0: 0.0008
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
       warmup_epochs: 0.0
-      warmup_bias_lr: 0.001
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     train:
@@ -632,7 +481,7 @@ stages:
       wider_face: 10
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 18
       accumulate: 4
@@ -684,7 +533,7 @@ stages:
       wider_face: 10
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 18
       accumulate: 4
@@ -735,23 +584,31 @@ stages:
       agora: 32
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 20
       accumulate: 4
       workers: 20
-      optimizer: MuSGD
-      lr0: 0.002
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     train:
@@ -791,24 +648,32 @@ stages:
       wider_face: 2
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 48
       val_batch: 40
       accumulate: 4
       workers: 20
-      optimizer: MuSGD
-      lr0: 0.002
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     train:
@@ -848,7 +713,7 @@ stages:
 
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       batch: 16
       accumulate: 4
       workers: 20
@@ -905,7 +770,7 @@ stages:
 
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       batch: 16
       accumulate: 4
       optimizer: SGD
@@ -963,7 +828,7 @@ stages:
 
     train_runtime:
       active_tasks: [det, pose]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       batch: 16
       accumulate: 4
       optimizer: SGD
@@ -1023,26 +888,33 @@ stages:
       wider_face: 3
     train_runtime:
       active_tasks: [det, mask]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 28
       val_batch: 20
       accumulate: 4
       workers: 20
       val_workers: 4
-      optimizer: MuSGD
-      lr0: 0.002
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 1.0
-      warmup_bias_lr: 0.001
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
       freeze_trainable_bn: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     train:
@@ -1080,7 +952,7 @@ stages:
       wider_face: 10
     train_runtime:
       active_tasks: [det]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       val_batch: 20
@@ -1137,7 +1009,7 @@ stages:
       wider_face: 7
     train_runtime:
       active_tasks: [det]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       val_batch: 20
@@ -1275,7 +1147,7 @@ stages:
       wider_face: 5
     train_runtime:
       active_tasks: [det]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       val_batch: 20
@@ -1341,9 +1213,9 @@ stages:
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      objects365: 92
-      crowdhuman: 2
-      wider_face: 6
+      objects365: 94
+      crowdhuman: 1
+      wider_face: 5
     train_runtime:
       active_tasks: [det]
       imgsz: [576, 768]
@@ -1437,36 +1309,49 @@ stages:
       crowdhuman: 5
       wider_face: 3
     train_runtime:
-      active_tasks: [det, pose, mask, scene]
-      imgsz: [448, 768]
+      active_tasks: [scene]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       accumulate: 4
       workers: 20
-      optimizer: MuSGD
-      lr0: 0.0015
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
+      freeze_trainable_bn: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     train:
-      all: true
+      backbone: false
+      neck: false
+      det_head: false
+      body25d_head: false
+      mask_head: false
+      scene_seg_head: true
     loss:
-      det: 1.0
-      pose2d: 1.0
-      pose_z: 0.5
-      pose_vis: 0.2
-      bone: 0.05
-      person_mask: 0.8
-      scene_seg: 0.3
+      det: 0.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      bone: 0.0
+      person_mask: 0.0
+      scene_seg: 1.0
     augment:
       mosaic: 0.0
       mixup: 0.0
@@ -1484,7 +1369,7 @@ stages:
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml
     sampling: weighted_random_with_replacement
-    default_imgsz: [448, 768]
+    default_imgsz: [576, 768]
     multi_scale: false
     sampling_weights:
       objects365: 15
@@ -1498,23 +1383,30 @@ stages:
       ade20k: 2
     train_runtime:
       active_tasks: [det, pose, mask, scene]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       accumulate: 4
       workers: 20
-      optimizer: MuSGD
-      lr0: 0.001
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     augment:
@@ -1550,23 +1442,30 @@ stages:
       ade20k: 0
     train_runtime:
       active_tasks: [det, pose, mask, scene]
-      imgsz: [448, 768]
+      imgsz: [576, 768]
       pad_stride: 32
       batch: 16
       accumulate: 4
       workers: 20
-      optimizer: MuSGD
-      lr0: 0.001
-      lrf: 0.01
-      momentum: 0.937
+      optimizer: Prodigy
+      lr0: 1.0
+      lrf: 1.0
+      momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 3.0
-      warmup_bias_lr: 0.1
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      prodigy_d0: 0.000001
+      prodigy_d_coef: 1.0
+      prodigy_growth_rate: 1.02
+      prodigy_slice_p: 11
+      prodigy_decouple: true
+      prodigy_use_bias_correction: false
+      prodigy_safeguard_warmup: true
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
-      scheduler: cosine
-      cos_lr: true
+      scheduler: constant
+      cos_lr: false
       ema: true
       amp: true
     augment:
