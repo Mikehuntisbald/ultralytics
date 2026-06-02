@@ -439,7 +439,12 @@ class v8DetectionLoss:
             mask_gt,
         )
 
-        target_scores_sum = max(target_scores.sum(), 1)
+        target_scores_sum = target_scores.sum().clamp(min=1)
+        if str(getattr(self.hyp, "det_area_loss_weight", False)).lower() in {"1", "true", "yes", "on"}:
+            area_weight = self._target_area_weight(gt_bboxes, mask_gt, target_gt_idx, fg_mask, pred_scores.dtype)
+            if area_weight is not None:
+                target_scores = target_scores * area_weight.unsqueeze(-1)
+                target_scores_sum = target_scores.sum().clamp(min=1)
 
         # Cls loss with optional per-image class supervision masks.
         # Partial-label datasets may supervise only person or face. Normalize by
@@ -501,6 +506,28 @@ class v8DetectionLoss:
             loss,
             loss.detach(),
         )  # loss(box, cls, dfl)
+
+    def _target_area_weight(
+        self,
+        gt_bboxes: torch.Tensor,
+        mask_gt: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        fg_mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Return per-anchor positive weights from sqrt(mean_area / area), clamped to [1, max_w]."""
+        wh = (gt_bboxes[..., 2:4] - gt_bboxes[..., 0:2]).clamp(min=0)
+        areas = (wh[..., 0] * wh[..., 1]).to(dtype)
+        valid = mask_gt.squeeze(-1).bool() & torch.isfinite(areas) & areas.gt(0)
+        if not bool(valid.any() and fg_mask.any()):
+            return None
+        mean_area = areas[valid].mean().clamp(min=1.0)
+        max_w = max(float(getattr(self.hyp, "det_area_loss_weight_max", 2.0)), 1.0)
+        gt_weights = torch.sqrt(mean_area / areas.clamp(min=1.0)).clamp(min=1.0, max=max_w)
+        gt_weights = torch.nan_to_num(gt_weights, nan=1.0, posinf=max_w, neginf=1.0)
+        assigned = torch.gather(gt_weights, 1, target_gt_idx.clamp(min=0))
+        assigned = torch.nan_to_num(assigned, nan=1.0, posinf=max_w, neginf=1.0)
+        return torch.where(fg_mask, assigned, torch.ones_like(assigned))
 
     def parse_output(
         self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]

@@ -185,6 +185,36 @@ def _label_class_ids(label: dict[str, Any] | None) -> list[int]:
     return sorted({int(c) for c in cls.tolist()})
 
 
+def _label_has_small_object(label: dict[str, Any] | None, area_threshold: float = 32.0**2) -> bool:
+    """Return whether a cached label has at least one bbox below the pixel-area threshold."""
+    if not isinstance(label, dict) or "bboxes" not in label:
+        return False
+    bboxes = label.get("bboxes")
+    try:
+        bboxes = np.asarray(bboxes, dtype=np.float32).reshape(-1, 4)
+    except Exception:
+        return False
+    if not bboxes.size:
+        return False
+    shape = label.get("shape") or (1, 1)
+    try:
+        h, w = float(shape[0]), float(shape[1])
+    except Exception:
+        h, w = 1.0, 1.0
+    normalized = bool(label.get("normalized", True))
+    fmt = str(label.get("bbox_format", "xywh")).lower()
+    if fmt == "xyxy":
+        bw = np.clip(bboxes[:, 2] - bboxes[:, 0], 0.0, None)
+        bh = np.clip(bboxes[:, 3] - bboxes[:, 1], 0.0, None)
+    else:
+        bw = np.clip(bboxes[:, 2], 0.0, None)
+        bh = np.clip(bboxes[:, 3], 0.0, None)
+    if normalized:
+        bw *= max(w, 1.0)
+        bh *= max(h, 1.0)
+    return bool(np.any((bw * bh) <= float(area_threshold)))
+
+
 def weighted_replacement_sampler(
     dataset: Dataset,
     weights: dict[str, float],
@@ -194,6 +224,10 @@ def weighted_replacement_sampler(
     class_aware_power: float = 0.5,
     class_aware_min_multiplier: float = 0.5,
     class_aware_max_multiplier: float = 8.0,
+    small_object_sampling: bool = False,
+    small_object_source: str = "objects365",
+    small_object_area: float = 32.0**2,
+    small_object_boost: float = 1.0,
 ) -> WeightedRandomSampler:
     """Create a weighted replacement sampler from cached source names or image path segments."""
     if samples_per_epoch <= 0:
@@ -208,8 +242,10 @@ def weighted_replacement_sampler(
     labels = getattr(dataset, "labels", None) or []
     sources_per_image = []
     classes_per_image: list[list[int]] = []
+    small_object_per_image: list[bool] = []
     class_counts: dict[int, int] = {}
     class_aware_source = _normalize_source_name(class_aware_source)
+    small_object_source = _normalize_source_name(small_object_source)
     for i, path in enumerate(im_files):
         label = labels[i] if i < len(labels) else None
         sources = _label_sources(label, weights)
@@ -224,6 +260,9 @@ def weighted_replacement_sampler(
         classes_per_image.append(class_ids)
         for class_id in class_ids:
             class_counts[class_id] = class_counts.get(class_id, 0) + 1
+        small_object_per_image.append(
+            _label_has_small_object(label, area_threshold=small_object_area) if small_object_source in sources else False
+        )
     sample_weights = []
     for sources in sources_per_image:
         weight = 0.0
@@ -264,6 +303,29 @@ def weighted_replacement_sampler(
                 "Class-aware sampler: "
                 f"source={class_aware_source}, classes={len(class_counts)}, images={len(target_indices)}, "
                 f"power={class_aware_power:g}, raw_median_count={median_count:g}, "
+                f"multiplier={min(effective):.3g}-{max(effective):.3g} mean={np.mean(effective):.3g}"
+            )
+    if small_object_sampling and float(small_object_boost) > 1.0:
+        if small_object_source not in weights:
+            raise ValueError(f"small_object_source='{small_object_source}' is not present in sampling_weights.")
+        target_indices = [i for i, sources in enumerate(sources_per_image) if small_object_source in sources]
+        if not target_indices:
+            LOGGER.warning(f"Small-object sampler requested for source='{small_object_source}', but no images matched.")
+        else:
+            boost = float(small_object_boost)
+            raw_multipliers = [boost if small_object_per_image[i] else 1.0 for i in target_indices]
+            mean_multiplier = float(np.mean(raw_multipliers)) if raw_multipliers else 1.0
+            mean_multiplier = mean_multiplier if mean_multiplier > 0.0 else 1.0
+            effective = []
+            for i, raw in zip(target_indices, raw_multipliers):
+                multiplier = raw / mean_multiplier
+                sample_weights[i] *= multiplier
+                effective.append(multiplier)
+            small_images = sum(bool(small_object_per_image[i]) for i in target_indices)
+            LOGGER.info(
+                "Small-object sampler: "
+                f"source={small_object_source}, small_images={small_images}/{len(target_indices)}, "
+                f"area<={float(small_object_area):g}px^2, raw_boost={boost:g}, "
                 f"multiplier={min(effective):.3g}-{max(effective):.3g} mean={np.mean(effective):.3g}"
             )
     LOGGER.info(
@@ -467,6 +529,10 @@ def build_dataloader(
     class_aware_power: float = 0.5,
     class_aware_min_multiplier: float = 0.5,
     class_aware_max_multiplier: float = 8.0,
+    small_object_sampling: bool = False,
+    small_object_source: str = "objects365",
+    small_object_area: float = 32.0**2,
+    small_object_boost: float = 1.0,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -502,6 +568,10 @@ def build_dataloader(
             class_aware_power=class_aware_power,
             class_aware_min_multiplier=class_aware_min_multiplier,
             class_aware_max_multiplier=class_aware_max_multiplier,
+            small_object_sampling=small_object_sampling,
+            small_object_source=small_object_source,
+            small_object_area=small_object_area,
+            small_object_boost=small_object_boost,
         )
         shuffle = False
     else:

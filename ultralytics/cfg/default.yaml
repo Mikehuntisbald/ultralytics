@@ -44,6 +44,15 @@ class_aware_source: objects365 # (str) source name for class-aware reweighting
 class_aware_power: 0.5 # (float) inverse class-frequency exponent; 0.5 is sqrt reweighting
 class_aware_min_multiplier: 0.5 # (float) lower clamp for per-image class-aware multiplier before source normalization
 class_aware_max_multiplier: 8.0 # (float) upper clamp for per-image class-aware multiplier before source normalization
+small_object_sampling: False # (bool) boost images containing small boxes within one sampler source
+small_object_source: objects365 # (str) source name used for small-object image reweighting
+small_object_area: 1024.0 # (float) max pixel area for small-object sampler/crop targets, default 32^2
+small_object_boost: 1.0 # (float) raw multiplier for small-object images before source normalization
+small_object_crop: 0.0 # (float) probability of small-object-centric crop during training
+small_object_crop_source: objects365 # (str) source name/path marker eligible for small-object crop
+small_object_crop_area: 1024.0 # (float) max pixel area for choosing crop-centered small boxes
+small_object_crop_scale: 0.72 # (float) crop window scale relative to current image before resizing back
+small_object_crop_min_keep: 1 # (int) minimum kept boxes required to accept the crop
 tal_topk_one2many: 10 # (int) YOLO26-PS one-to-many TaskAlignedAssigner candidates per GT
 tal_topk_one2one: 7 # (int) YOLO26-PS one-to-one TaskAlignedAssigner pre-filter candidates per GT
 tal_topk2_one2one: 1 # (int) YOLO26-PS one-to-one final TaskAlignedAssigner candidates per GT
@@ -54,6 +63,8 @@ tal_high_gt_topk2_one2one: # (int, optional) one-to-one final TAL top-k when hig
 tal_metric_chunk_gt: 0 # (int) chunk GT boxes during TAL metric computation to reduce peak memory; 0 disables
 det_class_mask_normalization: sqrt # (str) normalize partial-label detection BCE by supervised classes: sqrt, linear, or none
 det_partial_cls_positive_only: False # (bool) only apply partial-label class BCE on assigned positives for single-class partial sources
+det_area_loss_weight: False # (bool) apply sqrt(mean_area / area) weighting to assigned detection positives
+det_area_loss_weight_max: 2.0 # (float) max clamp for det_area_loss_weight
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples

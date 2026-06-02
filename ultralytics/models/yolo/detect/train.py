@@ -114,6 +114,10 @@ class DetectionTrainer(BaseTrainer):
             class_aware_power=float(getattr(self.args, "class_aware_power", 0.5)),
             class_aware_min_multiplier=float(getattr(self.args, "class_aware_min_multiplier", 0.5)),
             class_aware_max_multiplier=float(getattr(self.args, "class_aware_max_multiplier", 8.0)),
+            small_object_sampling=bool(getattr(self.args, "small_object_sampling", False)) if mode == "train" else False,
+            small_object_source=getattr(self.args, "small_object_source", "objects365"),
+            small_object_area=float(getattr(self.args, "small_object_area", 32.0**2)),
+            small_object_boost=float(getattr(self.args, "small_object_boost", 1.0)),
         )
 
     def preprocess_batch(self, batch: dict) -> dict:

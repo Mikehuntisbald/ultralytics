@@ -643,6 +643,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-aware-power", type=float)
     parser.add_argument("--class-aware-min-multiplier", type=float)
     parser.add_argument("--class-aware-max-multiplier", type=float)
+    parser.add_argument("--small-object-sampling", action="store_true", help="boost images with small boxes in sampler")
+    parser.add_argument("--no-small-object-sampling", action="store_true", help="disable small-object sampler boost")
+    parser.add_argument("--small-object-source")
+    parser.add_argument("--small-object-area", type=float)
+    parser.add_argument("--small-object-boost", type=float)
+    parser.add_argument("--small-object-crop", type=float)
+    parser.add_argument("--small-object-crop-source")
+    parser.add_argument("--small-object-crop-area", type=float)
+    parser.add_argument("--small-object-crop-scale", type=float)
+    parser.add_argument("--small-object-crop-min-keep", type=positive_int)
     parser.add_argument("--optimizer")
     parser.add_argument("--lr0", type=float)
     parser.add_argument("--lrf", type=float)
@@ -671,6 +681,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--det-class-mask-normalization", choices=("sqrt", "linear", "none", "off"))
     parser.add_argument("--det-partial-cls-positive-only", action="store_true")
     parser.add_argument("--no-det-partial-cls-positive-only", action="store_true")
+    parser.add_argument("--det-area-loss-weight", action="store_true")
+    parser.add_argument("--no-det-area-loss-weight", action="store_true")
+    parser.add_argument("--det-area-loss-weight-max", type=float)
     parser.add_argument("--cos-lr", action="store_true", help="force cosine LR scheduler")
     parser.add_argument("--no-cos-lr", action="store_true", help="force non-cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", help="force AMP on")
@@ -765,6 +778,10 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     )
     if args.class_aware_sampling and args.no_class_aware_sampling:
         raise ValueError("Use only one of --class-aware-sampling or --no-class-aware-sampling.")
+    if args.small_object_sampling and args.no_small_object_sampling:
+        raise ValueError("Use only one of --small-object-sampling or --no-small-object-sampling.")
+    if args.det_area_loss_weight and args.no_det_area_loss_weight:
+        raise ValueError("Use only one of --det-area-loss-weight or --no-det-area-loss-weight.")
     if args.class_aware_sampling:
         overrides["class_aware_sampling"] = True
     elif args.no_class_aware_sampling:
@@ -776,6 +793,15 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("class_aware_power", "class_aware_power"),
         ("class_aware_min_multiplier", "class_aware_min_multiplier"),
         ("class_aware_max_multiplier", "class_aware_max_multiplier"),
+        ("small_object_source", "small_object_source"),
+        ("small_object_area", "small_object_area"),
+        ("small_object_boost", "small_object_boost"),
+        ("small_object_crop", "small_object_crop"),
+        ("small_object_crop_source", "small_object_crop_source"),
+        ("small_object_crop_area", "small_object_crop_area"),
+        ("small_object_crop_scale", "small_object_crop_scale"),
+        ("small_object_crop_min_keep", "small_object_crop_min_keep"),
+        ("det_area_loss_weight_max", "det_area_loss_weight_max"),
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)
@@ -845,6 +871,18 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         overrides["det_partial_cls_positive_only"] = False
     elif defaults.get("det_partial_cls_positive_only") is not None:
         overrides["det_partial_cls_positive_only"] = bool(defaults.get("det_partial_cls_positive_only"))
+    if args.small_object_sampling:
+        overrides["small_object_sampling"] = True
+    elif args.no_small_object_sampling:
+        overrides["small_object_sampling"] = False
+    elif defaults.get("small_object_sampling") is not None:
+        overrides["small_object_sampling"] = bool(defaults.get("small_object_sampling"))
+    if args.det_area_loss_weight:
+        overrides["det_area_loss_weight"] = True
+    elif args.no_det_area_loss_weight:
+        overrides["det_area_loss_weight"] = False
+    elif defaults.get("det_area_loss_weight") is not None:
+        overrides["det_area_loss_weight"] = bool(defaults.get("det_area_loss_weight"))
     if args.cos_lr:
         overrides["cos_lr"] = True
     elif args.no_cos_lr:

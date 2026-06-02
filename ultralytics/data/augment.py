@@ -1538,6 +1538,114 @@ class RandomHSV(BaseTransform):
         return labels
 
 
+class SmallObjectCrop(BaseTransform):
+    """Crop around a small object and resize back to the current training canvas."""
+
+    def __init__(
+        self,
+        p: float = 0.0,
+        source: str = "objects365",
+        area: float = 32.0**2,
+        crop_scale: float = 0.72,
+        min_keep: int = 1,
+    ) -> None:
+        """Initialize the crop transform."""
+        self.p = float(p)
+        self.source = str(source or "").lower()
+        self.area = float(area)
+        self.crop_scale = min(max(float(crop_scale), 0.2), 1.0)
+        self.min_keep = max(int(min_keep), 1)
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply a small-object-centered crop when eligible."""
+        if self.p <= 0.0 or random.random() > self.p:
+            return labels
+        if self.source and self.source not in str(labels.get("im_file", "")).replace("\\", "/").lower():
+            return labels
+        if "instances" not in labels or len(labels["instances"]) == 0:
+            return labels
+
+        img = labels["img"]
+        h, w = img.shape[:2]
+        instances = deepcopy(labels["instances"])
+        instances.convert_bbox(format="xyxy")
+        instances.denormalize(w, h)
+        boxes = instances.bboxes
+        if not np.isfinite(boxes).all():
+            return labels
+        areas = np.clip(boxes[:, 2] - boxes[:, 0], 0.0, None) * np.clip(boxes[:, 3] - boxes[:, 1], 0.0, None)
+        small_idx = np.nonzero((areas > 0.0) & (areas <= self.area))[0]
+        if not len(small_idx):
+            return labels
+
+        target = int(random.choice(small_idx.tolist()))
+        crop_w = max(int(round(w * self.crop_scale)), 1)
+        crop_h = max(int(round(h * self.crop_scale)), 1)
+        cx = float((boxes[target, 0] + boxes[target, 2]) * 0.5)
+        cy = float((boxes[target, 1] + boxes[target, 3]) * 0.5)
+        x1 = int(round(np.clip(cx + random.uniform(-0.15, 0.15) * crop_w - crop_w * 0.5, 0, max(w - crop_w, 0))))
+        y1 = int(round(np.clip(cy + random.uniform(-0.15, 0.15) * crop_h - crop_h * 0.5, 0, max(h - crop_h, 0))))
+        x2, y2 = min(x1 + crop_w, w), min(y1 + crop_h, h)
+        if x2 <= x1 or y2 <= y1:
+            return labels
+
+        clipped = boxes.copy()
+        clipped[:, [0, 2]] = clipped[:, [0, 2]].clip(x1, x2) - x1
+        clipped[:, [1, 3]] = clipped[:, [1, 3]].clip(y1, y2) - y1
+        keep = ((clipped[:, 2] - clipped[:, 0]) >= 2) & ((clipped[:, 3] - clipped[:, 1]) >= 2)
+        if int(keep.sum()) < self.min_keep:
+            return labels
+
+        cropped = self._crop_instances(labels["instances"], keep, x1, y1, x2 - x1, y2 - y1, w, h)
+        cropped.convert_bbox(format="xyxy")
+        final_boxes = cropped.bboxes
+        final_keep = (
+            np.isfinite(final_boxes).all(1)
+            & ((final_boxes[:, 2] - final_boxes[:, 0]) >= 2)
+            & ((final_boxes[:, 3] - final_boxes[:, 1]) >= 2)
+        )
+        if int(final_keep.sum()) < self.min_keep:
+            return labels
+
+        labels["img"] = cv2.resize(img[y1:y2, x1:x2], (w, h), interpolation=cv2.INTER_LINEAR)
+        if labels["img"].ndim == 2:
+            labels["img"] = labels["img"][..., None]
+        if labels.get("scene_mask") is not None:
+            labels["scene_mask"] = cv2.resize(
+                labels["scene_mask"][y1:y2, x1:x2], (w, h), interpolation=cv2.INTER_NEAREST
+            )
+        labels["cls"] = labels["cls"][keep][final_keep]
+        _take_extra_instances(labels, keep)
+        _take_extra_instances(labels, final_keep)
+        labels["instances"] = cropped[final_keep]
+        labels["resized_shape"] = labels["img"].shape[:2]
+        return labels
+
+    @staticmethod
+    def _crop_instances(
+        instances: Instances,
+        keep: np.ndarray,
+        x1: int,
+        y1: int,
+        crop_w: int,
+        crop_h: int,
+        out_w: int,
+        out_h: int,
+    ) -> Instances:
+        """Crop selected instances and scale back to the output canvas."""
+        inst = deepcopy(instances)
+        if inst.segments is None:
+            inst.segments = np.zeros((len(inst), 0, 2), dtype=np.float32)
+        inst.convert_bbox(format="xyxy")
+        inst.denormalize(out_w, out_h)
+        inst = inst[keep]
+        inst.add_padding(-x1, -y1)
+        inst.clip(crop_w, crop_h)
+        inst.scale(out_w / max(crop_w, 1), out_h / max(crop_h, 1))
+        inst.clip(out_w, out_h)
+        return inst
+
+
 class RandomFlip(BaseTransform):
     """Apply a random horizontal or vertical flip to an image with a given probability.
 
@@ -2785,6 +2893,13 @@ def v8_transforms(dataset, imgsz: int | list[int] | tuple[int, int], hyp: Iterab
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
             Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
+            SmallObjectCrop(
+                p=getattr(hyp, "small_object_crop", 0.0),
+                source=getattr(hyp, "small_object_crop_source", "objects365"),
+                area=getattr(hyp, "small_object_crop_area", 32.0**2),
+                crop_scale=getattr(hyp, "small_object_crop_scale", 0.72),
+                min_keep=getattr(hyp, "small_object_crop_min_keep", 1),
+            ),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
