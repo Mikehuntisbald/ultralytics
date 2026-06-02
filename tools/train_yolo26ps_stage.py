@@ -45,6 +45,7 @@ STAGE_DATA_YAMLS = {
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
     "D_det_recover_objects365": DATA_YAML,
     "D_det_recover_objects365_unfreeze": DATA_YAML,
+    "D_det_recover_objects365_shock": DATA_YAML,
     "D_det_recover_objects365_prodigy_fast": DATA_YAML,
     "D_det_recover_objects365_prodigy_unfreeze_fast": DATA_YAML,
     "E_scene_seg": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml",
