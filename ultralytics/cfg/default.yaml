@@ -65,6 +65,8 @@ det_class_mask_normalization: sqrt # (str) normalize partial-label detection BCE
 det_partial_cls_positive_only: False # (bool) only apply partial-label class BCE on assigned positives for single-class partial sources
 det_area_loss_weight: False # (bool) apply sqrt(mean_area / area) weighting to assigned detection positives
 det_area_loss_weight_max: 2.0 # (float) max clamp for det_area_loss_weight
+det_nwd_ratio: 0.0 # (float) mix Normalized Wasserstein Distance into detection box loss, e.g. 0.3 for small objects
+det_nwd_constant: 12.8 # (float) NWD exponential normalization constant in feature-grid box units
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples

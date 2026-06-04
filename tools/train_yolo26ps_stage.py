@@ -684,6 +684,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--det-area-loss-weight", action="store_true")
     parser.add_argument("--no-det-area-loss-weight", action="store_true")
     parser.add_argument("--det-area-loss-weight-max", type=float)
+    parser.add_argument("--det-nwd-ratio", type=float)
+    parser.add_argument("--det-nwd-constant", type=float)
     parser.add_argument("--cos-lr", action="store_true", help="force cosine LR scheduler")
     parser.add_argument("--no-cos-lr", action="store_true", help="force non-cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", help="force AMP on")
@@ -802,6 +804,8 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("small_object_crop_scale", "small_object_crop_scale"),
         ("small_object_crop_min_keep", "small_object_crop_min_keep"),
         ("det_area_loss_weight_max", "det_area_loss_weight_max"),
+        ("det_nwd_ratio", "det_nwd_ratio"),
+        ("det_nwd_constant", "det_nwd_constant"),
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)

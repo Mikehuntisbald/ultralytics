@@ -110,9 +110,10 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int = 16, hyp=None):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
+        self.hyp = hyp
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
     def forward(
@@ -129,8 +130,19 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        pred_pos = pred_bboxes[fg_mask]
+        target_pos = target_bboxes[fg_mask]
+        iou = bbox_iou(pred_pos, target_pos, xywh=False, CIoU=True)
+        box_error = 1.0 - iou
+        nwd_ratio = float(getattr(self.hyp, "det_nwd_ratio", 0.0) or 0.0) if self.hyp is not None else 0.0
+        if nwd_ratio > 0:
+            nwd = self._nwd_similarity(
+                pred_pos,
+                target_pos,
+                constant=float(getattr(self.hyp, "det_nwd_constant", 12.8) or 12.8),
+            )
+            box_error = box_error * (1.0 - nwd_ratio) + (1.0 - nwd) * nwd_ratio
+        loss_iou = (box_error * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -152,6 +164,18 @@ class BboxLoss(nn.Module):
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
         return loss_iou, loss_dfl
+
+    @staticmethod
+    def _nwd_similarity(pred_bboxes: torch.Tensor, target_bboxes: torch.Tensor, constant: float = 12.8) -> torch.Tensor:
+        """Return Normalized Wasserstein Distance similarity for xyxy boxes."""
+        p_xy = (pred_bboxes[..., 0:2] + pred_bboxes[..., 2:4]) * 0.5
+        t_xy = (target_bboxes[..., 0:2] + target_bboxes[..., 2:4]) * 0.5
+        p_wh = (pred_bboxes[..., 2:4] - pred_bboxes[..., 0:2]).clamp(min=0)
+        t_wh = (target_bboxes[..., 2:4] - target_bboxes[..., 0:2]).clamp(min=0)
+        wasserstein = (p_xy - t_xy).pow(2).sum(-1, keepdim=True) + ((p_wh - t_wh) * 0.5).pow(2).sum(
+            -1, keepdim=True
+        )
+        return torch.exp(-torch.sqrt(wasserstein.clamp(min=0) + 1e-9) / max(float(constant), 1e-6))
 
 
 class RLELoss(nn.Module):
@@ -376,7 +400,7 @@ class v8DetectionLoss:
             high_gt_topk2=tal_high_gt_topk2,
             metric_chunk_gt=tal_metric_chunk_gt,
         )
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, h).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
