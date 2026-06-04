@@ -237,7 +237,7 @@ stages:
       small_object_sampling: true
       small_object_source: objects365
       small_object_area: 1024.0
-      small_object_boost: 3.0
+      small_object_boost: 2.0
       small_object_crop: 0.1
       small_object_crop_source: objects365
       small_object_crop_area: 1024.0
@@ -1207,7 +1207,7 @@ stages:
       flip: 0.5
   D_det_recover_objects365_prodigy_unfreeze_fast:
     epochs: 100
-    samples_per_epoch: 100000
+    samples_per_epoch: 400000
     val_samples: 10000
     plots: false
     data_yaml: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a.yaml
@@ -1221,7 +1221,7 @@ stages:
       imgsz: [576, 768]
       pad_stride: 32
       batch: 16
-      val_batch: 22
+      val_batch: 26
       accumulate: 4
       workers: 20
       val_workers: 4
@@ -1257,14 +1257,16 @@ stages:
       small_object_sampling: true
       small_object_source: objects365
       small_object_area: 1024.0
-      small_object_boost: 3.0
-      small_object_crop: 0.3
+      small_object_boost: 2.0
+      small_object_crop: 0.15
       small_object_crop_source: objects365
       small_object_crop_area: 1024.0
       small_object_crop_scale: 0.72
       small_object_crop_min_keep: 1
-      det_area_loss_weight: false
-      det_area_loss_weight_max: 2.0
+      det_area_loss_weight: true
+      det_area_loss_weight_max: 1.1
+      det_nwd_ratio: 0.0
+      det_nwd_constant: 12.8
       scheduler: constant
       cos_lr: false
       ema: true
