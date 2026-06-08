@@ -140,7 +140,13 @@ Objects365 extraction.
 Stages B-F use unified-schema dataset YAMLs committed under `ultralytics/cfg/datasets/`:
 
 - `yolo26ps_stage_b_pose2d.yaml`
+- `yolo26ps_stage_b_pose2d_poseq_min8.yaml` for stricter Stage B pose probes
 - `yolo26ps_stage_c_pose25d.yaml`
+- `yolo26ps_stage_c_pose25d_detreplay.yaml`
+- `yolo26ps_stage_c_pose25d_poseonly_ochuman.yaml`
+- `yolo26ps_stage_c_pose25d_targetclean.yaml`
+- `yolo26ps_stage_c_pose25d_targeteasy.yaml`
+- `yolo26ps_stage_c_pose25d_targetstrict.yaml`
 - `yolo26ps_stage_d_person_mask.yaml`
 - `yolo26ps_stage_e_scene_seg.yaml`
 - `yolo26ps_stage_f_full_finetune.yaml`
@@ -530,7 +536,7 @@ The stage uses the Stage A detection dataset YAML, with weighted replacement sam
 ```yaml
 sampling_weights: {objects365: 80, crowdhuman: 15, wider_face: 5}
 active_tasks: [det]
-train: {backbone: false, neck: false, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
+train: {backbone: false, det_neck: false, pose_neck: false, det_head: true, body25d_head: false, mask_head: false, scene_seg_head: false}
 loss: {det: 1.0, pose2d: 0.0, pose_z: 0.0, pose_vis: 0.0, person_mask: 0.0, scene_seg: 0.0}
 ```
 
@@ -610,6 +616,170 @@ For B-F, add or inspect task-specific metrics at stage boundaries:
 | D person mask | person mask AP/Dice on COCO person mask and OCHuman |
 | E scene seg | ADEChallengeData2016 150-class mIoU and detection AP retention |
 | F finetune | all task metrics with ADEChallengeData2016 weight kept small |
+
+## Pose Refinement Change Ledger
+
+This section records the current Stage B/C pose-refinement contract. It exists because the recent PS-2.5D work changed
+the model topology, the stage controls, and the pose objective; a future run should not have to reconstruct those
+details from experiment names.
+
+### Parallel Pose Neck
+
+The PS-2.5D model now has a medium-light pose PAN/FPN in parallel with the detection neck. The detection neck still
+outputs P2-P5 for detector, mask, and scene branches. The pose neck consumes backbone features separately and outputs
+its own P2-P5 stream for the body25d head.
+
+The model YAML passes eight feature maps into `YOLO26PSDetect25D`: first four detection features, then four pose
+features. The head splits them with `split_features()`. Detection, mask coefficients, P2 dense fusion, and scene logits
+use the detection features; `cv4`/`one2one_cv4` pose heads use the pose features. This is the main guardrail against
+pose tuning moving the detector's feature neck.
+
+There is also an optional `PoseResidualAdapter`. It is a zero-initialized residual adapter used only before the pose
+head, and it is disabled unless `train_runtime.pose_adapter: true` or `--pose-adapter` is set. The active plan relies on
+the parallel pose neck, not the optional adapter.
+
+### Stage Task Gating And Freezing
+
+`active_tasks` is now a real stage-control signal. The head no longer forcibly adds `det` to every stage, so the stage
+trainer can freeze the detection branch by default when `det` is not active. Raw detector maps are still produced because
+pose assignment and pose validation need boxes/scores as the proposal source; in a pose-only run they are frozen
+assignment inputs, not an actively trained detector objective. If a stage sets:
+
+```yaml
+train_runtime:
+  active_tasks: [pose]
+loss:
+  det: 0.0
+```
+
+then detector losses are off and the detection head stays frozen by the stage trainability rules. Keep `active_tasks`,
+`train.det_head`, and `loss.det` consistent: `loss.det` is the loss gate, while `active_tasks` and `train.det_head`
+control branch execution intent and trainability.
+
+The stage trainer applies three independent controls:
+
+- model-layer trainability: `train.backbone`, `train.det_neck`, and `train.pose_neck`
+- head-branch trainability: `det_head`, `body25d_head`, `mask_head`, `scene_seg_head`, and optional `pose_adapter`
+- BatchNorm locks: `freeze_trainable_bn`, `freeze_model_bn`, and per-branch `freeze_head_bn`
+
+Current pose-only Stage C uses `active_tasks: [pose]`, `loss.det: 0.0`, det branch frozen, detector BN locked, pose BN
+open, `train.det_neck: false`, and `train.pose_neck: true` so the parallel pose neck and pose head can train while the
+detector branch stays frozen. Stage B has also been run in both det-replay and pose-only forms; when reproducing a
+result, trust the saved `args.yaml` and the stage plan entry over the run name.
+
+### Dense Pose Anchors
+
+The original YOLO pose path only applies keypoint loss on anchors selected by the detector TaskAlignedAssigner. That can
+be too sparse when the detector is frozen or when pose is the only active task. `pose_anchor_topk` and
+`pose_anchor_radius` add pose-only positives around each person box:
+
+```yaml
+pose_anchor_topk: 16
+pose_anchor_radius: 0.5
+```
+
+The extra anchors are selected inside the GT bbox, optionally restricted by normalized distance from the box center.
+They write a pose supervision mask and pose GT index only; they do not create detector positives and do not change the
+detector assignment used by the det loss.
+
+Operationally:
+
+- lower `topk` or `radius` if crowded scenes show identity mixing or duplicate skeletons
+- raise them only if pose gradients are too sparse and visual matches are otherwise clean
+- keep visual checks after each exploratory epoch, because anchor expansion can look numerically stable while drawing
+  the wrong person in crowded images
+
+### 2D Pose XY Loss
+
+The PS25D loss keeps the original `KeypointLoss` implementation available, but the new stage path routes 2D keypoints
+through configurable XY losses:
+
+| `pose_xy_loss` | Meaning | Best use |
+| --- | --- | --- |
+| `bbox` | SmoothL1 on error normalized by target bbox width/height | closest to scale-normalized YOLO/OKS behavior |
+| `grid` | SmoothL1 in feature-grid coordinates | debugging decode and stride behavior |
+| `pixel` | SmoothL1 on pixel error after multiplying by stride | robust direct pixel training |
+| `mpjpe` | mean visible-keypoint L2 distance in input pixels | direct alignment with mean/P90 pixel metrics |
+
+The current pose-only Stage C uses `pose_xy_loss: mpjpe`, `pose_anchor_topk: 16`, and `pose_anchor_radius: 0.5`. Raw
+`pose2d_loss` is therefore no longer numerically comparable to the older OKS-style `KeypointLoss`; it is a pixel-scale
+objective.
+
+Optional MPJPE shaping exists but is disabled unless explicitly configured:
+
+```yaml
+pose_mpjpe_hard_px: 0.0
+pose_mpjpe_hard_gain: 0.0
+pose_mpjpe_kpt_weights:
+```
+
+Set `pose_mpjpe_hard_px/gain` only after confirming the hard samples are real errors rather than label noise. Set
+`pose_mpjpe_kpt_weights` only with 17 weights matching the current keypoint order.
+
+### Detection Loss Extras
+
+Detection focal modulation is available through:
+
+```yaml
+det_focal_gamma: 0.0
+det_focal_alpha: 0.25
+```
+
+`det_focal_gamma: 0.0` disables focal loss, which is the current default. In a pose-only run it is irrelevant because
+`active_tasks: [pose]` and `loss.det: 0.0` gate detector training off. In det-replay probes it can be enabled only as an
+explicit detection experiment; do not assume it is part of the current pose recipe.
+
+Partial-label detection safeguards are still important for any det-replay stage:
+
+```yaml
+det_class_mask_normalization: none
+det_partial_cls_positive_only: true
+```
+
+They prevent person-only or face-only sources from turning unannotated Objects365 classes into full negatives, and they
+avoid background BCE on single-class partial images when only assigned positives are trustworthy.
+
+### Pose Validation And Fitness
+
+The stage validator now records bbox-matched 2D pose metrics in original-image pixels:
+
+- `metrics/pose2d/mpjpe_mean_px`
+- `metrics/pose2d/mpjpe_median_px`
+- `metrics/pose2d/mpjpe_p90_px`
+- `metrics/pose2d/mpjpe_input_*_px`
+- `metrics/pose2d/mpjpe_box_h_norm_*`
+- per-source versions under `metrics/pose2d/source/{coco,ochuman,3dpw,agora}/...`
+
+`pose_fitness: mpjpe` makes model selection use lower MPJPE rather than detector mAP or a tiny validation loss. The
+fitness combines mean and P90 by default, so a checkpoint with a slightly lower mean but much worse tail error should
+not automatically win.
+
+The Stage B validation set is small, so `val/pose2d_loss` is only a reference signal. For Stage B and pose-only Stage C,
+watch train loss, MPJPE mean/median/P90, and manual overlays together. Do not promote a checkpoint solely from a small
+validation loss dip.
+
+### Prodigy And Effective LR Logging
+
+The stage trainer logs Prodigy state into `results.csv` when the optimizer is Prodigy:
+
+- `prodigy/d`
+- `prodigy/effective_lr`
+- `prodigy/k`
+- `prodigy/d_max` when exposed by the optimizer
+
+Use `prodigy/effective_lr` for comparison with SGD-style learning rates. The configured `lr0=1.0` is not directly
+comparable to an SGD LR; the actual Prodigy step scale is the learned `d` times the group LR.
+
+### Sampler Additions For Pose Probes
+
+The weighted sampler now understands:
+
+- `sampling_sources` on unified labels, so merged COCO records can count toward both pose and mask domains
+- `hard_image_list` plus `hard_image_boost`, for replaying known difficult image stems or paths
+- existing class-aware and small-object boosts without breaking source-weighted replacement
+
+For the current pose-only recipe, det replay is intentionally not required because the pose branch has its own neck.
+Use hard-image replay only after generating a verified list of bad pose overlays or high-MPJPE examples.
 
 ## Training Issue Log
 
@@ -1188,7 +1358,7 @@ Fix: use a bridge stage before the full detection mainline:
 
 ```yaml
 A_det_escape_bridge:
-  train: {backbone: false, neck: true, det_head: true}
+  train: {backbone: false, det_neck: true, pose_neck: false, det_head: true}
   sampling_weights: {objects365: 95, crowdhuman: 3, wider_face: 2}
 ```
 
