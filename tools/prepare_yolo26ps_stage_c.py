@@ -82,6 +82,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-agora-val", type=int, default=0, help="optional AGORA val image cap")
     parser.add_argument("--agora-occlusion-thr", type=float, default=95.0)
     parser.add_argument("--kpt-conf-thr", type=float, default=0.05)
+    parser.add_argument(
+        "--3dpw-kpt-conf-thr",
+        type=float,
+        default=None,
+        help="OpenPose confidence threshold used only for 3DPW keypoints; defaults to max(kpt-conf-thr, 0.20)",
+    )
+    parser.add_argument("--no-3dpw-reproj-filter", action="store_true", help="disable 3DPW SMPL-vs-OpenPose sanity filter")
+    parser.add_argument("--3dpw-reproj-min-kpts", type=int, default=6)
+    parser.add_argument("--3dpw-reproj-median-thr", type=float, default=25.0)
+    parser.add_argument("--3dpw-reproj-p80-thr", type=float, default=60.0)
+    parser.add_argument("--3dpw-reproj-max-thr", type=float, default=120.0)
+    parser.add_argument(
+        "--3dpw-joint-reproj-thr",
+        type=float,
+        default=40.0,
+        help="Drop individual 3DPW joints whose OpenPose-vs-SMPL projection error exceeds this threshold; <=0 disables",
+    )
     return parser.parse_args()
 
 
@@ -200,6 +217,66 @@ def smpl24_to_coco17(points3d: np.ndarray, kpts2d: np.ndarray) -> tuple[np.ndarr
     return out, valid
 
 
+def project_3dpw_coco17(kpts3d: np.ndarray, cam_intrinsics: np.ndarray, cam_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Project 3DPW SMPL joints into image coordinates using the frame camera pose."""
+    points = np.asarray(kpts3d, dtype=np.float32).reshape(-1, 3)
+    hom = np.concatenate([points, np.ones((len(points), 1), dtype=np.float32)], axis=1)
+    cam = (np.asarray(cam_pose, dtype=np.float32) @ hom.T).T[:, :3]
+    z = cam[:, 2]
+    xy = np.full((len(points), 2), np.nan, dtype=np.float32)
+    valid = np.abs(z) > 1e-6
+    k = np.asarray(cam_intrinsics, dtype=np.float32)
+    xy[valid, 0] = k[0, 0] * cam[valid, 0] / z[valid] + k[0, 2]
+    xy[valid, 1] = k[1, 1] * cam[valid, 1] / z[valid] + k[1, 2]
+    return xy, z
+
+
+def good_3dpw_reprojection(
+    kpts2d: np.ndarray,
+    kpts3d: np.ndarray,
+    valid3d: np.ndarray,
+    cam_intrinsics: np.ndarray,
+    cam_pose: np.ndarray,
+    min_kpts: int,
+    median_thr: float,
+    p80_thr: float,
+    max_thr: float,
+) -> bool:
+    """Return whether OpenPose 2D is consistent with 3DPW SMPL camera projection."""
+    projected, depth = project_3dpw_coco17(kpts3d, cam_intrinsics, cam_pose)
+    mask = (kpts2d[:, 2] > 0) & valid3d & np.isfinite(projected[:, 0]) & (depth > 0.05)
+    if int(mask.sum()) < min_kpts:
+        return False
+    error = np.linalg.norm(projected[mask] - kpts2d[mask, :2], axis=1)
+    return bool(np.median(error) <= median_thr and np.percentile(error, 80) <= p80_thr and error.max() <= max_thr)
+
+
+def clean_3dpw_reprojected_joints(
+    kpts2d: np.ndarray,
+    valid3d: np.ndarray,
+    kpts3d: np.ndarray,
+    cam_intrinsics: np.ndarray,
+    cam_pose: np.ndarray,
+    joint_thr: float,
+) -> int:
+    """Hide individual 3DPW joints with large OpenPose-vs-SMPL projection disagreement."""
+    if joint_thr <= 0:
+        return 0
+    projected, depth = project_3dpw_coco17(kpts3d, cam_intrinsics, cam_pose)
+    mask = (kpts2d[:, 2] > 0) & valid3d & np.isfinite(projected[:, 0]) & (depth > 0.05)
+    if not bool(mask.any()):
+        return 0
+    error = np.zeros(len(kpts2d), dtype=np.float32)
+    error[mask] = np.linalg.norm(projected[mask] - kpts2d[mask, :2], axis=1)
+    bad = mask & (error > joint_thr)
+    if not bool(bad.any()):
+        return 0
+    kpts2d[bad] = 0.0
+    kpts3d[bad] = 0.0
+    valid3d[bad] = False
+    return int(bad.sum())
+
+
 def agora45_to_coco17(points2d: np.ndarray, points3d: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     kpts2d = np.zeros((17, 3), dtype=np.float32)
     kpts3d = np.zeros((17, 3), dtype=np.float32)
@@ -217,20 +294,44 @@ def agora45_to_coco17(points2d: np.ndarray, points3d: np.ndarray, width: int, he
     return kpts2d, kpts3d, valid3d
 
 
-def prepare_3dpw(root: Path, split: str, limit: int, conf_thr: float) -> list[dict]:
+def prepare_3dpw(
+    root: Path,
+    split: str,
+    limit: int,
+    conf_thr: float,
+    use_reproj_filter: bool,
+    reproj_min_kpts: int,
+    reproj_median_thr: float,
+    reproj_p80_thr: float,
+    reproj_max_thr: float,
+    joint_reproj_thr: float,
+) -> tuple[list[dict], dict[str, int]]:
     seq_dir = root / "sequenceFiles" / split
     image_root = root / "imageFiles"
     records: list[dict] = []
     by_image: dict[Path, list[dict]] = defaultdict(list)
+    stats = {
+        "instances_seen": 0,
+        "instances_kept": 0,
+        "instances_low_kpt_rejected": 0,
+        "instances_reproj_rejected": 0,
+        "instances_joint_cleaned_rejected": 0,
+        "joints_reproj_cleaned": 0,
+    }
 
     for pkl_path in sorted(seq_dir.glob("*.pkl")):
         with pkl_path.open("rb") as f:
             data = pickle.load(f, encoding="latin1")
         sequence = str(data.get("sequence", pkl_path.stem))
         frame_ids = [int(x) for x in data["img_frame_ids"]]
+        cam_intrinsics = np.asarray(data.get("cam_intrinsics", np.eye(3)), dtype=np.float32)
+        cam_poses = np.asarray(data.get("cam_poses", []), dtype=np.float32)
         image_dir = image_root / sequence
         for frame_i, frame_id in enumerate(frame_ids):
-            image_path = image_dir / f"image_{frame_id:05d}.jpg"
+            # 3DPW pkl arrays are indexed by extracted-frame order, while img_frame_ids
+            # keep the original video frame numbers. The extracted image files are
+            # named by the compact array index, not by the original video frame id.
+            image_path = image_dir / f"image_{frame_i:05d}.jpg"
             if not image_path.exists():
                 continue
             try:
@@ -242,17 +343,51 @@ def prepare_3dpw(root: Path, split: str, limit: int, conf_thr: float) -> list[di
                 pose2d = np.asarray(pose2d)
                 if frame_i >= pose2d.shape[0]:
                     continue
+                stats["instances_seen"] += 1
                 kpts2d = openpose18_to_coco17(pose2d[frame_i].T, conf_thr)
                 if int((kpts2d[:, 2] > 0).sum()) < 6:
+                    stats["instances_low_kpt_rejected"] += 1
                     continue
                 joints = np.asarray(data.get("jointPositions", [])[person_i], dtype=np.float32)
                 if joints.ndim == 2 and frame_i < joints.shape[0]:
                     kpts3d, valid3d = smpl24_to_coco17(joints[frame_i].reshape(-1, 3), kpts2d)
                 else:
                     kpts3d, valid3d = np.zeros((17, 3), dtype=np.float32), np.zeros(17, dtype=bool)
+                if (
+                    use_reproj_filter
+                    and valid3d.any()
+                    and frame_i < len(cam_poses)
+                    and not good_3dpw_reprojection(
+                        kpts2d,
+                        kpts3d,
+                        valid3d,
+                        cam_intrinsics,
+                        cam_poses[frame_i],
+                        reproj_min_kpts,
+                        reproj_median_thr,
+                        reproj_p80_thr,
+                        reproj_max_thr,
+                    )
+                ):
+                    stats["instances_reproj_rejected"] += 1
+                    continue
+                if use_reproj_filter and valid3d.any() and frame_i < len(cam_poses):
+                    cleaned = clean_3dpw_reprojected_joints(
+                        kpts2d,
+                        valid3d,
+                        kpts3d,
+                        cam_intrinsics,
+                        cam_poses[frame_i],
+                        joint_reproj_thr,
+                    )
+                    stats["joints_reproj_cleaned"] += cleaned
+                    if cleaned and int((kpts2d[:, 2] > 0).sum()) < 6:
+                        stats["instances_joint_cleaned_rejected"] += 1
+                        continue
                 inst = make_instance(kpts2d, kpts3d, valid3d, width, height)
                 if inst is not None:
                     instances.append(inst)
+                    stats["instances_kept"] += 1
             if instances:
                 by_image[image_path].extend(instances)
 
@@ -261,7 +396,7 @@ def prepare_3dpw(root: Path, split: str, limit: int, conf_thr: float) -> list[di
         records.append(make_record(image_path, width, height, "3dpw", instances))
         if limit and len(records) >= limit:
             break
-    return records
+    return records, stats
 
 
 def agora_image_path(root: Path, split: str, shard: int, img_path: str) -> Path:
@@ -352,8 +487,35 @@ def main() -> None:
 
     threedpw_root = args.human_root / "3DPW" / "extracted"
     agora_root = args.human_root / "AGORA" / "extracted" / "AGORA"
-    threedpw_train = prepare_3dpw(threedpw_root, "train", args.max_3dpw_train, args.kpt_conf_thr)
-    threedpw_val = prepare_3dpw(threedpw_root, "validation", args.max_3dpw_val, args.kpt_conf_thr)
+    threedpw_kpt_conf_thr = (
+        max(args.kpt_conf_thr, 0.20)
+        if args.__dict__["3dpw_kpt_conf_thr"] is None
+        else float(args.__dict__["3dpw_kpt_conf_thr"])
+    )
+    threedpw_train, threedpw_train_stats = prepare_3dpw(
+        threedpw_root,
+        "train",
+        args.max_3dpw_train,
+        threedpw_kpt_conf_thr,
+        not args.no_3dpw_reproj_filter,
+        args.__dict__["3dpw_reproj_min_kpts"],
+        args.__dict__["3dpw_reproj_median_thr"],
+        args.__dict__["3dpw_reproj_p80_thr"],
+        args.__dict__["3dpw_reproj_max_thr"],
+        args.__dict__["3dpw_joint_reproj_thr"],
+    )
+    threedpw_val, threedpw_val_stats = prepare_3dpw(
+        threedpw_root,
+        "validation",
+        args.max_3dpw_val,
+        threedpw_kpt_conf_thr,
+        not args.no_3dpw_reproj_filter,
+        args.__dict__["3dpw_reproj_min_kpts"],
+        args.__dict__["3dpw_reproj_median_thr"],
+        args.__dict__["3dpw_reproj_p80_thr"],
+        args.__dict__["3dpw_reproj_max_thr"],
+        args.__dict__["3dpw_joint_reproj_thr"],
+    )
     agora_train = prepare_agora(agora_root, "train", args.max_agora_train, args.agora_occlusion_thr)
     agora_val = prepare_agora(agora_root, "val", args.max_agora_val, args.agora_occlusion_thr)
 
@@ -370,6 +532,17 @@ def main() -> None:
         "val_total": len(val_records),
         "train_sources": source_counts(train_records),
         "val_sources": source_counts(val_records),
+        "3dpw_reprojection_filter": {
+            "enabled": not args.no_3dpw_reproj_filter,
+            "kpt_conf_thr": threedpw_kpt_conf_thr,
+            "min_kpts": args.__dict__["3dpw_reproj_min_kpts"],
+            "median_thr": args.__dict__["3dpw_reproj_median_thr"],
+            "p80_thr": args.__dict__["3dpw_reproj_p80_thr"],
+            "max_thr": args.__dict__["3dpw_reproj_max_thr"],
+            "joint_thr": args.__dict__["3dpw_joint_reproj_thr"],
+            "train": threedpw_train_stats,
+            "val": threedpw_val_stats,
+        },
         "note": "Stage C warmup lists include pose/3D sources. Detection-only sources are intentionally left to detection-enabled stages.",
     }
     (out / "stage_c_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

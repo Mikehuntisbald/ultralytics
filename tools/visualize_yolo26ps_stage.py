@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-det", type=int, default=300, help="Top-k detections kept by model head")
     parser.add_argument("--max-vis", type=int, default=30, help="Maximum boxes drawn per image")
     parser.add_argument("--pose-conf", type=float, default=0.20, help="Minimum keypoint confidence for skeleton drawing")
+    parser.add_argument(
+        "--z-display",
+        choices=("raw", "norm"),
+        default="raw",
+        help="Display raw relative z by undoing deploy bbox-height normalization, or normalized deploy z.",
+    )
     parser.add_argument("--seed", type=int, default=20260529, help="Deterministic sampling seed")
     parser.add_argument("--device", default="0", help="Ultralytics device string")
     return parser.parse_args()
@@ -227,9 +233,13 @@ def draw_depth_legend(img: np.ndarray) -> None:
 
 
 def decode_pose_to_image(
-    pose_norm: torch.Tensor, boxes_orig: torch.Tensor, image_shape: tuple[int, int]
+    pose_norm: torch.Tensor,
+    boxes_orig: torch.Tensor,
+    image_shape: tuple[int, int],
+    boxes_model: torch.Tensor | None = None,
+    z_display: str = "raw",
 ) -> torch.Tensor:
-    """Convert bbox-normalized [x, y, z, conf] pose to image xy and relative z."""
+    """Convert bbox-normalized [x, y, z, conf] pose to image xy and diagnostic z."""
     if pose_norm.numel() == 0:
         return torch.empty((0, 17, 4), dtype=torch.float32)
     pose = pose_norm.detach().cpu().float().clone()
@@ -241,6 +251,11 @@ def decode_pose_to_image(
     pose[..., 1] = y1 + pose[..., 1] * bh
     pose[..., 0].clamp_(0, image_shape[1] - 1)
     pose[..., 1].clamp_(0, image_shape[0] - 1)
+    if z_display == "raw" and boxes_model is not None and boxes_model.numel():
+        # Deployment emits z normalized by the model-input bbox height. Restore the
+        # raw root-relative training target for visual diagnostics.
+        box_h_model = (boxes_model.detach().cpu().float()[:, 3] - boxes_model.detach().cpu().float()[:, 1]).clamp(min=1.0)
+        pose[..., 2] *= box_h_model.view(-1, 1)
     return pose
 
 
@@ -276,7 +291,12 @@ def draw_skeleton_25d(
     x1, y1, _x2, y2 = [int(round(float(v))) for v in box]
     mean_z = float(z_values.mean()) if len(z_values) else 0.0
     put_label(img, f"pose{instance_index} z={mean_z:+.2f} k={int(visible.sum())}", (x1, min(y2 + 18, img.shape[0] - 4)), (45, 45, 45), 0.45)
-    return {"visible_keypoints": int(visible.sum()), "mean_z": round(mean_z, 5)}
+    return {
+        "visible_keypoints": int(visible.sum()),
+        "mean_z": round(mean_z, 5),
+        "min_z": round(float(z_values.min()), 5) if len(z_values) else 0.0,
+        "max_z": round(float(z_values.max()), 5) if len(z_values) else 0.0,
+    }
 
 
 def selected_classes_for_source(source: str) -> set[int] | None:
@@ -352,7 +372,7 @@ def prepare_predictions(
     pose_orig = torch.empty((0, 17, 4), dtype=torch.float32)
     if boxes.numel():
         boxes_orig = ops.scale_boxes(im.shape[2:], boxes.clone(), image_shape, ratio_pad=ratio_pad).detach().cpu()
-        pose_orig = decode_pose_to_image(pose, boxes_orig, image_shape)
+        pose_orig = decode_pose_to_image(pose, boxes_orig, image_shape, boxes, getattr(args, "z_display", "raw"))
         masks_orig = torch.zeros((boxes.shape[0], image_shape[0], image_shape[1]), dtype=torch.bool)
         person = classes == PERSON_CLS
         if person.any() and proto.shape[-1] > 0 and proto.shape[-2] > 0:
@@ -492,6 +512,7 @@ def main() -> None:
         "conf": args.conf,
         "iou": args.iou,
         "pose_conf": args.pose_conf,
+        "z_display": args.z_display,
         "sources": sources,
         "images": [],
     }
