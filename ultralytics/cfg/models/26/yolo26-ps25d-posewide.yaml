@@ -1,0 +1,58 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO26 person-scene 2.5D multi-task model with a wider pose head.
+# This keeps the backbone/neck and other task heads identical to yolo26-ps25d.yaml.
+
+nc: 366
+scene_nc: 150
+person_cls: 0
+face_cls: 365
+end2end: True
+reg_max: 1
+kpt_shape: [17, 4]
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]]
+  - [-1, 2, C2PSA, [1024]]
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, AlignConcat, [1]]
+  - [-1, 2, C3k2, [384, True]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, AlignConcat, [1]]
+  - [-1, 2, C3k2, [384, True]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, AlignConcat, [1]]
+  - [-1, 2, C3k2, [384, True]]
+
+  - [-1, 1, Conv, [384, 3, 2]]
+  - [[-1, 16], 1, AlignConcat, [1]]
+  - [-1, 2, C3k2, [384, True]]
+
+  - [-1, 1, Conv, [384, 3, 2]]
+  - [[-1, 13], 1, AlignConcat, [1]]
+  - [-1, 2, C3k2, [384, True]]
+
+  - [-1, 1, Conv, [384, 3, 2]]
+  - [[-1, 10], 1, AlignConcat, [1]]
+  - [-1, 1, C3k2, [384, True, 0.5, True]]
+
+  - [[19, 22, 25, 28], 1, YOLO26PSDetect25D, [nc, kpt_shape, 32, 192, 150, 0, 192]]

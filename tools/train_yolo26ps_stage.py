@@ -20,7 +20,8 @@ sys.path.insert(0, str(ROOT))
 
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
-from ultralytics.utils import LOGGER, RANK, YAML
+from ultralytics.nn.tasks import torch_safe_load
+from ultralytics.utils import LOGGER, RANK, YAML, nms, ops
 from ultralytics.utils.metrics import DetMetrics
 from ultralytics.utils.torch_utils import unwrap_model
 
@@ -32,6 +33,7 @@ MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d.yaml"
 PLAN_YAML = ROOT / "ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml"
 STAGE_DATA_YAMLS = {
     "A_detection": DATA_YAML,
+    "A_person_only": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_a_person_only.yaml",
     "A_detection_stable": DATA_YAML,
     "A_det_escape_bridge": DATA_YAML,
     "A_det_escape_main": DATA_YAML,
@@ -40,7 +42,20 @@ STAGE_DATA_YAMLS = {
     "B_pose2d_probe": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "B_pose2d_det_probe": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
     "B_pose2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_b_pose2d.yaml",
-    "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_detreplay.yaml",
+    "C_pose25d_poseonly": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_poseonly_ochuman.yaml",
+    "C_pose25d_refine2d": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_detbox": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_balanced": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_clean": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_targetfit": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_denseanchors": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_posewide": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml",
+    "C_pose25d_refine2d_targetclean": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targetclean.yaml",
+    "C_pose25d_refine2d_targetstrict": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targetstrict.yaml",
+    "C_pose25d_refine2d_targeteasy": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targeteasy.yaml",
+    "C_pose25d_refine2d_targeteasy_neckprobe": ROOT
+    / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targeteasy.yaml",
     "C_det_reanchor": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml",
     "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
     "D_det_recover_objects365": DATA_YAML,
@@ -53,24 +68,64 @@ STAGE_DATA_YAMLS = {
     "F_full_finetune_pose_heavy": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
 }
 
-LOSS_KEYS = ("det", "pose2d", "pose_z", "pose_vis", "bone", "person_mask", "scene_seg")
+LOSS_KEYS = ("det", "human_det", "pose2d", "pose_z", "pose_vis", "bone", "person_mask", "scene_seg")
 MIXED_AUG_KEYS = ("mosaic", "mixup", "copy_paste", "cutmix")
 BRANCH_MODULES = {
     "det": ("cv2", "cv3", "one2one_cv2", "one2one_cv3"),
+    "human_det": ("human_cv2", "human_cv3", "one2one_human_cv2", "one2one_human_cv3"),
     "pose": ("cv4", "one2one_cv4"),
+    "pose_adapter": ("pose_adapter",),
     "mask": ("cv5", "one2one_cv5", "proto"),
     "scene": ("scene_seg",),
     "p2_dense": ("p2_refine",),
 }
 BRANCH_TRAIN_FLAGS = {
     "det": "det_head",
+    "human_det": "human_det_head",
     "pose": "body25d_head",
+    "pose_adapter": "pose_adapter",
     "mask": "mask_head",
     "scene": "scene_seg_head",
 }
 MODEL_GROUP_RANGES = {
     "backbone": (0, 11),
-    "neck": (11, -1),
+    "det_neck": (11, 29),
+    "pose_neck": (29, -1),
+}
+NORM_TYPES = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+HEAD_BN_ALIASES = {
+    "a": "det",
+    "stage_a": "det",
+    "detection": "det",
+    "det_head": "det",
+    "human": "human_det",
+    "human_det": "human_det",
+    "human_detection": "human_det",
+    "human_det_head": "human_det",
+    "person_only": "human_det",
+    "person_face": "human_det",
+    "b": "pose",
+    "stage_b": "pose",
+    "c": "pose",
+    "stage_c": "pose",
+    "body25d": "pose",
+    "body25d_head": "pose",
+    "pose2d": "pose",
+    "pose25d": "pose",
+    "pose_head": "pose",
+    "pose_adapter": "pose_adapter",
+    "pose_only_adapter": "pose_adapter",
+    "d": "mask",
+    "stage_d": "mask",
+    "person_mask": "mask",
+    "mask_head": "mask",
+    "e": "scene",
+    "stage_e": "scene",
+    "scene_seg": "scene",
+    "scene_seg_head": "scene",
+    "p2": "p2_dense",
+    "p2_refine": "p2_dense",
+    "adapter": "p2_dense",
 }
 
 
@@ -153,6 +208,13 @@ def train_flag_enabled(train: dict[str, Any], key: str, default: bool = True) ->
     return bool(value)
 
 
+def train_group_enabled(train: dict[str, Any], key: str, default: bool = True) -> bool:
+    """Read model-group trainability with a legacy fallback for the old combined neck key."""
+    if key in {"det_neck", "pose_neck"} and key not in train and "neck" in train:
+        return train_flag_enabled(train, "neck", default=default)
+    return train_flag_enabled(train, key, default=default)
+
+
 def truthy(value: Any) -> bool:
     """Read boolean-like YAML/CLI values."""
     if isinstance(value, str):
@@ -182,13 +244,14 @@ def active_tasks_from_stage(stage: dict[str, Any]) -> set[str]:
         if isinstance(runtime_tasks, str):
             runtime_tasks = [item.strip() for item in runtime_tasks.split(",") if item.strip()]
         tasks = {str(task).strip().lower() for task in runtime_tasks}
-        tasks.add("det")
         return tasks
     train = stage.get("train") or {}
     loss = stage.get("loss") or {}
     tasks = {"det"}
     if train.get("all"):
-        return {"det", "pose", "mask", "scene"}
+        return {"det", "human_det", "pose", "mask", "scene"}
+    if train.get("human_det_head") or float(loss.get("human_det", 0.0)):
+        tasks.add("human_det")
     if train.get("body25d_head") or any(float(loss.get(k, 0.0)) for k in ("pose2d", "pose_z", "pose_vis", "bone")):
         tasks.add("pose")
     if train.get("mask_head") or float(loss.get("person_mask", 0.0)):
@@ -202,6 +265,81 @@ def complete_loss_weights(stage: dict[str, Any]) -> dict[str, float]:
     """Return all task loss weights, defaulting missing stage weights to zero."""
     loss = stage.get("loss") or {}
     return {key: float(loss.get(key, 0.0)) for key in LOSS_KEYS}
+
+
+def load_stage_pretrain(model: YOLO, weights: Path) -> None:
+    """Load a stage pretrain checkpoint, including old final-head weights after architecture edits."""
+    yaml_file = getattr(model.model, "yaml_file", None)
+    if yaml_file is None:
+        yaml_file = "model"
+    LOGGER.info(f"Loading partial pretrained weights into {yaml_file}: {weights}")
+    ckpt, _ = torch_safe_load(weights)
+    source_model = (ckpt.get("ema") or ckpt["model"]).float()
+    source = source_model.state_dict()
+    target = model.model.state_dict()
+    transfer = {k: v for k, v in source.items() if k in target and v.shape == target[k].shape}
+    final_old, final_new = _final_layer_prefix(source), _final_layer_prefix(target)
+    remapped = 0
+    if final_old and final_new and final_old != final_new:
+        old_prefix, new_prefix = f"model.{final_old}.", f"model.{final_new}."
+        for key, value in source.items():
+            if not key.startswith(old_prefix):
+                continue
+            new_key = new_prefix + key[len(old_prefix) :]
+            if new_key in target and new_key not in transfer and value.shape == target[new_key].shape:
+                transfer[new_key] = value
+                remapped += 1
+    model.model.load_state_dict(transfer, strict=False)
+    LOGGER.info(f"Transferred {len(transfer)}/{len(target)} items from stage pretrain weights ({remapped} final-head remapped)")
+    model.ckpt = {"model": model.model}
+    model.ckpt_path = str(weights)
+
+
+def _final_layer_prefix(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """Return the largest numeric model layer prefix in a YOLO state dict."""
+    layers = []
+    for key in state_dict:
+        parts = key.split(".", 2)
+        if len(parts) > 1 and parts[0] == "model" and parts[1].isdigit():
+            layers.append(int(parts[1]))
+    return max(layers) if layers else None
+
+
+def apply_loss_overrides(stage: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Apply optional CLI loss-weight overrides to a stage config."""
+    overrides = {
+        key: float(value)
+        for key in LOSS_KEYS
+        if (value := getattr(args, f"loss_{key}", None)) is not None
+    }
+    if not overrides:
+        return stage
+    stage = dict(stage)
+    loss = dict(stage.get("loss") or {})
+    loss.update(overrides)
+    stage["loss"] = loss
+    return stage
+
+
+def pose_fitness_sources(value: Any) -> dict[str, float]:
+    """Parse optional source weights for pose MPJPE fitness."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {str(k).strip().lower(): float(v) for k, v in value.items() if float(v)}
+    if isinstance(value, (list, tuple, set)):
+        return {str(k).strip().lower(): 1.0 for k in value if str(k).strip()}
+    sources = {}
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            name, weight = item.split("=", 1)
+            sources[name.strip().lower()] = float(weight)
+        else:
+            sources[item.lower()] = 1.0
+    return {k: v for k, v in sources.items() if v}
 
 
 def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
@@ -252,11 +390,59 @@ class YOLO26PSStageValidator(DetectionValidator):
     """Validator that unwraps det-only outputs and records source-level stage metrics."""
 
     def postprocess(self, preds):
-        while isinstance(preds, (list, tuple)) and preds:
-            preds = preds[0]
-            if isinstance(preds, torch.Tensor):
-                break
-        return super().postprocess(preds)
+        pose = None
+        if isinstance(preds, (list, tuple)) and preds:
+            deploy = preds[0]
+            if isinstance(deploy, (list, tuple)) and len(deploy) == 5:
+                det, pose = deploy[0], deploy[1]
+            else:
+                det = deploy
+        else:
+            det = preds
+        if pose is None:
+            return super().postprocess(det)
+
+        if det.shape[-1] == 6 or self.end2end:
+            preds_out = []
+            classes = None if self.args.classes is None else torch.tensor(self.args.classes, device=det.device)
+            for i, pred in enumerate(det):
+                keep = pred[:, 4] > self.args.conf
+                if classes is not None:
+                    keep &= (pred[:, 5:6] == classes).any(1)
+                idx = torch.where(keep)[0][: self.args.max_det]
+                x = pred[idx]
+                preds_out.append(
+                    {
+                        "bboxes": x[:, :4],
+                        "conf": x[:, 4],
+                        "cls": x[:, 5],
+                        "extra": x[:, 6:],
+                        "pose25d": pose[i, idx] if len(idx) else pose.new_zeros((0, pose.shape[2], pose.shape[3])),
+                    }
+                )
+            return preds_out
+
+        outputs, keep_idxs = nms.non_max_suppression(
+            det,
+            self.args.conf,
+            self.args.iou,
+            nc=0 if self.args.task == "detect" else self.nc,
+            multi_label=True,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            end2end=self.end2end,
+            rotated=self.args.task == "obb",
+            return_idxs=True,
+        )
+        preds_out = []
+        for i, x in enumerate(outputs):
+            pred = {"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5], "extra": x[:, 6:]}
+            if len(x):
+                pred["pose25d"] = pose[i, keep_idxs[i].long()]
+            else:
+                pred["pose25d"] = pose.new_zeros((0, pose.shape[2], pose.shape[3]))
+            preds_out.append(pred)
+        return preds_out
 
     def init_metrics(self, model: torch.nn.Module) -> None:
         super().init_metrics(model)
@@ -264,6 +450,17 @@ class YOLO26PSStageValidator(DetectionValidator):
         self.face_cls = int(self.data.get("face_cls", max(self.nc - 1, 0)))
         self.stage_metric_buckets = {name: DetMetrics(names=self.names) for name in self._stage_bucket_names()}
         self.stage_task_counts = {"pose2d": 0, "pose3d": 0, "person_mask": 0, "scene_seg": 0}
+        self.pose2d_mpjpes: list[float] = []
+        self.pose2d_input_mpjpes: list[float] = []
+        self.pose2d_box_h_norms: list[float] = []
+        self.pose2d_source_stats = {
+            "coco_wholebody": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+            "ochuman": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+            "3dpw": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+            "agora": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+        }
+        self.pose2d_matched = 0
+        self.pose2d_total = 0
 
     @staticmethod
     def _stage_bucket_names() -> tuple[str, ...]:
@@ -273,6 +470,7 @@ class YOLO26PSStageValidator(DetectionValidator):
             "crowdhuman_person",
             "wider_face",
             "coco_person",
+            "ochuman_person",
             "3dpw_person",
             "agora_person",
             "small",
@@ -288,6 +486,8 @@ class YOLO26PSStageValidator(DetectionValidator):
             return "crowdhuman"
         if "wider_face" in parts or "wider" in parts:
             return "wider_face"
+        if "ochuman" in parts or "ochuman" in normalized:
+            return "ochuman"
         if "coco_wholebody" in parts or "coco_2017" in parts or "coco2017" in normalized:
             return "coco_wholebody"
         if "3dpw" in parts or "3dpw" in normalized:
@@ -353,6 +553,7 @@ class YOLO26PSStageValidator(DetectionValidator):
 
             pbatch = self._prepare_batch(si, batch)
             predn = self._prepare_pred(pred)
+            self._update_pose2d_mpjpe(predn, pbatch, batch, si)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
             stat = {
@@ -375,6 +576,8 @@ class YOLO26PSStageValidator(DetectionValidator):
                 self._bucket_update("wider_face", predn, pbatch, class_id=self.face_cls)
             elif source == "coco_wholebody":
                 self._bucket_update("coco_person", predn, pbatch, class_id=self.person_cls)
+            elif source == "ochuman":
+                self._bucket_update("ochuman_person", predn, pbatch, class_id=self.person_cls)
             elif source == "3dpw":
                 self._bucket_update("3dpw_person", predn, pbatch, class_id=self.person_cls)
             elif source == "agora":
@@ -408,16 +611,134 @@ class YOLO26PSStageValidator(DetectionValidator):
                         self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
                     )
 
+    def _update_pose2d_mpjpe(
+        self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any], batch: dict[str, Any], si: int
+    ) -> None:
+        """Accumulate bbox-matched 2D pose MPJPE in original-image pixels."""
+        if "pose25d" not in predn or predn["pose25d"].numel() == 0:
+            return
+        keypoints = batch.get("keypoints")
+        instance_flags = batch.get("instance_flags")
+        if keypoints is None or not torch.is_tensor(keypoints) or keypoints.numel() == 0:
+            return
+
+        idx = batch["batch_idx"] == si
+        if not bool(idx.any()):
+            return
+        gt_cls = batch["cls"][idx].view(-1).to(self.device)
+        gt_kpts = keypoints[idx].to(self.device).float()
+        gt_boxes = pbatch["bboxes"]
+        flags = instance_flags[idx].to(self.device).bool() if torch.is_tensor(instance_flags) else None
+        gt_pose_mask = flags[:, 1] if flags is not None else gt_kpts[..., 2].gt(0).any(-1)
+        gt_pose_mask &= gt_cls.long().eq(self.person_cls)
+        gt_pose_mask &= gt_kpts[..., 2].gt(0).sum(-1).ge(1)
+        if not bool(gt_pose_mask.any()):
+            return
+
+        gt_boxes = gt_boxes[gt_pose_mask]
+        gt_kpts = gt_kpts[gt_pose_mask].clone()
+        self.pose2d_total += int(gt_boxes.shape[0])
+        source = self._source_name(pbatch["im_file"])
+        source_stats = self.pose2d_source_stats.get(source)
+        if source_stats is not None:
+            source_stats["total"] += int(gt_boxes.shape[0])
+
+        pred_mask = predn["cls"].long().eq(self.person_cls)
+        pred_boxes = predn["bboxes"][pred_mask]
+        pred_pose = predn["pose25d"][pred_mask]
+        if pred_boxes.numel() == 0:
+            return
+
+        pred_boxes_orig = self.scale_preds({"bboxes": pred_boxes.clone()}, pbatch)["bboxes"]
+        pred_xy_input = self._pose_norm_to_input_xy(pred_pose, pred_boxes)
+        pred_xy = ops.scale_coords(
+            pbatch["imgsz"],
+            pred_xy_input.clone(),
+            pbatch["ori_shape"],
+            ratio_pad=pbatch["ratio_pad"],
+        )
+        gt_boxes_orig = self.scale_preds({"bboxes": gt_boxes.clone()}, pbatch)["bboxes"]
+        gt_kpts[..., 0] *= pbatch["imgsz"][1]
+        gt_kpts[..., 1] *= pbatch["imgsz"][0]
+        gt_xy_input = gt_kpts[..., :2].clone()
+        gt_xy = ops.scale_coords(
+            pbatch["imgsz"],
+            gt_xy_input.clone(),
+            pbatch["ori_shape"],
+            ratio_pad=pbatch["ratio_pad"],
+        )
+
+        iou = self._box_iou_original(gt_boxes_orig, pred_boxes_orig)
+        used: set[int] = set()
+        for gt_i in range(gt_boxes.shape[0]):
+            candidates = [(float(iou[gt_i, pred_i]), pred_i) for pred_i in range(pred_boxes.shape[0]) if pred_i not in used]
+            if not candidates:
+                continue
+            best_iou, pred_i = max(candidates, key=lambda item: item[0])
+            if best_iou < 0.50:
+                continue
+            visible = gt_kpts[gt_i, :, 2].gt(0)
+            if not bool(visible.any()):
+                continue
+            dist = (pred_xy[pred_i, visible] - gt_xy[gt_i, visible]).norm(dim=-1)
+            dist_input = (pred_xy_input[pred_i, visible] - gt_xy_input[gt_i, visible]).norm(dim=-1)
+            box_h = (gt_boxes_orig[gt_i, 3] - gt_boxes_orig[gt_i, 1]).clamp(min=1.0)
+            mpjpe = float(dist.mean().detach().cpu())
+            input_mpjpe = float(dist_input.mean().detach().cpu())
+            box_h_norm = float((dist.mean() / box_h).detach().cpu())
+            self.pose2d_mpjpes.append(mpjpe)
+            self.pose2d_input_mpjpes.append(input_mpjpe)
+            self.pose2d_box_h_norms.append(box_h_norm)
+            self.pose2d_matched += 1
+            if source_stats is not None:
+                source_stats["mpjpes"].append(mpjpe)
+                source_stats["input_mpjpes"].append(input_mpjpe)
+                source_stats["box_h_norms"].append(box_h_norm)
+                source_stats["matched"] += 1
+            used.add(pred_i)
+
+    @staticmethod
+    def _pose_norm_to_input_xy(pose_norm: torch.Tensor, boxes_input: torch.Tensor) -> torch.Tensor:
+        """Decode bbox-normalized pose xy to validator input-image coordinates."""
+        if pose_norm.numel() == 0:
+            return pose_norm.new_zeros((0, 0, 2))
+        boxes = boxes_input.to(pose_norm.dtype)
+        x1, y1, x2, y2 = [x.view(-1, 1) for x in boxes.T]
+        xy = pose_norm[..., :2].clone()
+        xy[..., 0] = x1 + xy[..., 0] * (x2 - x1).clamp(min=1.0)
+        xy[..., 1] = y1 + xy[..., 1] * (y2 - y1).clamp(min=1.0)
+        return xy
+
+    @staticmethod
+    def _box_iou_original(gt_boxes_orig: torch.Tensor, pred_boxes_orig: torch.Tensor) -> torch.Tensor:
+        """Return IoU between original-image GT and prediction boxes."""
+        if gt_boxes_orig.numel() == 0 or pred_boxes_orig.numel() == 0:
+            return gt_boxes_orig.new_zeros((gt_boxes_orig.shape[0], pred_boxes_orig.shape[0]))
+        x1 = torch.maximum(gt_boxes_orig[:, None, 0], pred_boxes_orig[None, :, 0])
+        y1 = torch.maximum(gt_boxes_orig[:, None, 1], pred_boxes_orig[None, :, 1])
+        x2 = torch.minimum(gt_boxes_orig[:, None, 2], pred_boxes_orig[None, :, 2])
+        y2 = torch.minimum(gt_boxes_orig[:, None, 3], pred_boxes_orig[None, :, 3])
+        inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+        area_a = (gt_boxes_orig[:, 2] - gt_boxes_orig[:, 0]).clamp(min=0) * (
+            gt_boxes_orig[:, 3] - gt_boxes_orig[:, 1]
+        ).clamp(min=0)
+        area_b = (pred_boxes_orig[:, 2] - pred_boxes_orig[:, 0]).clamp(min=0) * (
+            pred_boxes_orig[:, 3] - pred_boxes_orig[:, 1]
+        ).clamp(min=0)
+        return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-9)
+
     def gather_stats(self) -> None:
         super().gather_stats()
         if RANK == 0:
             for metric in self.stage_metric_buckets.values():
                 self._gather_stage_metric(metric)
             self._gather_stage_counts()
+            self._gather_pose2d_metrics()
         elif RANK > 0:
             for metric in self.stage_metric_buckets.values():
                 self._gather_stage_metric(metric)
             self._gather_stage_counts()
+            self._gather_pose2d_metrics()
 
     @staticmethod
     def _gather_stage_metric(metric: DetMetrics) -> None:
@@ -453,12 +774,127 @@ class YOLO26PSStageValidator(DetectionValidator):
         elif RANK > 0:
             dist.gather_object(self.stage_task_counts, None, dst=0)
 
+    def _gather_pose2d_metrics(self) -> None:
+        """Gather pose MPJPE lists and counters across DDP ranks."""
+        if RANK == 0:
+            gathered = [None] * dist.get_world_size()
+            dist.gather_object(
+                {
+                    "mpjpes": self.pose2d_mpjpes,
+                    "input_mpjpes": self.pose2d_input_mpjpes,
+                    "box_h_norms": self.pose2d_box_h_norms,
+                    "source_stats": self.pose2d_source_stats,
+                    "matched": self.pose2d_matched,
+                    "total": self.pose2d_total,
+                },
+                gathered,
+                dst=0,
+            )
+            self.pose2d_mpjpes = []
+            self.pose2d_input_mpjpes = []
+            self.pose2d_box_h_norms = []
+            self.pose2d_source_stats = {
+                "coco_wholebody": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+                "3dpw": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+                "agora": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
+            }
+            self.pose2d_matched = 0
+            self.pose2d_total = 0
+            for item in gathered:
+                if not item:
+                    continue
+                self.pose2d_mpjpes.extend(float(x) for x in item.get("mpjpes", []))
+                self.pose2d_input_mpjpes.extend(float(x) for x in item.get("input_mpjpes", []))
+                self.pose2d_box_h_norms.extend(float(x) for x in item.get("box_h_norms", []))
+                self.pose2d_matched += int(item.get("matched", 0))
+                self.pose2d_total += int(item.get("total", 0))
+                for source, stats in (item.get("source_stats") or {}).items():
+                    if source not in self.pose2d_source_stats:
+                        self.pose2d_source_stats[source] = {
+                            "mpjpes": [],
+                            "input_mpjpes": [],
+                            "box_h_norms": [],
+                            "matched": 0,
+                            "total": 0,
+                        }
+                    self.pose2d_source_stats[source]["mpjpes"].extend(float(x) for x in stats.get("mpjpes", []))
+                    self.pose2d_source_stats[source]["input_mpjpes"].extend(
+                        float(x) for x in stats.get("input_mpjpes", [])
+                    )
+                    self.pose2d_source_stats[source]["box_h_norms"].extend(
+                        float(x) for x in stats.get("box_h_norms", [])
+                    )
+                    self.pose2d_source_stats[source]["matched"] += int(stats.get("matched", 0))
+                    self.pose2d_source_stats[source]["total"] += int(stats.get("total", 0))
+        elif RANK > 0:
+            dist.gather_object(
+                {
+                    "mpjpes": self.pose2d_mpjpes,
+                    "input_mpjpes": self.pose2d_input_mpjpes,
+                    "box_h_norms": self.pose2d_box_h_norms,
+                    "source_stats": self.pose2d_source_stats,
+                    "matched": self.pose2d_matched,
+                    "total": self.pose2d_total,
+                },
+                None,
+                dst=0,
+            )
+
     def get_stats(self) -> dict[str, Any]:
         stats = super().get_stats()
         stats.update(self._stage_results())
+        stats.update(self._pose2d_results())
         for name, count in self.stage_task_counts.items():
             stats[f"metrics/stage/{name}_images"] = count
         return stats
+
+    def _pose2d_results(self) -> dict[str, float]:
+        mpjpes = np.asarray(self.pose2d_mpjpes, dtype=np.float32)
+        input_mpjpes = np.asarray(self.pose2d_input_mpjpes, dtype=np.float32)
+        box_h_norms = np.asarray(self.pose2d_box_h_norms, dtype=np.float32)
+        out = {
+            "metrics/pose2d/mpjpe_matched": float(self.pose2d_matched),
+            "metrics/pose2d/mpjpe_total": float(self.pose2d_total),
+            "metrics/pose2d/mpjpe_match_ratio": float(self.pose2d_matched / max(self.pose2d_total, 1)),
+        }
+        out.update(self._pose2d_array_results("metrics/pose2d/mpjpe", mpjpes, suffix="px"))
+        out.update(self._pose2d_array_results("metrics/pose2d/mpjpe_input", input_mpjpes, suffix="px"))
+        out.update(self._pose2d_array_results("metrics/pose2d/mpjpe_box_h_norm", box_h_norms))
+        source_prefix = {
+            "coco_wholebody": "metrics/pose2d/source/coco",
+            "ochuman": "metrics/pose2d/source/ochuman",
+            "3dpw": "metrics/pose2d/source/3dpw",
+            "agora": "metrics/pose2d/source/agora",
+        }
+        for source, prefix in source_prefix.items():
+            stats = self.pose2d_source_stats.get(source) or {}
+            source_mpjpes = np.asarray(stats.get("mpjpes", []), dtype=np.float32)
+            source_input = np.asarray(stats.get("input_mpjpes", []), dtype=np.float32)
+            source_norm = np.asarray(stats.get("box_h_norms", []), dtype=np.float32)
+            matched = int(stats.get("matched", 0))
+            total = int(stats.get("total", 0))
+            out[f"{prefix}/matched"] = float(matched)
+            out[f"{prefix}/total"] = float(total)
+            out[f"{prefix}/match_ratio"] = float(matched / max(total, 1))
+            out.update(self._pose2d_array_results(f"{prefix}/mpjpe", source_mpjpes, suffix="px"))
+            out.update(self._pose2d_array_results(f"{prefix}/mpjpe_input", source_input, suffix="px"))
+            out.update(self._pose2d_array_results(f"{prefix}/mpjpe_box_h_norm", source_norm))
+        return out
+
+    @staticmethod
+    def _pose2d_array_results(prefix: str, values: np.ndarray, suffix: str | None = None) -> dict[str, float]:
+        """Summarize a pose metric array for CSV output."""
+        names = ("mean", "median", "p90")
+        if suffix:
+            keys = (f"{prefix}_{name}_{suffix}" for name in names)
+        else:
+            keys = (f"{prefix}_{name}" for name in names)
+        if not values.size:
+            return {key: 0.0 for key in keys}
+        return {
+            key: float(value)
+            for key, value in zip(keys, (values.mean(), np.median(values), np.quantile(values, 0.9)))
+        }
 
     def _stage_results(self) -> dict[str, float]:
         results = {}
@@ -468,6 +904,7 @@ class YOLO26PSStageValidator(DetectionValidator):
             "crowdhuman_person": "metrics/stage_a/crowdhuman/person",
             "wider_face": "metrics/stage_a/wider_face/face",
             "coco_person": "metrics/stage_c/coco/person",
+            "ochuman_person": "metrics/stage_c/ochuman/person",
             "3dpw_person": "metrics/stage_c/3dpw/person",
             "agora_person": "metrics/stage_c/agora/person",
             "small": "metrics/stage_a/small",
@@ -492,9 +929,37 @@ class YOLO26PSStageTrainer(DetectionTrainer):
 
     stage_cfg: dict[str, Any] = {}
 
+    def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
+        """Build the training model and attach optional stage-only modules after loading weights."""
+        model = super().get_model(cfg=cfg, weights=weights, verbose=verbose)
+        self._apply_optional_pose_adapter(model, log=verbose and RANK in {-1, 0})
+        return model
+
     def set_model_attributes(self):
         super().set_model_attributes()
         self.apply_stage_controls(log=True, freeze=False)
+
+    def _apply_optional_pose_adapter(self, model: nn.Module, log: bool = False) -> None:
+        """Attach a pose-only feature adapter requested by train_runtime."""
+        runtime = self.stage_cfg.get("train_runtime") or {}
+        if not truthy(runtime.get("pose_adapter", False)):
+            return
+        layers = getattr(model, "model", [])
+        if not layers:
+            return
+        head = layers[-1]
+        if not hasattr(head, "enable_pose_adapter"):
+            LOGGER.warning("pose_adapter requested, but the model head does not support it.")
+            return
+        hidden_ratio = float(runtime.get("pose_adapter_hidden_ratio", 0.5))
+        scale = float(runtime.get("pose_adapter_scale", 1.0))
+        module = head.enable_pose_adapter(hidden_ratio=hidden_ratio, scale=scale)
+        module.to(next(model.parameters()).device)
+        if log:
+            params = sum(p.numel() for p in module.parameters())
+            LOGGER.info(
+                f"Stage pose adapter enabled: hidden_ratio={hidden_ratio:g}, scale={scale:g}, params={params:,}"
+            )
 
     def apply_stage_controls(self, log: bool = False, freeze: bool = True) -> None:
         """Apply active tasks, loss weights, trainable branches, and eval locks."""
@@ -505,11 +970,11 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         tasks = active_tasks_from_stage(self.stage_cfg)
         if hasattr(head, "set_active_tasks"):
             head.set_active_tasks(tasks)
+        self._apply_optional_pose_adapter(model, log=False)
         model.loss_weights = complete_loss_weights(self.stage_cfg)
         frozen_groups = self._apply_model_trainability(model, freeze=freeze)
         frozen = self._apply_branch_trainability(head, tasks, freeze=freeze)
-        if truthy((self.stage_cfg.get("train_runtime") or {}).get("freeze_trainable_bn", False)):
-            self._freeze_trainable_norm_stats(model)
+        bn_locks = self._apply_bn_policy(model, head, tasks)
         if log:
             LOGGER.info(f"Stage active tasks: {sorted(tasks)}")
             LOGGER.info(f"Stage task loss weights: {model.loss_weights}")
@@ -517,19 +982,33 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                 LOGGER.info(f"Stage frozen/eval model groups: {', '.join(frozen_groups)}")
             if frozen:
                 LOGGER.info(f"Stage frozen/eval branches: {', '.join(frozen)}")
+            if bn_locks:
+                LOGGER.info(f"Stage BN eval locks: {', '.join(bn_locks)}")
+
+    @staticmethod
+    def _model_group_range(model: nn.Module, group: str) -> range:
+        """Return model layer indices for a named trainability group."""
+        layers = getattr(model, "model", [])
+        start, end = MODEL_GROUP_RANGES[group]
+        stop = len(layers) + end if end < 0 else end
+        start = max(0, min(start, len(layers)))
+        stop = max(start, min(stop, len(layers)))
+        return range(start, stop)
 
     def _apply_model_trainability(self, model: nn.Module, freeze: bool = True) -> list[str]:
-        """Freeze backbone/neck groups from the stage train config and keep their BN layers in eval mode."""
+        """Freeze named model groups from the stage train config."""
         train = self.stage_cfg.get("train") or {}
         layers = getattr(model, "model", [])
         frozen: list[str] = []
-        for group, (start, end) in MODEL_GROUP_RANGES.items():
-            trainable = train_flag_enabled(train, group, default=True)
-            stop = len(layers) if end is None else end if end >= 0 else len(layers) + end
-            modules = layers[start:stop]
+        for group in MODEL_GROUP_RANGES:
+            indices = self._model_group_range(model, group)
+            if not indices:
+                continue
+            trainable = train_group_enabled(train, group, default=True)
             if not trainable:
                 frozen.append(group)
-            for module in modules:
+            for layer_idx in indices:
+                module = layers[layer_idx]
                 if not trainable:
                     module.eval()
                 if freeze:
@@ -552,6 +1031,11 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                     train, "scene_seg_head", default=False
                 )
                 trainable = bool(train.get("all")) or (default and trainable)
+            elif group == "pose_adapter":
+                runtime = self.stage_cfg.get("train_runtime") or {}
+                default = truthy(runtime.get("pose_adapter", False)) and "pose" in active_groups
+                trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=default)
+                trainable = bool(train.get("all")) or (default and trainable)
             else:
                 trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=group in active_groups)
             for name in names:
@@ -566,13 +1050,93 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                         p.requires_grad = bool(trainable)
         return frozen
 
+    def _apply_bn_policy(self, model: nn.Module, head: nn.Module, tasks: set[str]) -> list[str]:
+        """Lock BatchNorm/Norm stats by model group or head branch while allowing selected head BN to update."""
+        runtime = self.stage_cfg.get("train_runtime") or {}
+        train = self.stage_cfg.get("train") or {}
+        if truthy(runtime.get("freeze_trainable_bn", False)):
+            self._set_norm_training(model, train=False)
+            return ["all"]
+
+        locked: list[str] = []
+        layers = getattr(model, "model", [])
+        model_bn_policy = self._resolve_model_bn_policy(runtime)
+        for group, freeze_bn in model_bn_policy.items():
+            indices = self._model_group_range(model, group)
+            if not indices:
+                continue
+            self._set_norm_training(nn.Sequential(*(layers[i] for i in indices)), train=not freeze_bn)
+            if freeze_bn:
+                locked.append(group)
+
+        head_bn_cfg = runtime.get("freeze_head_bn")
+        if head_bn_cfg is None:
+            return locked
+
+        branch_policy = self._resolve_head_bn_policy(head_bn_cfg, tasks)
+        for group, freeze_bn in branch_policy.items():
+            modules = self._head_branch_modules(head, group, train)
+            if not modules:
+                continue
+            for module in modules:
+                self._set_norm_training(module, train=not freeze_bn)
+            if freeze_bn:
+                locked.append(f"head:{group}")
+        return locked
+
     @staticmethod
-    def _freeze_trainable_norm_stats(model: nn.Module) -> None:
-        """Keep normalization statistics fixed while allowing affine weights to train."""
-        norm_types = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
-        for module in model.modules():
-            if isinstance(module, norm_types):
-                module.eval()
+    def _set_norm_training(module: nn.Module, train: bool) -> None:
+        """Set only Norm layers to train/eval, leaving affine requires_grad untouched."""
+        for submodule in module.modules():
+            if isinstance(submodule, NORM_TYPES):
+                submodule.train(mode=train)
+
+    def _resolve_model_bn_policy(self, runtime: dict[str, Any]) -> dict[str, bool]:
+        """Resolve model-group BN locks for backbone, det neck, and pose neck."""
+        groups = set(MODEL_GROUP_RANGES)
+        value = runtime.get("freeze_model_bn")
+        if isinstance(value, dict):
+            policy: dict[str, bool] = {}
+            for key, freeze_bn in value.items():
+                name = str(key).strip().lower()
+                if name == "neck":
+                    policy["det_neck"] = truthy(freeze_bn)
+                    policy["pose_neck"] = truthy(freeze_bn)
+                elif name in groups:
+                    policy[name] = truthy(freeze_bn)
+            return policy
+        if value is not None:
+            freeze_all = truthy(value)
+            return {group: freeze_all for group in groups}
+        if truthy(runtime.get("freeze_backbone_neck_bn", False)):
+            return {group: True for group in groups}
+        return {}
+
+    def _resolve_head_bn_policy(self, value: Any, tasks: set[str]) -> dict[str, bool]:
+        """Resolve freeze_head_bn config to branch -> freeze_bn."""
+        groups = set(BRANCH_MODULES)
+        if isinstance(value, dict):
+            policy: dict[str, bool] = {}
+            for key, freeze_bn in value.items():
+                name = HEAD_BN_ALIASES.get(str(key).strip().lower(), str(key).strip().lower())
+                if name in groups:
+                    policy[name] = truthy(freeze_bn)
+            return policy
+        if isinstance(value, str) and value.strip().lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+            names = {HEAD_BN_ALIASES.get(x.strip().lower(), x.strip().lower()) for x in value.split(",") if x.strip()}
+            return {group: group in names for group in groups}
+        freeze_all = truthy(value)
+        return {group: freeze_all for group in groups}
+
+    @staticmethod
+    def _head_branch_modules(head: nn.Module, group: str, train: dict[str, Any]) -> list[nn.Module]:
+        """Return modules that belong to a logical head branch."""
+        names = BRANCH_MODULES.get(group, ())
+        if group == "p2_dense":
+            names = names if train_flag_enabled(train, "mask_head", default=False) or train_flag_enabled(
+                train, "scene_seg_head", default=False
+            ) else ()
+        return [module for name in names if (module := getattr(head, name, None)) is not None]
 
     def _setup_train(self):
         super()._setup_train()
@@ -592,6 +1156,92 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         LOGGER.info(f"Stage optimizer trainable parameters: {trainable:,}")
         return optimizer
 
+    def _optimizer_metrics(self) -> dict[str, float]:
+        groups = getattr(getattr(self, "optimizer", None), "param_groups", None) or []
+        prodigy = next((group for group in groups if "d" in group), None)
+        if prodigy is None:
+            return {}
+        lr = max(float(group.get("lr", 0.0)) for group in groups)
+        d = float(prodigy.get("d", 0.0))
+        metrics = {
+            "prodigy/d": d,
+            "prodigy/effective_lr": d * lr,
+            "prodigy/k": float(prodigy.get("k", 0.0)),
+        }
+        if "d_max" in prodigy:
+            metrics["prodigy/d_max"] = float(prodigy["d_max"])
+        return metrics
+
+    @staticmethod
+    def _pose_fitness_metric_name(pose_fitness: str) -> str | None:
+        """Map a runtime pose_fitness mode to the corresponding MPJPE metric stem."""
+        key = pose_fitness.strip().lower()
+        aliases = {
+            "mpjpe": "mpjpe",
+            "mpjpe_raw": "mpjpe",
+            "raw_mpjpe": "mpjpe",
+            "mpjpe_input": "mpjpe_input",
+            "input_mpjpe": "mpjpe_input",
+            "input_px": "mpjpe_input",
+            "mpjpe_box_h_norm": "mpjpe_box_h_norm",
+            "box_h_norm": "mpjpe_box_h_norm",
+            "box_norm": "mpjpe_box_h_norm",
+        }
+        return aliases.get(key)
+
+    @staticmethod
+    def _pose_metric_value(metrics: dict[str, Any], prefix: str, metric_name: str, stat: str) -> float | None:
+        suffix = "_px" if metric_name in {"mpjpe", "mpjpe_input"} else ""
+        key = f"{prefix}/{metric_name}_{stat}{suffix}"
+        value = metrics.get(key)
+        return None if value is None else float(value)
+
+    def _pose_mpjpe_fitness(self, metrics: dict[str, Any], runtime: dict[str, Any], pose_fitness: str) -> float | None:
+        """Return negative MPJPE fitness using optional source-aware metric selection."""
+        metric_name = self._pose_fitness_metric_name(pose_fitness)
+        if metric_name is None:
+            return None
+        p90_weight = float(runtime.get("pose_fitness_p90_weight", 0.25))
+        source_weights = pose_fitness_sources(runtime.get("pose_fitness_sources"))
+        if not source_weights:
+            mean = self._pose_metric_value(metrics, "metrics/pose2d", metric_name, "mean")
+            p90 = self._pose_metric_value(metrics, "metrics/pose2d", metric_name, "p90")
+            if mean is None or p90 is None:
+                return None
+            error = mean + p90_weight * p90
+        else:
+            total_error = 0.0
+            total_weight = 0.0
+            for source, weight in source_weights.items():
+                prefix = f"metrics/pose2d/source/{source}"
+                matched = float(metrics.get(f"{prefix}/matched", 0.0) or 0.0)
+                if matched <= 0:
+                    continue
+                mean = self._pose_metric_value(metrics, prefix, metric_name, "mean")
+                p90 = self._pose_metric_value(metrics, prefix, metric_name, "p90")
+                if mean is None or p90 is None:
+                    continue
+                total_error += float(weight) * (mean + p90_weight * p90)
+                total_weight += float(weight)
+            if total_weight <= 0:
+                return None
+            error = total_error / total_weight
+        metrics["metrics/pose2d/fitness_error"] = float(error)
+        return -float(error)
+
+    def _update_pose_best_fitness(self, fitness: float) -> None:
+        """Track best pose fitness separately from detector-oriented defaults."""
+        if not hasattr(self, "_stage_pose_best_fitness"):
+            self._stage_pose_best_fitness = None
+        if self._stage_pose_best_fitness is None or self._stage_pose_best_fitness < fitness:
+            self._stage_pose_best_fitness = fitness
+            self.best_fitness = fitness
+        else:
+            self.best_fitness = self._stage_pose_best_fitness
+
+    def save_metrics(self, metrics):
+        return super().save_metrics({**metrics, **self._optimizer_metrics()})
+
     def get_validator(self):
         self.loss_names = getattr(unwrap_model(self.model).model[-1], "loss_names", ("box_loss", "cls_loss", "dfl_loss"))
         return YOLO26PSStageValidator(
@@ -601,7 +1251,25 @@ class YOLO26PSStageTrainer(DetectionTrainer):
     def validate(self):
         if not self.args.val:
             return {}, 0.0
-        return super().validate()
+        metrics, fitness = super().validate()
+        stage_loss = self.stage_cfg.get("loss") or {}
+        pose_weight = float(stage_loss.get("pose2d", 0.0)) + float(stage_loss.get("pose_vis", 0.0))
+        runtime = self.stage_cfg.get("train_runtime") or {}
+        pose_fitness = str(runtime.get("pose_fitness", "")).strip().lower()
+        if pose_weight and pose_fitness:
+            pose_metric_fitness = self._pose_mpjpe_fitness(metrics, runtime, pose_fitness)
+            if pose_metric_fitness is None:
+                return metrics, fitness
+            fitness = pose_metric_fitness
+            self._update_pose_best_fitness(fitness)
+        elif pose_weight and not float(stage_loss.get("det", 0.0)):
+            pose2d_loss = metrics.get("val/pose2d_loss")
+            pose_vis_loss = metrics.get("val/pose_vis_loss", 0.0)
+            if pose2d_loss is None:
+                return metrics, fitness
+            fitness = -(float(pose2d_loss) + float(pose_vis_loss) * float(stage_loss.get("pose_vis", 0.0)))
+            self._update_pose_best_fitness(fitness)
+        return metrics, fitness
 
     def final_eval(self):
         if not self.args.val:
@@ -637,6 +1305,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-epoch", type=positive_int)
     parser.add_argument("--sampling")
     parser.add_argument("--sampling-weights", type=parse_sampling_weights, help="override sampler weights: name=weight,...")
+    for key in LOSS_KEYS:
+        parser.add_argument(f"--loss-{key.replace('_', '-')}", dest=f"loss_{key}", type=float)
     parser.add_argument("--class-aware-sampling", action="store_true", help="enable rare-class reweighting inside one source")
     parser.add_argument("--no-class-aware-sampling", action="store_true", help="disable rare-class reweighting")
     parser.add_argument("--class-aware-source", help="source name for class-aware reweighting")
@@ -653,6 +1323,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--small-object-crop-area", type=float)
     parser.add_argument("--small-object-crop-scale", type=float)
     parser.add_argument("--small-object-crop-min-keep", type=positive_int)
+    parser.add_argument("--hard-image-list", type=Path, help="file with image stems/paths to boost in the sampler")
+    parser.add_argument("--hard-image-boost", type=float)
     parser.add_argument("--optimizer")
     parser.add_argument("--lr0", type=float)
     parser.add_argument("--lrf", type=float)
@@ -678,6 +1350,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tal-high-gt-topk-one2one", type=positive_int)
     parser.add_argument("--tal-high-gt-topk2-one2one", type=positive_int)
     parser.add_argument("--tal-metric-chunk-gt", type=positive_int)
+    parser.add_argument("--pose-anchor-topk", type=int)
+    parser.add_argument("--pose-anchor-radius", type=float)
+    parser.add_argument("--pose-xy-loss", choices=("bbox", "grid", "pixel", "mpjpe"))
+    parser.add_argument("--pose-xy-beta", type=float)
+    parser.add_argument("--pose-mpjpe-hard-px", type=float)
+    parser.add_argument("--pose-mpjpe-hard-gain", type=float)
+    parser.add_argument("--pose-mpjpe-hard-power", type=float)
+    parser.add_argument("--pose-mpjpe-hard-max", type=float)
+    parser.add_argument("--pose-mpjpe-kpt-weights", help="comma/space separated per-keypoint MPJPE weights")
+    parser.add_argument("--pose-adapter", action="store_true", help="enable a pose-only residual feature adapter")
+    parser.add_argument("--no-pose-adapter", action="store_true", help="disable the pose-only residual feature adapter")
+    parser.add_argument("--pose-adapter-hidden-ratio", type=float)
+    parser.add_argument("--pose-adapter-scale", type=float)
     parser.add_argument("--det-class-mask-normalization", choices=("sqrt", "linear", "none", "off"))
     parser.add_argument("--det-partial-cls-positive-only", action="store_true")
     parser.add_argument("--no-det-partial-cls-positive-only", action="store_true")
@@ -686,6 +1371,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--det-area-loss-weight-max", type=float)
     parser.add_argument("--det-nwd-ratio", type=float)
     parser.add_argument("--det-nwd-constant", type=float)
+    parser.add_argument("--det-focal-gamma", type=float)
+    parser.add_argument("--det-focal-alpha", type=float)
     parser.add_argument("--cos-lr", action="store_true", help="force cosine LR scheduler")
     parser.add_argument("--no-cos-lr", action="store_true", help="force non-cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", help="force AMP on")
@@ -803,9 +1490,13 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("small_object_crop_area", "small_object_crop_area"),
         ("small_object_crop_scale", "small_object_crop_scale"),
         ("small_object_crop_min_keep", "small_object_crop_min_keep"),
+        ("hard_image_list", "hard_image_list"),
+        ("hard_image_boost", "hard_image_boost"),
         ("det_area_loss_weight_max", "det_area_loss_weight_max"),
         ("det_nwd_ratio", "det_nwd_ratio"),
         ("det_nwd_constant", "det_nwd_constant"),
+        ("det_focal_gamma", "det_focal_gamma"),
+        ("det_focal_alpha", "det_focal_alpha"),
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)
@@ -866,6 +1557,47 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         value = cli_value if cli_value is not None else defaults.get(key)
         if value is not None:
             overrides[key] = int(value)
+    pose_anchor_topk = args.pose_anchor_topk if args.pose_anchor_topk is not None else defaults.get("pose_anchor_topk")
+    if pose_anchor_topk is not None:
+        overrides["pose_anchor_topk"] = int(pose_anchor_topk)
+    pose_anchor_radius = args.pose_anchor_radius if args.pose_anchor_radius is not None else defaults.get("pose_anchor_radius")
+    if pose_anchor_radius is not None:
+        overrides["pose_anchor_radius"] = float(pose_anchor_radius)
+    pose_xy_loss = args.pose_xy_loss or defaults.get("pose_xy_loss")
+    if pose_xy_loss is not None:
+        overrides["pose_xy_loss"] = str(pose_xy_loss)
+    pose_xy_beta = args.pose_xy_beta if args.pose_xy_beta is not None else defaults.get("pose_xy_beta")
+    if pose_xy_beta is not None:
+        overrides["pose_xy_beta"] = float(pose_xy_beta)
+    for key, cli_key in (
+        ("pose_mpjpe_hard_px", "pose_mpjpe_hard_px"),
+        ("pose_mpjpe_hard_gain", "pose_mpjpe_hard_gain"),
+        ("pose_mpjpe_hard_power", "pose_mpjpe_hard_power"),
+        ("pose_mpjpe_hard_max", "pose_mpjpe_hard_max"),
+    ):
+        cli_value = getattr(args, cli_key)
+        value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = float(value)
+    pose_mpjpe_kpt_weights = args.pose_mpjpe_kpt_weights or defaults.get("pose_mpjpe_kpt_weights")
+    if pose_mpjpe_kpt_weights:
+        overrides["pose_mpjpe_kpt_weights"] = str(pose_mpjpe_kpt_weights)
+    if args.pose_adapter and args.no_pose_adapter:
+        raise ValueError("Use only one of --pose-adapter or --no-pose-adapter.")
+    if args.pose_adapter:
+        overrides["pose_adapter"] = True
+    elif args.no_pose_adapter:
+        overrides["pose_adapter"] = False
+    elif defaults.get("pose_adapter") is not None:
+        overrides["pose_adapter"] = bool(defaults.get("pose_adapter"))
+    for key, cli_key in (
+        ("pose_adapter_hidden_ratio", "pose_adapter_hidden_ratio"),
+        ("pose_adapter_scale", "pose_adapter_scale"),
+    ):
+        cli_value = getattr(args, cli_key)
+        value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = float(value)
     det_mask_norm = args.det_class_mask_normalization or defaults.get("det_class_mask_normalization")
     if det_mask_norm is not None:
         overrides["det_class_mask_normalization"] = str(det_mask_norm)
@@ -911,6 +1643,19 @@ def main() -> None:
     args = parse_args()
     plan = load_plan(args.plan)
     stage = stage_config(plan, args.stage)
+    if args.pose_adapter or args.no_pose_adapter:
+        stage = dict(stage)
+        runtime = dict(stage.get("train_runtime") or {})
+        runtime["pose_adapter"] = bool(args.pose_adapter)
+        stage["train_runtime"] = runtime
+    for key in ("pose_adapter_hidden_ratio", "pose_adapter_scale"):
+        value = getattr(args, key)
+        if value is not None:
+            stage = dict(stage)
+            runtime = dict(stage.get("train_runtime") or {})
+            runtime[key] = float(value)
+            stage["train_runtime"] = runtime
+    stage = apply_loss_overrides(stage, args)
     if args.data is None:
         data_yaml = stage.get("data_yaml")
         if data_yaml:
@@ -925,8 +1670,7 @@ def main() -> None:
         if args.weights:
             LOGGER.warning("--pretrain is ignored when --weights is provided; same-architecture checkpoint already loaded.")
         else:
-            LOGGER.info(f"Loading partial pretrained weights into {args.model}: {args.pretrain}")
-            model.load(args.pretrain)
+            load_stage_pretrain(model, args.pretrain)
     model.train(trainer=YOLO26PSStageTrainer, **build_overrides(args, plan, stage))
 
 

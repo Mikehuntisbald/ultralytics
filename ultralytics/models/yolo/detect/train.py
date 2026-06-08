@@ -118,6 +118,8 @@ class DetectionTrainer(BaseTrainer):
             small_object_source=getattr(self.args, "small_object_source", "objects365"),
             small_object_area=float(getattr(self.args, "small_object_area", 32.0**2)),
             small_object_boost=float(getattr(self.args, "small_object_boost", 1.0)),
+            hard_image_list=getattr(self.args, "hard_image_list", None),
+            hard_image_boost=float(getattr(self.args, "hard_image_boost", 1.0)),
         )
 
     def preprocess_batch(self, batch: dict) -> dict:

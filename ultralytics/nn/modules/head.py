@@ -426,6 +426,26 @@ class Segment26(Segment):
             self.proto.fuse()
 
 
+class PoseResidualAdapter(nn.Module):
+    """Residual per-scale feature adapter used only before the pose head."""
+
+    def __init__(self, channels: list[int] | tuple[int, ...], hidden_ratio: float = 0.5, scale: float = 1.0):
+        """Initialize zero-output residual blocks so the adapter starts as identity."""
+        super().__init__()
+        self.scale = float(scale)
+        self.blocks = nn.ModuleList()
+        for c in channels:
+            hidden = max(16, int(round(float(c) * float(hidden_ratio))))
+            block = nn.Sequential(Conv(c, hidden, 1), DWConv(hidden, hidden, 3), nn.Conv2d(hidden, c, 1))
+            constant_(block[-1].weight, 0.0)
+            constant_(block[-1].bias, 0.0)
+            self.blocks.append(block)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return adapted features without mutating the shared detection features."""
+        return [feat + self.scale * block(feat) for feat, block in zip(x, self.blocks)]
+
+
 class YOLO26PSDetect25D(Detect):
     """YOLO26 person-scene multi-task head.
 
@@ -443,17 +463,28 @@ class YOLO26PSDetect25D(Detect):
         fusion_channels: int = 192,
         scene_nc: int = 150,
         person_cls: int = 0,
+        pose_channels: int | None = None,
         reg_max=1,
         end2end=False,
         ch: tuple = (),
+        human_nc: int = 2,
     ):
         """Initialize detection, 2.5D pose, person mask, and scene segmentation branches."""
-        super().__init__(nc, reg_max, end2end, ch)
+        if len(ch) % 2 == 0 and len(ch) > 4:
+            det_ch, pose_ch = tuple(ch[: len(ch) // 2]), tuple(ch[len(ch) // 2 :])
+        else:
+            det_ch = pose_ch = tuple(ch)
+        super().__init__(nc, reg_max, end2end, det_ch)
+        self.det_feature_count = len(det_ch)
+        self.pose_feature_count = len(pose_ch)
         self.kpt_shape = list(kpt_shape)
         self.nk = self.kpt_shape[0] * self.kpt_shape[1]
         self.nm = nm
         self.scene_nc = scene_nc
         self.person_cls = nc + person_cls if person_cls < 0 else person_cls
+        self.face_cls = nc - 1
+        self.human_nc = int(human_nc)
+        self.human_global_classes = (self.person_cls, self.face_cls)
         self.fusion_channels = fusion_channels
         self.input_stride = 32
         self.output_stride = 4
@@ -469,38 +500,146 @@ class YOLO26PSDetect25D(Detect):
             "bone_loss",
             "person_mask_loss",
             "scene_seg_loss",
+            "human_box_loss",
+            "human_cls_loss",
+            "human_dfl_loss",
         )
 
-        c_pose = max(ch[0] // 4, self.nk)
+        self.human_cv2 = copy.deepcopy(self.cv2)
+        self.human_cv3 = self._clone_cls_head(self.cv3, self.human_nc)
+
+        c_pose = int(pose_channels) if pose_channels else max(pose_ch[0] // 4, self.nk)
+        c_pose = max(c_pose, self.nk)
+        self.pose_channels = c_pose
         self.cv4 = nn.ModuleList(
-            nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3), nn.Conv2d(c_pose, self.nk, 1)) for x in ch
+            nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3), nn.Conv2d(c_pose, self.nk, 1)) for x in pose_ch
         )
 
-        c_mask = max(ch[0] // 4, self.nm)
+        c_mask = max(det_ch[0] // 4, self.nm)
         self.cv5 = nn.ModuleList(
-            nn.Sequential(Conv(x, c_mask, 3), Conv(c_mask, c_mask, 3), nn.Conv2d(c_mask, self.nm, 1)) for x in ch
+            nn.Sequential(Conv(x, c_mask, 3), Conv(c_mask, c_mask, 3), nn.Conv2d(c_mask, self.nm, 1)) for x in det_ch
         )
 
-        self.p2_refine = nn.ModuleList(Conv(x, ch[0], 1) for x in ch[1:])
+        self.p2_refine = nn.ModuleList(Conv(x, det_ch[0], 1) for x in det_ch[1:])
         self.proto = nn.Sequential(
-            Conv(ch[0], fusion_channels, 3),
+            Conv(det_ch[0], fusion_channels, 3),
             Conv(fusion_channels, fusion_channels, 3),
             nn.Conv2d(fusion_channels, self.nm, 1),
         )
         self.scene_seg = nn.Sequential(
-            Conv(ch[0], fusion_channels, 3),
+            Conv(det_ch[0], fusion_channels, 3),
             Conv(fusion_channels, fusion_channels, 3),
             nn.Conv2d(fusion_channels, self.scene_nc, 1),
         )
 
         if end2end:
+            self.one2one_human_cv2 = copy.deepcopy(self.one2one_cv2)
+            self.one2one_human_cv3 = self._clone_cls_head(self.one2one_cv3, self.human_nc)
             self.one2one_cv4 = copy.deepcopy(self.cv4)
             self.one2one_cv5 = copy.deepcopy(self.cv5)
+
+    @staticmethod
+    def _clone_cls_head(cls_head: nn.ModuleList, nc: int) -> nn.ModuleList:
+        """Clone a YOLO classification tower and replace its final logits with ``nc`` classes."""
+        cloned = copy.deepcopy(cls_head)
+        for tower in cloned:
+            final = tower[-1]
+            if not isinstance(final, nn.Conv2d):
+                continue
+            tower[-1] = nn.Conv2d(
+                final.in_channels,
+                nc,
+                final.kernel_size,
+                final.stride,
+                final.padding,
+                final.dilation,
+                final.groups,
+                final.bias is not None,
+                final.padding_mode,
+            )
+        return cloned
+
+    def copy_human_head_from_det(self) -> None:
+        """Initialize the human-centric detector from the frozen full detector."""
+        self._copy_box_head(self.cv2, self.human_cv2)
+        self._copy_person_face_cls_head(self.cv3, self.human_cv3)
+        if self.end2end and getattr(self, "one2one_human_cv2", None) is not None:
+            self._copy_box_head(self.one2one_cv2, self.one2one_human_cv2)
+            self._copy_person_face_cls_head(self.one2one_cv3, self.one2one_human_cv3)
+
+    @staticmethod
+    def _copy_box_head(src: nn.ModuleList, dst: nn.ModuleList) -> None:
+        """Copy box tower weights when source and destination shapes match."""
+        for src_tower, dst_tower in zip(src, dst):
+            dst_tower.load_state_dict(src_tower.state_dict(), strict=True)
+
+    def _copy_person_face_cls_head(self, src: nn.ModuleList, dst: nn.ModuleList) -> None:
+        """Copy hidden cls towers and seed 2-class logits from global person/face rows."""
+        for src_tower, dst_tower in zip(src, dst):
+            src_state = src_tower.state_dict()
+            dst_state = dst_tower.state_dict()
+            for key, value in src_state.items():
+                if key not in dst_state or dst_state[key].shape != value.shape:
+                    continue
+                dst_state[key].copy_(value)
+            src_final = src_tower[-1]
+            dst_final = dst_tower[-1]
+            if not isinstance(src_final, nn.Conv2d) or not isinstance(dst_final, nn.Conv2d):
+                dst_tower.load_state_dict(dst_state, strict=False)
+                continue
+            dst_tower.load_state_dict(dst_state, strict=False)
+            classes = [int(c) for c in self.human_global_classes]
+            with torch.no_grad():
+                for out_i, src_i in enumerate(classes):
+                    if 0 <= src_i < src_final.weight.shape[0] and out_i < dst_final.weight.shape[0]:
+                        dst_final.weight[out_i].copy_(src_final.weight[src_i])
+                        if src_final.bias is not None and dst_final.bias is not None:
+                            dst_final.bias[out_i].copy_(src_final.bias[src_i])
+
+    def bias_init(self):
+        """Initialize full and human-centric detection biases."""
+        super().bias_init()
+        human_branches = []
+        if getattr(self, "human_cv2", None) is not None and getattr(self, "human_cv3", None) is not None:
+            human_branches.append((self.human_cv2, self.human_cv3))
+        if self.end2end and getattr(self, "one2one_human_cv2", None) is not None:
+            human_branches.append((self.one2one_human_cv2, self.one2one_human_cv3))
+        for box_head, cls_head in human_branches:
+            for i, (box_tower, cls_tower) in enumerate(zip(box_head, cls_head)):
+                box_tower[-1].bias.data[:] = 2.0
+                cls_tower[-1].bias.data[: self.human_nc] = math.log(
+                    5 / self.human_nc / (640 / self.stride[i]) ** 2
+                )
+
+    def enable_pose_adapter(self, hidden_ratio: float = 0.5, scale: float = 1.0) -> nn.Module:
+        """Attach a residual feature adapter used only by the pose head."""
+        if getattr(self, "pose_adapter", None) is not None:
+            self.pose_adapter_enabled = True
+            return self.pose_adapter
+        channels = []
+        for branch in self.cv4:
+            first = branch[0]
+            conv = getattr(first, "conv", None)
+            channels.append(int(conv.in_channels if conv is not None else self.pose_channels))
+        self.pose_adapter = PoseResidualAdapter(channels, hidden_ratio=hidden_ratio, scale=scale)
+        self.pose_adapter_enabled = True
+        return self.pose_adapter
+
+    def disable_pose_adapter(self) -> None:
+        """Disable the optional pose-only adapter without deleting its weights."""
+        self.pose_adapter_enabled = False
 
     @property
     def one2many(self):
         """Return one-to-many branch heads."""
-        return dict(box_head=self.cv2, cls_head=self.cv3, pose_head=self.cv4, mask_head=self.cv5)
+        return dict(
+            box_head=self.cv2,
+            cls_head=self.cv3,
+            human_box_head=getattr(self, "human_cv2", None),
+            human_cls_head=getattr(self, "human_cv3", None),
+            pose_head=self.cv4,
+            mask_head=self.cv5,
+        )
 
     @property
     def one2one(self):
@@ -508,6 +647,8 @@ class YOLO26PSDetect25D(Detect):
         return dict(
             box_head=self.one2one_cv2,
             cls_head=self.one2one_cv3,
+            human_box_head=getattr(self, "one2one_human_cv2", None),
+            human_cls_head=getattr(self, "one2one_human_cv3", None),
             pose_head=self.one2one_cv4,
             mask_head=self.one2one_cv5,
         )
@@ -522,20 +663,23 @@ class YOLO26PSDetect25D(Detect):
         return set(tasks) or {"det"}
 
     def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
-        """Set active task branches. Detection is always enabled."""
+        """Set active task branches for staged training/inference."""
         if tasks in (None, "all", True):
             self.active_tasks = {"det", "pose", "mask", "scene"}
         elif isinstance(tasks, str):
             self.active_tasks = {x.strip() for x in tasks.split(",") if x.strip()}
         else:
             self.active_tasks = set(tasks)
-        self.active_tasks.add("det")
 
     def _head_args_for_tasks(self, tasks: set[str], one2one: bool = False) -> dict[str, torch.nn.Module | None]:
         """Return branch heads for the currently active tasks."""
+        human_box_head = getattr(self, "one2one_human_cv2" if one2one else "human_cv2", None)
+        human_cls_head = getattr(self, "one2one_human_cv3" if one2one else "human_cv3", None)
         return dict(
             box_head=self.one2one_cv2 if one2one else self.cv2,
             cls_head=self.one2one_cv3 if one2one else self.cv3,
+            human_box_head=human_box_head if "human_det" in tasks else None,
+            human_cls_head=human_cls_head if "human_det" in tasks else None,
             pose_head=(self.one2one_cv4 if one2one else self.cv4) if "pose" in tasks else None,
             mask_head=(self.one2one_cv5 if one2one else self.cv5) if "mask" in tasks else None,
         )
@@ -545,19 +689,45 @@ class YOLO26PSDetect25D(Detect):
         x: list[torch.Tensor],
         box_head: torch.nn.Module,
         cls_head: torch.nn.Module,
+        human_box_head: torch.nn.Module | None = None,
+        human_cls_head: torch.nn.Module | None = None,
         pose_head: torch.nn.Module | None = None,
         mask_head: torch.nn.Module | None = None,
     ) -> dict[str, torch.Tensor]:
         """Concatenate raw detection, pose, and mask coefficient maps across P2-P5."""
-        preds = super().forward_head(x, box_head, cls_head)
-        bs = x[0].shape[0]
+        det_x, pose_x = self.split_features(x)
+        preds = super().forward_head(det_x, box_head, cls_head)
+        bs = det_x[0].shape[0]
+        if human_box_head is not None and human_cls_head is not None:
+            preds["human_boxes"] = torch.cat(
+                [human_box_head[i](det_x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], 2
+            )
+            preds["human_scores"] = torch.cat(
+                [human_cls_head[i](det_x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], 2
+            )
         if pose_head is not None:
-            preds["pose25d"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
+            preds["pose25d"] = torch.cat([pose_head[i](pose_x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
         if mask_head is not None:
             preds["mask_coefficient"] = torch.cat(
-                [mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+                [mask_head[i](det_x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
             )
         return preds
+
+    def split_features(self, x: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Split concatenated model features into detection and pose neck streams."""
+        det_n = int(getattr(self, "det_feature_count", self.nl))
+        pose_n = int(getattr(self, "pose_feature_count", self.nl))
+        if len(x) >= det_n + pose_n:
+            return list(x[:det_n]), list(x[det_n : det_n + pose_n])
+        return list(x[: self.nl]), list(x[: self.nl])
+
+    def pose_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return pose-head features, optionally adapted without touching detection heads."""
+        _, x = self.split_features(x)
+        adapter = getattr(self, "pose_adapter", None)
+        if adapter is None or not bool(getattr(self, "pose_adapter_enabled", False)):
+            return x
+        return adapter(x)
 
     def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | tuple:
         """Run the multi-task head and return raw training maps or deployment tensors."""
@@ -565,8 +735,9 @@ class YOLO26PSDetect25D(Detect):
         need_mask = "mask" in tasks
         need_scene = "scene" in tasks
         proto = scene_seg = None
+        det_x, _ = self.split_features(x)
         if need_mask or need_scene:
-            p2 = self._fuse_p2_features(x)
+            p2 = self._fuse_p2_features(det_x)
             if need_mask:
                 proto = self.proto(p2)
             if need_scene:
@@ -618,13 +789,19 @@ class YOLO26PSDetect25D(Detect):
         self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None, scene_seg: torch.Tensor | None, tasks: set[str]
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Decode and top-k gather all task outputs for deployment."""
-        boxes = self._get_decode_xyxy(preds).permute(0, 2, 1)
-        scores = preds["scores"].sigmoid().permute(0, 2, 1)
+        use_human_det = "human_det" in tasks and "det" not in tasks and "human_boxes" in preds and "human_scores" in preds
+        det_preds = {**preds, "boxes": preds["human_boxes"], "scores": preds["human_scores"]} if use_human_det else preds
+        boxes = self._get_decode_xyxy(det_preds).permute(0, 2, 1)
+        scores = det_preds["scores"].sigmoid().permute(0, 2, 1)
 
         score, cls, idx = self.get_topk_index(scores, self.max_det)
+        if use_human_det:
+            person_cls = boxes.new_tensor(float(self.person_cls))
+            face_cls = boxes.new_tensor(float(self.face_cls))
+            cls = torch.where(cls.long().eq(0), person_cls, face_cls)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
         det_out = torch.cat([boxes, score, cls], dim=-1)
-        if tasks == {"det"}:
+        if tasks in ({"det"}, {"human_det"}):
             return det_out
 
         pose25d = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.kpt_shape[0], self.kpt_shape[1]))
@@ -682,7 +859,7 @@ class YOLO26PSDetect25D(Detect):
 
     def fuse(self) -> None:
         """Remove one-to-many branches for fused end-to-end inference."""
-        self.cv2 = self.cv3 = self.cv4 = self.cv5 = None
+        self.cv2 = self.cv3 = self.human_cv2 = self.human_cv3 = self.cv4 = self.cv5 = None
 
 
 class SemanticSegment(nn.Module):

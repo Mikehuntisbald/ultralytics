@@ -189,6 +189,12 @@ CFG_FLOAT_KEYS = frozenset(
         "prodigy_d0",
         "prodigy_d_coef",
         "prodigy_growth_rate",
+        "pose_xy_beta",
+        "hard_image_boost",
+        "pose_mpjpe_hard_px",
+        "pose_mpjpe_hard_gain",
+        "pose_mpjpe_hard_power",
+        "pose_mpjpe_hard_max",
     }
 )
 CFG_FRACTION_KEYS = frozenset(

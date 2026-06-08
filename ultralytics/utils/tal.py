@@ -230,6 +230,79 @@ class TaskAlignedAssigner(nn.Module):
 
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
+    def assign_bboxes(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Assign anchors and boxes without creating per-class target score tensors."""
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
+
+        if self.n_max_boxes == 0:
+            empty_mask = torch.zeros_like(pd_scores[..., 0], dtype=torch.bool)
+            return torch.zeros_like(pd_bboxes), empty_mask, torch.zeros_like(pd_scores[..., 0], dtype=torch.long)
+
+        self._set_active_topk(mask_gt)
+        try:
+            if self._active_imagewise:
+                return self._assign_bboxes_imagewise(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+            return self._assign_bboxes(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if not self._active_imagewise and self.bs > 1:
+                    LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, retrying assignment image-wise on GPU")
+                    if torch.cuda.is_available() and pd_scores.is_cuda:
+                        torch.cuda.empty_cache()
+                    try:
+                        return self._assign_bboxes_imagewise(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+                    except RuntimeError as retry_e:
+                        if "out of memory" not in str(retry_e).lower():
+                            raise
+                LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner assignment, using CPU")
+                cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+                result = self._assign_bboxes(*cpu_tensors)
+                return tuple(t.to(device) for t in result)
+            raise
+
+    def _assign_bboxes_imagewise(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Run bbox-only assignment one image at a time to reduce peak memory."""
+        saved_bs, saved_n_max_boxes = self.bs, self.n_max_boxes
+        outputs = [[] for _ in range(3)]
+        na = pd_scores.shape[1]
+        try:
+            for i in range(saved_bs):
+                valid = mask_gt[i, :, 0].bool()
+                n_valid = int(valid.sum().item())
+                if n_valid == 0:
+                    outputs[0].append(torch.zeros((1, na, 4), device=pd_bboxes.device, dtype=pd_bboxes.dtype))
+                    outputs[1].append(torch.zeros((1, na), device=pd_scores.device, dtype=torch.bool))
+                    outputs[2].append(torch.zeros((1, na), device=pd_scores.device, dtype=torch.long))
+                    continue
+                self.bs = 1
+                self.n_max_boxes = n_valid
+                result = self._assign_bboxes(
+                    pd_scores[i : i + 1],
+                    pd_bboxes[i : i + 1],
+                    anc_points,
+                    gt_labels[i : i + 1, valid],
+                    gt_bboxes[i : i + 1, valid],
+                    torch.ones((1, n_valid, 1), dtype=mask_gt.dtype, device=mask_gt.device),
+                )
+                for out, value in zip(outputs, result):
+                    out.append(value)
+        finally:
+            self.bs, self.n_max_boxes = saved_bs, saved_n_max_boxes
+        return tuple(torch.cat(items, dim=0) for items in outputs)
+
+    def _assign_bboxes(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Compute bbox assignment tensors without class target scores."""
+        mask_pos, align_metric, overlaps = self.get_pos_mask(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
+        )
+        target_gt_idx, fg_mask, _ = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes, align_metric)
+        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_bboxes.device)[..., None]
+        flat_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes
+        target_bboxes = gt_bboxes.view(-1, gt_bboxes.shape[-1])[flat_gt_idx]
+        return target_bboxes, fg_mask.bool(), target_gt_idx
+
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
         """Get positive mask for each ground truth box.
 

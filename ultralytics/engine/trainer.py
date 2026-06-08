@@ -276,6 +276,20 @@ class BaseTrainer:
             world_size=self.world_size,
         )
 
+    @staticmethod
+    def _shutdown_dataloader(loader):
+        """Stop DataLoader workers before replacing a loader."""
+        if loader is None:
+            return
+        iterator = getattr(loader, "iterator", None)
+        try:
+            if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+                iterator._shutdown_workers()
+            elif hasattr(loader, "__del__"):
+                loader.__del__()
+        except Exception:
+            pass
+
     def _build_train_pipeline(self):
         """Build dataloaders, optimizer, and scheduler for current batch size."""
         batch_size = self.batch_size // max(self.world_size, 1)
@@ -484,6 +498,9 @@ class BaseTrainer:
                     )
                     batch = loss = preds = None
                     self.loss = self.loss_items = self.tloss = None
+                    self._shutdown_dataloader(getattr(self, "train_loader", None))
+                    self._shutdown_dataloader(getattr(self, "test_loader", None))
+                    self.train_loader = self.test_loader = None
                     self._clear_memory()
                     self._build_train_pipeline()  # rebuild dataloaders, optimizer, scheduler
                     self.scheduler.last_epoch = self.start_epoch - 1
@@ -888,11 +905,14 @@ class BaseTrainer:
                 for k in (
                     "imgsz",
                     "batch",
+                    "nbs",
                     "device",
                     "close_mosaic",
                     "augmentations",
                     "save_period",
                     "workers",
+                    "val_batch",
+                    "val_workers",
                     "cache",
                     "patience",
                     "time",
@@ -1090,7 +1110,7 @@ class BaseTrainer:
                 g_.extend([{"params": p1, **x, "lr": lr * 3}, {"params": p2, **x}])
             g = g_
         optimizer_cls = get_prodigy_optimizer() if name == "Prodigy" else getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))
-        optimizer = optimizer_cls(params=g)
+        optimizer = optimizer_cls(params=g, **optim_args) if name == "Prodigy" else optimizer_cls(params=g)
 
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "

@@ -50,7 +50,7 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
-UNIFIED_CACHE_VERSION = "1.0.8"
+UNIFIED_CACHE_VERSION = "1.0.9"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
 ADE20K_150_LABEL_MAPPING = {0: 255, **{i: i - 1 for i in range(1, 151)}}
@@ -412,13 +412,14 @@ class YOLODataset(BaseDataset):
         path_root = Path(self.data.get("path", ".")).resolve()
         stage_a = path_root.parent / "YOLO26PS_STAGE_A"
         split = "train" if self.split == "train" else "val"
-        cache_path = stage_a / "labels" / split / "crowdhuman.cache"
-        try:
-            cache = load_dataset_cache_file(cache_path)
-            assert cache.get("version") == DATASET_CACHE_VERSION
-        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
-            return
-        yield from cache.get("labels", [])
+        for name in ("crowdhuman", "wider_face"):
+            cache_path = stage_a / "labels" / split / f"{name}.cache"
+            try:
+                cache = load_dataset_cache_file(cache_path)
+                assert cache.get("version") == DATASET_CACHE_VERSION
+            except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+                continue
+            yield from cache.get("labels", [])
 
     def _unified_cache_path(self) -> Path:
         """Return the cache path for parsed unified labels."""
@@ -1041,11 +1042,11 @@ class YOLODataset(BaseDataset):
 
     @staticmethod
     def _dummy_segment_from_box(box: list[float]) -> np.ndarray:
-        """Return a zero-area polygon inside a bbox for non-mask instances."""
+        """Return a bbox polygon for non-mask instances."""
         cx, cy, bw, bh = box
         x1, y1 = cx - bw * 0.5, cy - bh * 0.5
         x2, y2 = cx + bw * 0.5, cy + bh * 0.5
-        return np.array([[x1, y1], [x2, y1], [x2, y1]], dtype=np.float32)
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list.

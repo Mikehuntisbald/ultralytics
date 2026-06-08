@@ -71,9 +71,17 @@ class InfiniteDataLoader(dataloader.DataLoader):
         return len(self.batch_sampler.sampler)
 
     def __iter__(self) -> Iterator:
-        """Create an iterator that yields indefinitely from the underlying iterator."""
+        """Create an iterator that yields one logical epoch from the underlying iterator."""
         for _ in range(len(self)):
-            yield next(self.iterator)
+            try:
+                item = next(self.iterator)
+            except StopIteration:
+                self.reset()
+                try:
+                    item = next(self.iterator)
+                except StopIteration:
+                    return
+            yield item
 
     def __del__(self):
         """Ensure that workers are properly terminated when the DataLoader is deleted."""
@@ -215,6 +223,43 @@ def _label_has_small_object(label: dict[str, Any] | None, area_threshold: float 
     return bool(np.any((bw * bh) <= float(area_threshold)))
 
 
+def _load_hard_image_keys(value: Any) -> set[str]:
+    """Load image path/stem keys for sampler hard-image boosting."""
+    if value is None:
+        return set()
+    if isinstance(value, (str, Path)):
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "off"}:
+            return set()
+        path = Path(text)
+        if path.exists() and path.is_file():
+            lines = path.read_text(encoding="utf-8").splitlines()
+        else:
+            lines = text.replace(",", "\n").splitlines()
+    else:
+        lines = [str(item) for item in value]
+
+    keys = set()
+    for line in lines:
+        item = line.strip()
+        if not item:
+            continue
+        path = Path(item)
+        keys.add(path.stem.lower())
+        keys.add(path.name.lower())
+        keys.add(str(path).replace("\\", "/").lower())
+    return keys
+
+
+def _is_hard_image(path: str, keys: set[str]) -> bool:
+    """Return whether an image path matches a hard-image key."""
+    if not keys:
+        return False
+    normalized = str(path).replace("\\", "/").lower()
+    p = Path(path)
+    return normalized in keys or p.name.lower() in keys or p.stem.lower() in keys
+
+
 def weighted_replacement_sampler(
     dataset: Dataset,
     weights: dict[str, float],
@@ -228,6 +273,8 @@ def weighted_replacement_sampler(
     small_object_source: str = "objects365",
     small_object_area: float = 32.0**2,
     small_object_boost: float = 1.0,
+    hard_image_list: Any = None,
+    hard_image_boost: float = 1.0,
 ) -> WeightedRandomSampler:
     """Create a weighted replacement sampler from cached source names or image path segments."""
     if samples_per_epoch <= 0:
@@ -243,6 +290,8 @@ def weighted_replacement_sampler(
     sources_per_image = []
     classes_per_image: list[list[int]] = []
     small_object_per_image: list[bool] = []
+    hard_image_keys = _load_hard_image_keys(hard_image_list)
+    hard_image_per_image: list[bool] = []
     class_counts: dict[int, int] = {}
     class_aware_source = _normalize_source_name(class_aware_source)
     small_object_source = _normalize_source_name(small_object_source)
@@ -263,6 +312,7 @@ def weighted_replacement_sampler(
         small_object_per_image.append(
             _label_has_small_object(label, area_threshold=small_object_area) if small_object_source in sources else False
         )
+        hard_image_per_image.append(_is_hard_image(path, hard_image_keys))
     sample_weights = []
     for sources in sources_per_image:
         weight = 0.0
@@ -328,6 +378,22 @@ def weighted_replacement_sampler(
                 f"area<={float(small_object_area):g}px^2, raw_boost={boost:g}, "
                 f"multiplier={min(effective):.3g}-{max(effective):.3g} mean={np.mean(effective):.3g}"
             )
+    if hard_image_keys and float(hard_image_boost) > 1.0:
+        boost = float(hard_image_boost)
+        raw_multipliers = [boost if is_hard else 1.0 for is_hard in hard_image_per_image]
+        mean_multiplier = float(np.mean(raw_multipliers)) if raw_multipliers else 1.0
+        mean_multiplier = mean_multiplier if mean_multiplier > 0.0 else 1.0
+        effective = []
+        for i, raw in enumerate(raw_multipliers):
+            multiplier = raw / mean_multiplier
+            sample_weights[i] *= multiplier
+            effective.append(multiplier)
+        hard_images = sum(bool(x) for x in hard_image_per_image)
+        LOGGER.info(
+            "Hard-image sampler: "
+            f"hard_images={hard_images}/{len(sample_weights)}, raw_boost={boost:g}, keys={len(hard_image_keys)}, "
+            f"multiplier={min(effective):.3g}-{max(effective):.3g} mean={np.mean(effective):.3g}"
+        )
     LOGGER.info(
         "Weighted replacement sampler: "
         + ", ".join(f"{source}={counts[source]} images, weight={weights[source]:g}" for source in weights)
@@ -533,6 +599,8 @@ def build_dataloader(
     small_object_source: str = "objects365",
     small_object_area: float = 32.0**2,
     small_object_boost: float = 1.0,
+    hard_image_list: Any = None,
+    hard_image_boost: float = 1.0,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -572,6 +640,8 @@ def build_dataloader(
             small_object_source=small_object_source,
             small_object_area=small_object_area,
             small_object_boost=small_object_boost,
+            hard_image_list=hard_image_list,
+            hard_image_boost=hard_image_boost,
         )
         shuffle = False
     else:
