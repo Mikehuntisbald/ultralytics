@@ -23,7 +23,7 @@ from ultralytics import YOLO
 from ultralytics.utils import ops
 
 from tools.eval_yolo26ps_pose2d import box_iou, valid_pose_instances
-from tools.visualize_yolo26ps_stage import prepare_predictions, run_inference, source_from_path
+from tools.visualize_yolo26ps_stage import active_tasks_for_source, prepare_predictions, run_inference, source_from_path
 
 
 DEFAULT_MANIFEST = Path(
@@ -274,6 +274,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     model = YOLO(str(args.weights))
     predictor = None
     if records:
+        head = model.model.model[-1]
+        if hasattr(head, "set_active_tasks"):
+            head.set_active_tasks(active_tasks_for_source(records[0]["source"], args, head))
+        head.max_det = args.max_det
         model.predict(
             records[0]["image"],
             imgsz=args.imgsz,
@@ -287,7 +291,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         predictor = model.predictor
         head = model.model.model[-1]
         if hasattr(head, "set_active_tasks"):
-            head.set_active_tasks({"pose"})
+            head.set_active_tasks(active_tasks_for_source(records[0]["source"], args, head))
         head.max_det = args.max_det
         model.model.eval()
 
@@ -333,6 +337,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         if image is None:
             bucket["failed_images"] += 1
             continue
+        head = model.model.model[-1]
+        if hasattr(head, "set_active_tasks"):
+            head.set_active_tasks(active_tasks_for_source(source, args, head))
         with torch.no_grad():
             deploy, ratio_pad, im = run_inference(model, predictor, image, args)
             raw = model.model(im)[1]

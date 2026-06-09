@@ -25,6 +25,7 @@ from ultralytics import YOLO
 from tools.eval_yolo26ps_pose2d import box_iou, valid_pose_instances
 from tools.visualize_yolo26ps_stage import (
     COCO17_SKELETON,
+    active_tasks_for_source,
     make_contact_sheet,
     prepare_predictions,
     put_label,
@@ -230,6 +231,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(args.weights))
+    head = model.model.model[-1]
+    if hasattr(head, "set_active_tasks"):
+        head.set_active_tasks(active_tasks_for_source("coco_wholebody", args, head))
+    head.max_det = args.max_det
     model.predict(
         records[0]["image"],
         imgsz=args.imgsz,
@@ -243,7 +248,7 @@ def main() -> None:
     predictor = model.predictor
     head = model.model.model[-1]
     if hasattr(head, "set_active_tasks"):
-        head.set_active_tasks({"pose"})
+        head.set_active_tasks(active_tasks_for_source("coco_wholebody", args, head))
     head.max_det = args.max_det
     model.model.eval()
 

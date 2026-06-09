@@ -109,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-vis", type=int, default=30, help="Maximum boxes drawn per image")
     parser.add_argument("--pose-conf", type=float, default=0.20, help="Minimum keypoint confidence for skeleton drawing")
     parser.add_argument(
+        "--face-branch",
+        choices=("det", "human_det"),
+        default="det",
+        help="Detector branch used for WIDER_FACE/face-only visualization",
+    )
+    parser.add_argument(
         "--z-display",
         choices=("raw", "norm"),
         default="raw",
@@ -310,6 +316,32 @@ def selected_classes_for_source(source: str) -> set[int] | None:
     return {PERSON_CLS}
 
 
+def human_det_available(head: Any) -> bool:
+    """Return whether this checkpoint has the human detector branch needed for human_det deploy."""
+    if head is None:
+        return False
+    if bool(getattr(head, "end2end", False)):
+        return getattr(head, "one2one_human_cv2", None) is not None and getattr(head, "one2one_human_cv3", None) is not None
+    return getattr(head, "human_cv2", None) is not None and getattr(head, "human_cv3", None) is not None
+
+
+def active_tasks_for_source(source: str, args: argparse.Namespace, head: Any | None = None) -> set[str]:
+    """Return head branches needed for source-aware deploy outputs."""
+    if source in POSE_SOURCES:
+        tasks = {"human_det" if human_det_available(head) else "det", "pose"}
+        if source in MASK_SOURCES:
+            tasks.add("mask")
+        return tasks
+    if source in FACE_BOX_SOURCES and args.face_branch == "human_det" and human_det_available(head):
+        # Include pose so the multi-task head returns the full deployment tuple;
+        # face-class predictions still come from the human detector branch.
+        return {"human_det", "pose"}
+    tasks = {"det"}
+    if source in MASK_SOURCES:
+        tasks.add("mask")
+    return tasks
+
+
 def run_inference(
     model: YOLO,
     predictor: Any,
@@ -485,6 +517,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(args.weights))
+    head = model.model.model[-1]
+    if hasattr(head, "set_active_tasks"):
+        head.set_active_tasks(active_tasks_for_source(samples[0]["source"], args, head))
+    head.max_det = args.max_det
     model.predict(
         samples[0]["image"],
         imgsz=args.imgsz,
@@ -497,8 +533,6 @@ def main() -> None:
     )
     predictor = model.predictor
     head = model.model.model[-1]
-    if hasattr(head, "set_active_tasks"):
-        head.set_active_tasks({"det", "pose", "mask"})
     head.max_det = args.max_det
     model.model.eval()
     names = model.model.names
@@ -523,6 +557,8 @@ def main() -> None:
         if image is None:
             summary["images"].append({"source": source, "image": image_path, "error": "cv2.imread failed"})
             continue
+        if hasattr(head, "set_active_tasks"):
+            head.set_active_tasks(active_tasks_for_source(source, args, head))
         deploy, ratio_pad, im = run_inference(model, predictor, image, args)
         preds = prepare_predictions(deploy, im, image.shape[:2], ratio_pad, source, args)
         vis, detections = draw_predictions(image, preds, source, names, args, image_path)

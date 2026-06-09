@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from ultralytics import YOLO
 
-from tools.visualize_yolo26ps_stage import prepare_predictions, run_inference, source_from_path
+from tools.visualize_yolo26ps_stage import active_tasks_for_source, prepare_predictions, run_inference, source_from_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,6 +100,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     records = load_records(args)
     model = YOLO(str(args.weights))
     if records:
+        head = model.model.model[-1]
+        if hasattr(head, "set_active_tasks"):
+            head.set_active_tasks(active_tasks_for_source(args.source, args, head))
+        head.max_det = args.max_det
         model.predict(
             records[0]["image"],
             imgsz=args.imgsz,
@@ -113,7 +117,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         predictor = model.predictor
         head = model.model.model[-1]
         if hasattr(head, "set_active_tasks"):
-            head.set_active_tasks({"pose"})
+            head.set_active_tasks(active_tasks_for_source(args.source, args, head))
         head.max_det = args.max_det
         model.model.eval()
     mpjpes: list[float] = []
