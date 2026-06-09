@@ -1553,44 +1553,58 @@ class YOLO26PS25DLoss:
         anchors = anchor_points.to(instance_bboxes.device) * stride_tensor.to(instance_bboxes.device)
         radius = float(self.pose_anchor_radius)
         topk = min(topk, num_anchors)
-        local_instance_ids = torch.zeros_like(batch_idx)
-        for b in range(bs):
-            image_ids = torch.where(batch_idx == b)[0]
-            if image_ids.numel():
-                local_instance_ids[image_ids] = torch.arange(image_ids.numel(), device=self.device, dtype=batch_idx.dtype)
+        offsets = torch.zeros(bs + 1, dtype=batch_idx.dtype, device=self.device)
+        offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+        offsets = offsets.cumsum(0)
+        local_instance_ids = torch.arange(batch_idx.numel(), device=self.device, dtype=batch_idx.dtype) - offsets[batch_idx]
+        box_valid = (
+            (instance_bboxes[:, 2] > instance_bboxes[:, 0]) & (instance_bboxes[:, 3] > instance_bboxes[:, 1])
+            if instance_bboxes.numel()
+            else torch.zeros_like(batch_idx, dtype=torch.bool)
+        )
 
         for b in range(bs):
             global_ids = torch.where(
                 (batch_idx == b)
                 & has_body2d
                 & (classes == self.person_cls if self.person_cls >= 0 else torch.ones_like(classes, dtype=torch.bool))
+                & box_valid
             )[0]
             if not global_ids.numel():
                 continue
-            for global_i in global_ids:
-                global_i = int(global_i)
-                if global_i >= len(instance_bboxes):
-                    continue
-                local_i = int(local_instance_ids[global_i])
-                x1, y1, x2, y2 = instance_bboxes[global_i]
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                gc = torch.stack(((x1 + x2) * 0.5, (y1 + y2) * 0.5))
-                gwh = torch.stack(((x2 - x1).clamp(min=1.0), (y2 - y1).clamp(min=1.0)))
-                delta = (anchors - gc) / gwh
-                inside = (delta.abs() <= 0.5).all(-1)
-                if radius > 0:
-                    inside &= delta.norm(dim=-1) <= radius
-                if not inside.any():
-                    continue
-                dist = delta.norm(dim=-1)
-                dist = torch.where(inside, dist, torch.full_like(dist, float("inf")))
-                _, selected = torch.topk(-dist, k=min(topk, int(inside.sum().item())), largest=True)
-                write = selected[(~out_mask[b, selected]) | (out_idx[b, selected] == local_i)]
-                if not write.numel():
-                    continue
-                out_mask[b, write] = True
-                out_idx[b, write] = local_i
+            boxes = instance_bboxes[global_ids]
+            centers = (boxes[:, 0:2] + boxes[:, 2:4]) * 0.5
+            wh = (boxes[:, 2:4] - boxes[:, 0:2]).clamp(min=1.0)
+            delta = (anchors.unsqueeze(0) - centers.unsqueeze(1)) / wh.unsqueeze(1)
+            dist = delta.norm(dim=-1)
+            inside = (delta.abs() <= 0.5).all(-1)
+            if radius > 0:
+                inside &= dist <= radius
+            dist = torch.where(inside, dist, torch.full_like(dist, float("inf")))
+            selected_dist, selected = torch.topk(-dist, k=topk, dim=1, largest=True)
+            keep = torch.isfinite(selected_dist)
+            if not keep.any():
+                continue
+            local_ids = local_instance_ids[global_ids].view(-1, 1).expand_as(selected)
+            priority = torch.arange(global_ids.numel(), device=self.device, dtype=batch_idx.dtype).view(-1, 1).expand_as(
+                selected
+            )
+            cand_anchor = selected[keep]
+            cand_local = local_ids[keep]
+            cand_priority = priority[keep]
+            base_mask = out_mask[b]
+            base_idx = out_idx[b]
+            writeable = (~base_mask[cand_anchor]) | (base_idx[cand_anchor] == cand_local)
+            cand_anchor = cand_anchor[writeable]
+            cand_local = cand_local[writeable]
+            cand_priority = cand_priority[writeable]
+            if not cand_anchor.numel():
+                continue
+            best_priority = torch.full((num_anchors,), global_ids.numel(), device=self.device, dtype=batch_idx.dtype)
+            best_priority.scatter_reduce_(0, cand_anchor, cand_priority, reduce="amin", include_self=True)
+            winner = cand_priority == best_priority[cand_anchor]
+            out_mask[b, cand_anchor[winner]] = True
+            out_idx[b, cand_anchor[winner]] = cand_local[winner]
         return out_mask, out_idx
 
     def _target_boxes_by_instance(

@@ -402,7 +402,7 @@ stages:
       warmup_bias_lr: 0.0
       prodigy_d0: 0.000001
       prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.02
+      prodigy_growth_rate: 1.01
       prodigy_slice_p: 11
       prodigy_decouple: true
       prodigy_use_bias_correction: false
@@ -411,7 +411,7 @@ stages:
       freeze_model_bn:
         backbone: true
         det_neck: true
-        pose_neck: true
+        pose_neck: false
       freeze_head_bn:
         det: true
         pose: false
@@ -428,22 +428,25 @@ stages:
       tal_metric_chunk_gt: 256
       pose_anchor_topk: 16
       pose_anchor_radius: 0.5
-      pose_xy_loss: pixel
-      pose_xy_beta: 0.05
+      pose_xy_loss: oks
+      pose_oks_conf_weight: true
+      pose_oks_max_px: 160.0
+      pose_oks_max_box_frac: 0.75
+      pose_oks_loss_clip: 1.0
       scheduler: constant
       cos_lr: false
       ema: true
       amp: true
     train:
       backbone: false
-      det_neck: true
+      det_neck: false
       pose_neck: true
-      det_head: true
+      det_head: false
       body25d_head: true
       mask_head: false
       scene_seg_head: false
     loss:
-      det: 1.0
+      det: 0.0
       pose2d: 1.0
       pose_z: 0.0
       pose_vis: 0.3
