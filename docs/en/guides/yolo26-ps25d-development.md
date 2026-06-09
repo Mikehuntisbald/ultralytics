@@ -638,34 +638,82 @@ There is also an optional `PoseResidualAdapter`. It is a zero-initialized residu
 head, and it is disabled unless `train_runtime.pose_adapter: true` or `--pose-adapter` is set. The active plan relies on
 the parallel pose neck, not the optional adapter.
 
+Implementation map:
+
+- `ultralytics/nn/modules/head.py`: `YOLO26PSDetect25D.split_features()` separates detection-neck and pose-neck features
+  before the heads run.
+- `ultralytics/nn/tasks.py`: optional `parallel_neck_inference` runs layers 11-28 and 29-46 on separate CUDA streams
+  during inference only.
+- `tools/train_yolo26ps_stage.py`: `train.det_neck` and `train.pose_neck` are separate trainability controls. Avoid
+  using the old ambiguous `train_layers: neck` style for this model.
+
 ### Stage Task Gating And Freezing
 
 `active_tasks` is now a real stage-control signal. The head no longer forcibly adds `det` to every stage, so the stage
 trainer can freeze the detection branch by default when `det` is not active. Raw detector maps are still produced because
-pose assignment and pose validation need boxes/scores as the proposal source; in a pose-only run they are frozen
-assignment inputs, not an actively trained detector objective. If a stage sets:
+pose assignment and pose validation need boxes/scores as the proposal source; in a pose-only run they are frozen proposal
+inputs, not an actively trained detector objective. For pose stages, the stage trainer auto-adds `human_det` when `pose`
+is requested so pose can use the human-centric person/face detector instead of the full Objects365 detector.
+
+Current explicit form:
 
 ```yaml
 train_runtime:
-  active_tasks: [pose]
+  active_tasks: [human_det, pose]
 loss:
   det: 0.0
+  human_det: 0.0
 ```
 
-then detector losses are off and the detection head stays frozen by the stage trainability rules. Keep `active_tasks`,
-`train.det_head`, and `loss.det` consistent: `loss.det` is the loss gate, while `active_tasks` and `train.det_head`
-control branch execution intent and trainability.
+This runs human detection for proposals, but keeps both full-det and human-det losses off. Keep `active_tasks`,
+`train.det_head`, `train.human_det_head`, `loss.det`, and `loss.human_det` consistent: loss weights gate gradients from
+that loss, while the `train.*_head` flags decide whether branch parameters are allowed to update.
 
 The stage trainer applies three independent controls:
 
 - model-layer trainability: `train.backbone`, `train.det_neck`, and `train.pose_neck`
-- head-branch trainability: `det_head`, `body25d_head`, `mask_head`, `scene_seg_head`, and optional `pose_adapter`
+- head-branch trainability: `det_head`, `human_det_head`, `body25d_head`, `mask_head`, `scene_seg_head`, and optional
+  `pose_adapter`
 - BatchNorm locks: `freeze_trainable_bn`, `freeze_model_bn`, and per-branch `freeze_head_bn`
 
-Current pose-only Stage C uses `active_tasks: [pose]`, `loss.det: 0.0`, det branch frozen, detector BN locked, pose BN
-open, `train.det_neck: false`, and `train.pose_neck: true` so the parallel pose neck and pose head can train while the
-detector branch stays frozen. Stage B has also been run in both det-replay and pose-only forms; when reproducing a
-result, trust the saved `args.yaml` and the stage plan entry over the run name.
+Current pose-only Stage C uses `active_tasks: [human_det, pose]`, `loss.det: 0.0`, `loss.human_det: 0.0`, det and
+human-det branches frozen, detector BN locked, pose BN open, `train.det_neck: false`, and `train.pose_neck: true` so
+the parallel pose neck and pose head can train while the detector branches stay frozen. The human detector is still
+executed because pose assignment and inference are human-centric. Stage B has also been run in both det-replay and
+pose-only forms; when reproducing a result, trust the saved `args.yaml` and the stage plan entry over the run name.
+
+Code-level guardrails:
+
+- `active_tasks_from_stage()` in `tools/train_yolo26ps_stage.py` auto-adds `human_det` when `pose` is active.
+- `branch_trainable_from_stage()` keeps `human_det` frozen unless `train.human_det_head: true` or `loss.human_det > 0`.
+- `YOLO26PS25DLoss._get_pose_assignment()` in `ultralytics/utils/loss.py` prefers `human_boxes/human_scores` when the
+  human detector is present, then maps human-det labels back to global `person_cls` and `face_cls`.
+
+### Human Detector Branch Contract
+
+The human detector branch is a copied detector head attached to the detection neck. It is not a replacement for the
+original Objects365 detector. The original detector branch keeps the strong detection checkpoint weights for backbone,
+det neck, and full det head. The human detector branch is a task-specific person/face proposal head.
+
+For `A_person_only`:
+
+- `active_tasks: [human_det]`
+- full det branch remains frozen
+- `human_det_head` is trainable
+- human-det BN is allowed to train for that stage
+- labels use partial-label handling so face-only or person-only sources do not become full negatives for unannotated
+  classes
+
+For current pose-only Stage C:
+
+- `active_tasks: [human_det, pose]`
+- `loss.human_det: 0.0`
+- `train.human_det_head: false`
+- detector neck and detector BN stay frozen
+- pose neck and pose head train
+
+This is why `human_det` appears in a pose-only recipe: it supplies the proposal boxes that pose consumes, but it does not
+learn unless the stage explicitly enables the human-det loss or trainability.
 
 ### Dense Pose Anchors
 
@@ -678,9 +726,24 @@ pose_anchor_topk: 16
 pose_anchor_radius: 0.5
 ```
 
+Why these knobs exist:
+
+- `pose_anchor_topk` controls how many extra anchors around each person can receive keypoint gradients. It was added
+  because detector TAL positives are box/class positives, not a dense keypoint sampling policy. When the detector branch
+  is frozen, or when pose is the only active task, relying only on detector positives makes pose supervision sparse and
+  ties pose learning to detector assignment confidence instead of keypoint geometry.
+- `pose_anchor_radius` limits those extra anchors to a normalized neighborhood around the bbox center. Expanding to every
+  anchor in the box gives more gradients, but in crowded scenes it can supervise anchors near another person or near box
+  edges with the wrong skeleton. The radius keeps the extra pose positives local while still giving the pose neck/head
+  enough nearby cells to learn from.
+
 The extra anchors are selected inside the GT bbox, optionally restricted by normalized distance from the box center.
 They write a pose supervision mask and pose GT index only; they do not create detector positives and do not change the
 detector assignment used by the det loss.
+
+For the current Stage C recipe, `pose_anchor_topk: 16` and `pose_anchor_radius: 0.5` are intended as a middle ground:
+more stable pose gradients than detector-only TAL positives, but not a full-box expansion that can blend identities in
+crowded images.
 
 Operationally:
 
@@ -700,10 +763,61 @@ through configurable XY losses:
 | `grid` | SmoothL1 in feature-grid coordinates | debugging decode and stride behavior |
 | `pixel` | SmoothL1 on pixel error after multiplying by stride | robust direct pixel training |
 | `mpjpe` | mean visible-keypoint L2 distance in input pixels | direct alignment with mean/P90 pixel metrics |
+| `oks` / `yolo` / `keypoint` | YOLO-style OKS loss using COCO keypoint sigmas and bbox area | scale-aware pose AP training |
 
-The current pose-only Stage C uses `pose_xy_loss: mpjpe`, `pose_anchor_topk: 16`, and `pose_anchor_radius: 0.5`. Raw
-`pose2d_loss` is therefore no longer numerically comparable to the older OKS-style `KeypointLoss`; it is a pixel-scale
-objective.
+The current pose-only Stage C uses `pose_xy_loss: oks`, `pose_anchor_topk: 16`, and `pose_anchor_radius: 0.5`. Raw
+`pose2d_loss` is therefore an OKS-style objective and should be compared against pose AP, not interpreted directly as
+pixel error.
+
+The OKS path in this repo is implemented in `YOLO26PS25DLoss._pose_oks_loss()` and adds these robustness controls:
+
+```yaml
+pose_oks_conf_weight: true
+pose_oks_max_px: 160.0
+pose_oks_max_box_frac: 0.75
+pose_oks_loss_clip: 1.0
+```
+
+Those controls mean: use dataset visibility/confidence as a keypoint weight when available, ignore extreme visible
+keypoint errors above either an absolute-pixel or bbox-height threshold, and clip the per-keypoint OKS loss before
+averaging. If the robust mask would remove every keypoint for a sample, the implementation falls back to the normal
+visibility mask so the sample does not silently disappear.
+
+Why the direct pixel losses still exist:
+
+The target being judged in these runs is mean pixel error and P90 pixel error. The original YOLO-style keypoint loss is
+OKS-like: it computes grid-coordinate error, normalizes by bbox area and keypoint sigmas, then applies a bounded
+`1 - exp(-e)` form. That is useful for scale-invariant pose AP, but it is only a proxy for absolute pixel accuracy. A
+20 px wrist miss on a large person and a 20 px wrist miss on a small person are intentionally treated differently by the
+OKS-style objective, while the current acceptance target counts both as 20 px.
+
+`pose_xy_loss: mpjpe` trains the same unit that the current diagnostics report: visible-keypoint L2 distance in input
+pixels. The tradeoff is that it is more sensitive to label noise and large-person absolute errors, and its scalar value
+cannot be compared directly with older bbox-normalized or OKS-style `pose2d_loss` runs.
+
+For pose AP and 2.5D depth monitoring, use `tools/eval_yolo26ps_pose_ap_z.py` on saved checkpoints. It reports
+`pose_AP50`, `pose_AP75`, `pose_AP50_95`, and root-relative z absolute error summaries for 3DPW/AGORA-style records.
+
+Example sidecar check:
+
+```bash
+python tools/eval_yolo26ps_pose_ap_z.py \
+  --weights runs/detect/<run>/weights/last.pt \
+  --manifest /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI/manifests/stage_c_val_ochuman.jsonl \
+  --sources coco_wholebody,3dpw,agora \
+  --samples 120 \
+  --imgsz 576 768 \
+  --conf 0.001 \
+  --iou 0.70 \
+  --min-kpts 1 \
+  --max-det 300 \
+  --device 0 \
+  --out examples/<run>_pose_ap_z_sample120.json
+```
+
+Training `results.csv` still carries MPJPE mean/median/P90 and loss terms. Pose AP and root-relative z error are sidecar
+metrics unless they are explicitly wired into the validator later, so monitor them after saved checkpoints rather than
+expecting those columns in every epoch row.
 
 Optional MPJPE shaping exists but is disabled unless explicitly configured:
 
@@ -726,8 +840,9 @@ det_focal_alpha: 0.25
 ```
 
 `det_focal_gamma: 0.0` disables focal loss, which is the current default. In a pose-only run it is irrelevant because
-`active_tasks: [pose]` and `loss.det: 0.0` gate detector training off. In det-replay probes it can be enabled only as an
-explicit detection experiment; do not assume it is part of the current pose recipe.
+`active_tasks: [human_det, pose]`, `loss.det: 0.0`, and `loss.human_det: 0.0` gate detector training off. In det-replay
+or human-det training probes it can be enabled only as an explicit detection experiment; do not assume it is part of the
+current pose recipe.
 
 Partial-label detection safeguards are still important for any det-replay stage:
 
@@ -738,6 +853,10 @@ det_partial_cls_positive_only: true
 
 They prevent person-only or face-only sources from turning unannotated Objects365 classes into full negatives, and they
 avoid background BCE on single-class partial images when only assigned positives are trustworthy.
+
+For `A_person_only`, the source mix in the current plan is CrowdHuman, WIDER Face, 3DPW, AGORA, and OCHuman through
+`ultralytics/cfg/datasets/yolo26ps_stage_a_person_only_ochuman.yaml`. The helper
+`tools/build_yolo26ps_stage_a_person_only.py --include-ochuman` builds that manifest family.
 
 ### Pose Validation And Fitness
 
