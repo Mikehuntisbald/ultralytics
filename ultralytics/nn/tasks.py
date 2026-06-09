@@ -176,6 +176,9 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        if self._can_predict_yolo26ps_parallel_necks(x, profile, visualize, embed):
+            return self._predict_yolo26ps_parallel_necks(x)
+
         y, dt, embeddings = [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
@@ -193,6 +196,71 @@ class BaseModel(torch.nn.Module):
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
+
+    def _can_predict_yolo26ps_parallel_necks(self, x, profile=False, visualize=False, embed=None):
+        """Return True when YOLO26-PS25D inference can run det/pose necks on separate CUDA streams."""
+        if (
+            self.training
+            or profile
+            or visualize
+            or embed is not None
+            or not isinstance(x, torch.Tensor)
+            or not x.is_cuda
+            or torch.is_grad_enabled()
+            or not getattr(self, "parallel_neck_inference", False)
+            or len(self.model) < 48
+            or not isinstance(self.model[-1], YOLO26PSDetect25D)
+        ):
+            return False
+
+        head = self.model[-1]
+        return (
+            self.model[29].f == 10
+            and list(head.f) == [19, 22, 25, 28, 37, 40, 43, 46]
+            and int(getattr(head, "det_feature_count", 0)) == 4
+            and int(getattr(head, "pose_feature_count", 0)) == 4
+        )
+
+    def _parallel_neck_streams(self, device):
+        """Return cached CUDA streams used to enqueue independent det and pose neck branches."""
+        device_index = torch.device(device).index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        streams = getattr(self, "_yolo26ps_parallel_neck_streams", {})
+        if device_index not in streams:
+            with torch.cuda.device(device_index):
+                streams[device_index] = (torch.cuda.Stream(), torch.cuda.Stream())
+            self._yolo26ps_parallel_neck_streams = streams
+        return streams[device_index]
+
+    def _predict_layers_range(self, start, end, x, y):
+        """Run a contiguous model layer range, reading skip tensors from y and storing saved outputs."""
+        for m in self.model[start:end]:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y[m.i] = x if m.i in self.save else None
+        return x
+
+    def _predict_yolo26ps_parallel_necks(self, x):
+        """Inference fast path for YOLO26-PS25D with independent det and pose neck CUDA streams."""
+        y = [None] * len(self.model)
+        x = self._predict_layers_range(0, 11, x, y)
+
+        det_stream, pose_stream = self._parallel_neck_streams(x.device)
+        current_stream = torch.cuda.current_stream(x.device)
+        det_stream.wait_stream(current_stream)
+        pose_stream.wait_stream(current_stream)
+
+        with torch.cuda.stream(det_stream):
+            self._predict_layers_range(11, 29, x, y)
+        with torch.cuda.stream(pose_stream):
+            self._predict_layers_range(29, 47, x, y)
+
+        current_stream.wait_stream(det_stream)
+        current_stream.wait_stream(pose_stream)
+        head = self.model[-1]
+        return head([y[j] for j in head.f])
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""

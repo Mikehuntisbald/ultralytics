@@ -676,12 +676,13 @@ class YOLO26PSDetect25D(Detect):
         human_box_head = getattr(self, "one2one_human_cv2" if one2one else "human_cv2", None)
         human_cls_head = getattr(self, "one2one_human_cv3" if one2one else "human_cv3", None)
         return dict(
-            box_head=self.one2one_cv2 if one2one else self.cv2,
-            cls_head=self.one2one_cv3 if one2one else self.cv3,
+            box_head=(self.one2one_cv2 if one2one else self.cv2) if "det" in tasks else None,
+            cls_head=(self.one2one_cv3 if one2one else self.cv3) if "det" in tasks else None,
             human_box_head=human_box_head if "human_det" in tasks else None,
             human_cls_head=human_cls_head if "human_det" in tasks else None,
             pose_head=(self.one2one_cv4 if one2one else self.cv4) if "pose" in tasks else None,
             mask_head=(self.one2one_cv5 if one2one else self.cv5) if "mask" in tasks else None,
+            tasks=tasks,
         )
 
     def forward_head(
@@ -693,24 +694,105 @@ class YOLO26PSDetect25D(Detect):
         human_cls_head: torch.nn.Module | None = None,
         pose_head: torch.nn.Module | None = None,
         mask_head: torch.nn.Module | None = None,
+        tasks: set[str] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Concatenate raw detection, pose, and mask coefficient maps across P2-P5."""
         det_x, pose_x = self.split_features(x)
-        preds = super().forward_head(det_x, box_head, cls_head)
         bs = det_x[0].shape[0]
-        if human_box_head is not None and human_cls_head is not None:
+        tasks = set(tasks or ())
+        human_only = "human_det" in tasks and "det" not in tasks
+        preds = {}
+        if human_only and human_box_head is not None and human_cls_head is not None:
             preds["human_boxes"] = torch.cat(
                 [human_box_head[i](det_x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], 2
             )
             preds["human_scores"] = torch.cat(
                 [human_cls_head[i](det_x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], 2
             )
+            preds["boxes"], preds["scores"], preds["feats"] = preds["human_boxes"], preds["human_scores"], det_x
+        elif self._can_parallel_det_human_heads(det_x, box_head, cls_head, human_box_head, human_cls_head, tasks):
+            preds = self._forward_det_human_heads_parallel(det_x, box_head, cls_head, human_box_head, human_cls_head)
+        else:
+            preds = super().forward_head(det_x, box_head, cls_head)
+            if human_box_head is not None and human_cls_head is not None:
+                preds["human_boxes"] = torch.cat(
+                    [human_box_head[i](det_x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], 2
+                )
+                preds["human_scores"] = torch.cat(
+                    [human_cls_head[i](det_x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], 2
+                )
         if pose_head is not None:
             preds["pose25d"] = torch.cat([pose_head[i](pose_x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
         if mask_head is not None:
             preds["mask_coefficient"] = torch.cat(
                 [mask_head[i](det_x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
             )
+        return preds
+
+    def _can_parallel_det_human_heads(
+        self,
+        det_x: list[torch.Tensor],
+        box_head: torch.nn.Module | None,
+        cls_head: torch.nn.Module | None,
+        human_box_head: torch.nn.Module | None,
+        human_cls_head: torch.nn.Module | None,
+        tasks: set[str],
+    ) -> bool:
+        """Return True when full det and human det heads can be enqueued on separate CUDA streams."""
+        return (
+            "det" in tasks
+            and "human_det" in tasks
+            and box_head is not None
+            and cls_head is not None
+            and human_box_head is not None
+            and human_cls_head is not None
+            and not self.training
+            and det_x
+            and det_x[0].is_cuda
+            and not torch.is_grad_enabled()
+            and getattr(self, "parallel_det_human_head_inference", False)
+        )
+
+    def _det_human_head_streams(self, device: torch.device) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+        """Return cached CUDA streams used for independent det and human det head towers."""
+        device_index = torch.device(device).index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        streams = getattr(self, "_det_human_head_stream_cache", {})
+        if device_index not in streams:
+            with torch.cuda.device(device_index):
+                streams[device_index] = (torch.cuda.Stream(), torch.cuda.Stream())
+            self._det_human_head_stream_cache = streams
+        return streams[device_index]
+
+    def _forward_det_human_heads_parallel(
+        self,
+        det_x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+        human_box_head: torch.nn.Module,
+        human_cls_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Run full detector and human detector heads in parallel CUDA streams for inference."""
+        det_stream, human_stream = self._det_human_head_streams(det_x[0].device)
+        current_stream = torch.cuda.current_stream(det_x[0].device)
+        det_stream.wait_stream(current_stream)
+        human_stream.wait_stream(current_stream)
+        preds: dict[str, torch.Tensor] = {}
+        bs = det_x[0].shape[0]
+
+        with torch.cuda.stream(det_stream):
+            preds.update(super().forward_head(det_x, box_head, cls_head))
+        with torch.cuda.stream(human_stream):
+            preds["human_boxes"] = torch.cat(
+                [human_box_head[i](det_x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], 2
+            )
+            preds["human_scores"] = torch.cat(
+                [human_cls_head[i](det_x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], 2
+            )
+
+        current_stream.wait_stream(det_stream)
+        current_stream.wait_stream(human_stream)
         return preds
 
     def split_features(self, x: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
