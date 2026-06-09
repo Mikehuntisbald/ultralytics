@@ -1408,6 +1408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plots", action="store_true", help="force train/val plots on")
     parser.add_argument("--no-plots", action="store_true", help="force train/val plots off")
     parser.add_argument("--no-save", action="store_true", help="disable checkpoint saving")
+    parser.add_argument("--train-profile-steps", type=positive_int, help="log average train batch stage timings")
     parser.add_argument("--skip-crowdhuman-extract", action="store_true")
     return parser.parse_args()
 
@@ -1490,6 +1491,9 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         plots=plots,
         multi_scale=0.0 if stage.get("multi_scale") is False else float(defaults.get("multi_scale", 0.0)),
     )
+    train_profile_steps = args.train_profile_steps if args.train_profile_steps is not None else defaults.get("train_profile_steps")
+    if train_profile_steps is not None:
+        overrides["train_profile_steps"] = int(train_profile_steps)
     if args.class_aware_sampling and args.no_class_aware_sampling:
         raise ValueError("Use only one of --class-aware-sampling or --no-class-aware-sampling.")
     if args.small_object_sampling and args.no_small_object_sampling:

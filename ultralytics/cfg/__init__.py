@@ -249,6 +249,7 @@ CFG_INT_KEYS = frozenset(
         "tal_high_gt_topk2_one2one",
         "tal_metric_chunk_gt",
         "prodigy_slice_p",
+        "train_profile_steps",
         "save_period",
     }
 )

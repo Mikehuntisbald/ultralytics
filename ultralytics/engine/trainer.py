@@ -447,7 +447,16 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            profile_steps = int(getattr(self.args, "train_profile_steps", 0) or 0)
+            profile_totals = {"data": 0.0, "preprocess": 0.0, "forward_loss": 0.0, "backward": 0.0, "optimizer": 0.0}
+            profile_count = 0
+            profile_last = time.perf_counter()
             for i, batch in pbar:
+                profile_active = RANK in {-1, 0} and profile_steps > 0 and profile_count < profile_steps
+                if profile_active:
+                    profile_now = time.perf_counter()
+                    profile_totals["data"] += profile_now - profile_last
+                    profile_last = profile_now
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
                 ni = i + nb * epoch
@@ -471,6 +480,11 @@ class BaseTrainer:
                 try:
                     with autocast(self.amp):
                         batch = self.preprocess_batch(batch)
+                        if profile_active:
+                            torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                            profile_now = time.perf_counter()
+                            profile_totals["preprocess"] += profile_now - profile_last
+                            profile_last = profile_now
                         if self.args.compile:
                             # Decouple inference and loss calculations for improved compile performance
                             preds = self.model(batch["img"])
@@ -483,9 +497,19 @@ class BaseTrainer:
                         self.tloss = (
                             self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
                         )
+                        if profile_active:
+                            torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                            profile_now = time.perf_counter()
+                            profile_totals["forward_loss"] += profile_now - profile_last
+                            profile_last = profile_now
 
                     # Backward
                     self.scaler.scale(self.loss).backward()
+                    if profile_active:
+                        torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                        profile_now = time.perf_counter()
+                        profile_totals["backward"] += profile_now - profile_last
+                        profile_last = profile_now
                 except torch.cuda.OutOfMemoryError:
                     if epoch > self.start_epoch or self._oom_retries >= 3 or RANK != -1:
                         raise  # only auto-reduce during first epoch on single GPU, max 3 retries
@@ -511,6 +535,11 @@ class BaseTrainer:
                     break  # restart epoch loop with reduced batch size
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
+                    if profile_active:
+                        torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                        profile_now = time.perf_counter()
+                        profile_totals["optimizer"] += profile_now - profile_last
+                        profile_last = profile_now
                     last_opt_step = ni
                     criterion = getattr(unwrap_model(self.model), "criterion", None)
                     if hasattr(criterion, "update"):
@@ -525,6 +554,25 @@ class BaseTrainer:
                             self.stop = broadcast_list[0]
                         if self.stop:  # training time exceeded
                             break
+                if profile_active:
+                    profile_count += 1
+                    if profile_count == profile_steps:
+                        averages = {k: v / max(profile_count, 1) * 1000.0 for k, v in profile_totals.items()}
+                        total = sum(averages.values())
+                        LOGGER.info(
+                            "Train profile averages over %d batches: "
+                            "data %.1fms, preprocess %.1fms, forward+loss %.1fms, backward %.1fms, optimizer %.1fms, total %.1fms"
+                            % (
+                                profile_count,
+                                averages["data"],
+                                averages["preprocess"],
+                                averages["forward_loss"],
+                                averages["backward"],
+                                averages["optimizer"],
+                                total,
+                            )
+                        )
+                profile_last = time.perf_counter()
 
                 # Log
                 if RANK in {-1, 0}:
