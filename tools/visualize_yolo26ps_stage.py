@@ -408,7 +408,7 @@ def prepare_predictions(
         masks_orig = torch.zeros((boxes.shape[0], image_shape[0], image_shape[1]), dtype=torch.bool)
         person = classes == PERSON_CLS
         if person.any() and proto.shape[-1] > 0 and proto.shape[-2] > 0:
-            masks_in = ops.process_mask(proto[0], coef[person], boxes[person], im.shape[2:], upsample=True)
+            masks_in = ops.process_mask(proto[0], coef[person].float(), boxes[person], im.shape[2:], upsample=True)
             masks_scaled = ops.scale_masks(masks_in[:, None].float(), image_shape, ratio_pad=ratio_pad)[:, 0]
             masks_orig[person.detach().cpu()] = masks_scaled.detach().cpu() > 0.5
 
