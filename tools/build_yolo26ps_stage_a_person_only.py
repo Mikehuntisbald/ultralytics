@@ -34,6 +34,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-manifest-name", default="stage_a_person_only_train.jsonl")
     parser.add_argument("--val-manifest-name", default="stage_a_person_only_val.jsonl")
     parser.add_argument("--summary-name", default="stage_a_person_only_summary.json")
+    parser.add_argument("--include-ochuman", action="store_true", help="append OCHuman person-box records")
+    parser.add_argument(
+        "--ochuman-train-manifest",
+        type=Path,
+        default=STAGE_MULTI / "manifests" / "stage_c_train_ochuman.jsonl",
+        help="manifest containing OCHuman train records",
+    )
+    parser.add_argument(
+        "--ochuman-val-manifest",
+        type=Path,
+        default=STAGE_MULTI / "manifests" / "stage_c_val_ochuman.jsonl",
+        help="manifest containing OCHuman val records",
+    )
     return parser.parse_args()
 
 
@@ -62,6 +75,8 @@ def source_from_line(line: str) -> str:
         return "crowdhuman"
     if "wider_face" in text or "wider" in text:
         return "wider_face"
+    if "ochuman" in text:
+        return "ochuman"
     if "3dpw" in text:
         return "3dpw"
     if "agora" in text:
@@ -94,6 +109,12 @@ def stage_a_lines(stage_a: Path, split: str) -> list[str]:
 def pose_records(stage_multi: Path, split: str) -> list[dict[str, Any]]:
     records = read_jsonl(stage_multi / "manifests" / f"stage_c_{split}.jsonl")
     return [record for record in records if source_from_record(record) in {"3dpw", "agora"}]
+
+
+def ochuman_records(path: Path) -> list[dict[str, Any]]:
+    """Read OCHuman records from a mixed manifest."""
+    records = read_jsonl(path)
+    return [record for record in records if source_from_record(record) == "ochuman"]
 
 
 def dedupe_keep_order(lines: list[str]) -> list[str]:
@@ -134,6 +155,9 @@ def main() -> None:
     args = parse_args()
     train_records = pose_records(args.stage_multi, "train")
     val_records = pose_records(args.stage_multi, "val")
+    if args.include_ochuman:
+        train_records.extend(ochuman_records(args.ochuman_train_manifest))
+        val_records.extend(ochuman_records(args.ochuman_val_manifest))
     train_det = stage_a_lines(args.stage_a, "train")
     val_det = stage_a_lines(args.stage_a, "val")
 
@@ -160,7 +184,13 @@ def main() -> None:
         "dataset_yaml": str(args.out_yaml),
         "train_sources": counts(train_records, train_det),
         "val_sources": counts(val_records, val_det),
-        "target_sampling_weights": {"crowdhuman": 17.5, "wider_face": 50, "3dpw": 17.5, "agora": 25},
+        "target_sampling_weights": {
+            "crowdhuman": 15,
+            "wider_face": 50,
+            "3dpw": 10,
+            "agora": 17,
+            **({"ochuman": 8} if args.include_ochuman else {}),
+        },
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))

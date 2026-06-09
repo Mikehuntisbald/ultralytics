@@ -245,8 +245,8 @@ stages:
       class_aware_sampling: true
       class_aware_source: objects365
       class_aware_power: 0.5
-      class_aware_min_multiplier: 0.5
-      class_aware_max_multiplier: 8.0
+      class_aware_min_multiplier: 0.8
+      class_aware_max_multiplier: 3.0
       small_object_sampling: true
       small_object_source: objects365
       small_object_area: 1024.0
@@ -256,8 +256,8 @@ stages:
       small_object_crop_area: 1024.0
       small_object_crop_scale: 0.72
       small_object_crop_min_keep: 1
-      det_area_loss_weight: false
-      det_area_loss_weight_max: 2.0
+      det_area_loss_weight: true
+      det_area_loss_weight_max: 1.05
       scheduler: constant
       cos_lr: false
       ema: true
@@ -283,30 +283,31 @@ stages:
     epochs: 20
     samples_per_epoch: 120000
     val_samples: 3000
-    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_a_person_only.yaml
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_a_person_only_ochuman.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      crowdhuman: 17.5
+      crowdhuman: 15
       wider_face: 50
-      3dpw: 17.5
-      agora: 25
+      3dpw: 10
+      agora: 17
+      ochuman: 8
     train_runtime:
       active_tasks: [human_det]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 48
+      batch: 40
       val_batch: 32
       accumulate: 1
       workers: 20
       freeze: 0
       no_val: false
       sampling: weighted_random_with_replacement
-      optimizer: Prodigy
-      lr0: 1.0
-      lrf: 1.0
+      optimizer: AdamW
+      lr0: 0.0001
+      lrf: 0.2
       momentum: 0.9
       weight_decay: 0.0005
-      warmup_epochs: 0.0
+      warmup_epochs: 1.0
       warmup_bias_lr: 0.0
       prodigy_d0: 0.000001
       prodigy_d_coef: 1.0
@@ -330,15 +331,24 @@ stages:
       tal_topk_one2many: 10
       tal_topk_one2one: 7
       tal_topk2_one2one: 1
-      tal_high_gt_threshold: 900
+      tal_high_gt_threshold: 10
       tal_high_gt_topk_one2many: 8
       tal_high_gt_topk_one2one: 6
       tal_high_gt_topk2_one2one: 1
-      tal_metric_chunk_gt: 256
+      tal_metric_chunk_gt: 128
+      small_object_sampling: true
+      small_object_source: wider_face
+      small_object_area: 3600.0
+      small_object_boost: 2.0
+      small_object_crop: 0.3
+      small_object_crop_source: wider_face
+      small_object_crop_area: 3600.0
+      small_object_crop_scale: 0.72
+      small_object_crop_min_keep: 1
       det_class_mask_normalization: none
-      det_partial_cls_positive_only: true
-      det_area_loss_weight: false
-      det_area_loss_weight_max: 2.0
+      det_partial_cls_positive_only: false
+      det_area_loss_weight: true
+      det_area_loss_weight_max: 1.05
       scheduler: constant
       cos_lr: false
       ema: true
@@ -376,7 +386,7 @@ stages:
     sampling_weights:
       coco_wholebody: 100
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 48
@@ -456,7 +466,7 @@ stages:
       3dpw: 8
       agora: 45
     train_runtime:
-      active_tasks: [det, pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 20
@@ -533,7 +543,7 @@ stages:
       # crowdhuman: 2
       # wider_face: 6
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 12
@@ -575,7 +585,11 @@ stages:
       tal_metric_chunk_gt: 256
       pose_anchor_topk: 16
       pose_anchor_radius: 0.5
-      pose_xy_loss: mpjpe
+      pose_xy_loss: oks
+      pose_oks_conf_weight: true
+      pose_oks_max_px: 160.0
+      pose_oks_max_box_frac: 0.75
+      pose_oks_loss_clip: 1.0
       pose_fitness: mpjpe
       det_class_mask_normalization: none
       det_partial_cls_positive_only: true
@@ -605,7 +619,7 @@ stages:
       scale: [0.8, 1.2]
       rotate: [-10, 10]
       flip: 0.5
-  C_pose25d_poseonly:
+  C_pose25d_poseonly: # This is default
     epochs: 30
     samples_per_epoch: 100000
     val_samples: 2000
@@ -614,13 +628,13 @@ stages:
     sampling_weights:
       coco_wholebody: 10
       3dpw: 30
-      agora: 50
-      ochuman: 10
+      agora: 60
+      # ochuman: 10
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 48
+      batch: 64
       val_batch: 32
       accumulate: 1
       workers: 20
@@ -633,7 +647,7 @@ stages:
       warmup_bias_lr: 0.0
       prodigy_d0: 0.00000862714
       prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.02
+      prodigy_growth_rate: 1.01
       prodigy_slice_p: 11
       prodigy_decouple: true
       prodigy_use_bias_correction: false
@@ -659,7 +673,11 @@ stages:
       tal_metric_chunk_gt: 256
       pose_anchor_topk: 16
       pose_anchor_radius: 0.5
-      pose_xy_loss: mpjpe
+      pose_xy_loss: oks
+      pose_oks_conf_weight: true
+      pose_oks_max_px: 160.0
+      pose_oks_max_box_frac: 0.75
+      pose_oks_loss_clip: 1.0
       pose_fitness: mpjpe
       det_class_mask_normalization: none
       det_partial_cls_positive_only: true
@@ -701,7 +719,7 @@ stages:
       3dpw: 2
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 48
@@ -738,7 +756,11 @@ stages:
       tal_topk2_one2one: 1
       pose_anchor_topk: 24
       pose_anchor_radius: 0.65
-      pose_xy_loss: pixel
+      pose_xy_loss: oks
+      pose_oks_conf_weight: true
+      pose_oks_max_px: 160.0
+      pose_oks_max_box_frac: 0.75
+      pose_oks_loss_clip: 1.0
       pose_xy_beta: 0.05
       pose_fitness: mpjpe
       scheduler: constant
@@ -779,7 +801,7 @@ stages:
       3dpw: 15
       ochuman: 0
     train_runtime:
-      active_tasks: [det, pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -859,7 +881,7 @@ stages:
       3dpw: 20
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -937,7 +959,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1015,7 +1037,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1097,7 +1119,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1179,7 +1201,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1261,7 +1283,7 @@ stages:
       3dpw: 20
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1344,7 +1366,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1426,7 +1448,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1507,7 +1529,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [pose]
+      active_tasks: [human_det, pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -1584,22 +1606,16 @@ stages:
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      coco_person_mask: 50
-      ochuman: 18
-      coco_wholebody: 0
-      3dpw: 10
-      agora: 11
-      objects365: 5
-      crowdhuman: 3
-      wider_face: 3
+      coco_person_mask: 75
+      ochuman: 25
     train_runtime:
-      active_tasks: [det, mask]
+      active_tasks: [mask]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 28
+      batch: 42
       val_batch: 20
       accumulate: 4
-      workers: 20
+      workers: 10
       val_workers: 4
       optimizer: Prodigy
       lr0: 1.0
@@ -1610,7 +1626,7 @@ stages:
       warmup_bias_lr: 0.0
       prodigy_d0: 0.000001
       prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.02
+      prodigy_growth_rate: 1.01
       prodigy_slice_p: 11
       prodigy_decouple: true
       prodigy_use_bias_correction: false
@@ -1622,10 +1638,11 @@ stages:
         pose_neck: true
       freeze_head_bn:
         det: true
+        human_det: true
         pose: true
         mask: false
         scene: true
-        p2_dense: true
+        p2_dense: false
       tal_topk_one2many: 7
       tal_topk_one2one: 5
       tal_topk2_one2one: 1
@@ -1822,25 +1839,17 @@ stages:
       flip: 0.5
   E_scene_seg:
     epochs: 30
-    samples_per_epoch: 40000
+    samples_per_epoch: 100000
     val_samples: 2000
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_e_scene_seg.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      ade20k: 12
-      coco_wholebody: 22
-      coco_person_mask: 14
-      ochuman: 8
-      3dpw: 12
-      agora: 12
-      objects365: 12
-      crowdhuman: 5
-      wider_face: 3
+      ade20k: 100
     train_runtime:
       active_tasks: [scene]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 16
+      batch: 32
       accumulate: 4
       workers: 20
       optimizer: Prodigy
@@ -1921,7 +1930,7 @@ stages:
       ochuman: 3
       ade20k: 2
     train_runtime:
-      active_tasks: [det, pose, mask, scene]
+      active_tasks: [det, human_det, pose, mask, scene]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 16
@@ -1980,7 +1989,7 @@ stages:
       ochuman: 3
       ade20k: 0
     train_runtime:
-      active_tasks: [det, pose, mask, scene]
+      active_tasks: [det, human_det, pose, mask, scene]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 16
