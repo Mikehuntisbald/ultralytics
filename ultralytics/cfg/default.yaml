@@ -65,8 +65,12 @@ tal_high_gt_topk2_one2one: # (int, optional) one-to-one final TAL top-k when hig
 tal_metric_chunk_gt: 0 # (int) chunk GT boxes during TAL metric computation to reduce peak memory; 0 disables
 pose_anchor_topk: 9 # (int) extra bbox-centered anchors per pose GT for denser keypoint supervision; 0 disables
 pose_anchor_radius: 0.35 # (float) normalized bbox-center radius for extra pose anchors; <=0 uses the full bbox
-pose_xy_loss: bbox # (str) YOLO26-PS 2D pose xy loss scale: bbox or grid
+pose_xy_loss: bbox # (str) YOLO26-PS 2D pose xy loss scale: bbox, grid, pixel, mpjpe, or oks/yolo
 pose_xy_beta: 0.05 # (float) SmoothL1 beta for 2D pose xy loss in the selected scale
+pose_oks_conf_weight: True # (bool) weight OKS keypoint loss by dataset visibility/confidence when available
+pose_oks_max_px: 0.0 # (float) ignore visible OKS keypoints above this pixel error; <=0 disables
+pose_oks_max_box_frac: 0.0 # (float) ignore visible OKS keypoints above this fraction of bbox height; <=0 disables
+pose_oks_loss_clip: 1.0 # (float) clamp per-keypoint OKS loss before weighting; <=0 disables
 pose_mpjpe_hard_px: 0.0 # (float) MPJPE hard-keypoint threshold in pixels; <=0 disables hard weighting
 pose_mpjpe_hard_gain: 0.0 # (float) extra MPJPE loss weight gain for keypoints above pose_mpjpe_hard_px
 pose_mpjpe_hard_power: 1.0 # (float) exponent for MPJPE hard-keypoint excess weighting

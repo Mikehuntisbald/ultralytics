@@ -1175,6 +1175,10 @@ class YOLO26PS25DLoss:
         self.pose_anchor_radius = float(getattr(model.args, "pose_anchor_radius", 0.0) or 0.0)
         self.pose_xy_loss = str(getattr(model.args, "pose_xy_loss", "bbox") or "bbox").lower()
         self.pose_xy_beta = float(getattr(model.args, "pose_xy_beta", 0.05) or 0.05)
+        self.pose_oks_conf_weight = self._truthy(getattr(model.args, "pose_oks_conf_weight", True))
+        self.pose_oks_max_px = float(getattr(model.args, "pose_oks_max_px", 0.0) or 0.0)
+        self.pose_oks_max_box_frac = float(getattr(model.args, "pose_oks_max_box_frac", 0.0) or 0.0)
+        self.pose_oks_loss_clip = float(getattr(model.args, "pose_oks_loss_clip", 1.0) or 1.0)
         self.pose_mpjpe_hard_px = float(getattr(model.args, "pose_mpjpe_hard_px", 0.0) or 0.0)
         self.pose_mpjpe_hard_gain = float(getattr(model.args, "pose_mpjpe_hard_gain", 0.0) or 0.0)
         self.pose_mpjpe_hard_power = float(getattr(model.args, "pose_mpjpe_hard_power", 1.0) or 1.0)
@@ -1405,7 +1409,7 @@ class YOLO26PS25DLoss:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute gated 2D, depth, visibility, and bone losses for matched person positives."""
         zero = self._safe_zero(preds["pose25d"])
-        task_preds, task_batch, assignment = self._get_assignment(preds, batch, image_mask, assignment_cache)
+        task_preds, task_batch, assignment = self._get_pose_assignment(preds, batch, image_mask, assignment_cache)
         if task_batch["batch_idx"].numel() == 0:
             return zero, zero, zero, zero
 
@@ -1483,6 +1487,7 @@ class YOLO26PS25DLoss:
                     kpt_present[positive],
                     pose_target_bboxes_grid[positive],
                     stride_tensor.view(1, -1, 1, 1).expand_as(pred_pose_grid[..., :1])[positive],
+                    gt_kpts[..., 2][positive],
                 )
 
                 visible_target = gt_kpts_grid[..., 2].gt(0).to(pred_pose_grid.dtype)
@@ -1606,11 +1611,14 @@ class YOLO26PS25DLoss:
         kpt_present: torch.Tensor,
         target_bboxes_grid: torch.Tensor,
         stride: torch.Tensor | None = None,
+        gt_conf: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute 2D keypoint regression loss in bbox-normalized or grid-cell units."""
         if not kpt_present.any():
             return self._safe_zero(pred_xy)
         beta = max(float(self.pose_xy_beta), 1e-6)
+        if self.pose_xy_loss in {"oks", "yolo", "keypoint"}:
+            return self._pose_oks_loss(pred_xy, gt_xy, kpt_present, target_bboxes_grid, stride, gt_conf)
         if self.pose_xy_loss == "grid":
             return F.smooth_l1_loss(pred_xy[kpt_present], gt_xy[kpt_present], beta=beta)
         if self.pose_xy_loss == "pixel":
@@ -1643,6 +1651,60 @@ class YOLO26PS25DLoss:
         box_wh = (target_bboxes_grid[..., 2:4] - target_bboxes_grid[..., 0:2]).clamp(min=1.0).unsqueeze(1)
         error = (pred_xy - gt_xy) / box_wh
         return F.smooth_l1_loss(error[kpt_present], torch.zeros_like(error[kpt_present]), beta=beta)
+
+    def _pose_oks_loss(
+        self,
+        pred_xy: torch.Tensor,
+        gt_xy: torch.Tensor,
+        kpt_present: torch.Tensor,
+        target_bboxes_grid: torch.Tensor,
+        stride: torch.Tensor | None = None,
+        gt_conf: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """YOLO-style OKS keypoint loss with visibility masks and optional robust outlier filtering."""
+        if not kpt_present.any():
+            return self._safe_zero(pred_xy)
+
+        box_wh = (target_bboxes_grid[..., 2:4] - target_bboxes_grid[..., 0:2]).clamp(min=1.0)
+        area = box_wh.prod(dim=-1, keepdim=True).clamp(min=1.0)
+        d = (pred_xy[..., 0] - gt_xy[..., 0]).pow(2) + (pred_xy[..., 1] - gt_xy[..., 1]).pow(2)
+        sigmas = self.keypoint_loss.sigmas.to(device=pred_xy.device, dtype=pred_xy.dtype)
+        e = d / ((2 * sigmas).pow(2).view(1, -1) * area * 2 + 1e-9)
+        loss = 1.0 - torch.exp(-e)
+
+        robust_mask = kpt_present
+        if self.pose_oks_max_px > 0 or self.pose_oks_max_box_frac > 0:
+            error_px = (pred_xy - gt_xy)
+            if stride is not None:
+                error_px = error_px * stride
+            error_px = error_px.norm(dim=-1)
+            if self.pose_oks_max_px > 0:
+                robust_mask = robust_mask & (error_px <= self.pose_oks_max_px)
+            if self.pose_oks_max_box_frac > 0:
+                box_h_px = box_wh[..., 1:2]
+                if stride is not None:
+                    if stride.ndim >= 3:
+                        stride_scale = stride[:, 0, 0].view(-1, 1)
+                    elif stride.ndim == 2:
+                        stride_scale = stride[:, 0].view(-1, 1)
+                    else:
+                        stride_scale = stride.reshape(-1, 1)
+                    box_h_px = box_h_px * stride_scale
+                robust_mask = robust_mask & (error_px <= box_h_px * self.pose_oks_max_box_frac)
+            if not robust_mask.any():
+                robust_mask = kpt_present
+
+        weights = robust_mask.to(loss.dtype)
+        if self.pose_oks_conf_weight and gt_conf is not None:
+            conf_raw = gt_conf.to(device=loss.device, dtype=loss.dtype).clamp(min=0.0, max=2.0)
+            conf = torch.where(conf_raw > 1.0, torch.ones_like(conf_raw), conf_raw.clamp(min=0.25, max=1.0))
+            conf = torch.where(conf_raw.eq(1.0), conf.new_full((), 0.5), conf)
+            weights = weights * conf
+        weights_sum = weights.sum(dim=1).clamp(min=1.0)
+        kpt_loss_factor = kpt_present.shape[1] / weights_sum
+        if self.pose_oks_loss_clip > 0:
+            loss = loss.clamp(max=self.pose_oks_loss_clip)
+        return (kpt_loss_factor.view(-1, 1) * loss * weights).mean()
 
     def _decode_pose25d(
         self, preds: dict[str, torch.Tensor], anchor_points: torch.Tensor, stride_tensor: torch.Tensor
@@ -1844,6 +1906,52 @@ class YOLO26PS25DLoss:
             cache[key] = result
         return result
 
+    def _get_pose_assignment(
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, Any],
+        image_mask: torch.Tensor,
+        cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], tuple]:
+        """Return pose assignment, preferring the human detector when that head is active."""
+        if "human_boxes" not in preds or "human_scores" not in preds:
+            return self._get_assignment(preds, batch, image_mask, cache)
+
+        human_batch = self._human_det_batch(batch, preds["boxes"].shape[0])
+        human_mask = image_mask & self._task_image_mask(human_batch, "has_det", preds["boxes"].shape[0])
+        task_preds = self._select_preds_by_images(
+            {**preds, "boxes": preds["human_boxes"], "scores": preds["human_scores"]},
+            human_mask,
+        )
+        task_batch = self._select_batch_by_images(human_batch, human_mask)
+        if task_batch["batch_idx"].numel() == 0:
+            empty = task_preds["boxes"].new_zeros(
+                (task_preds["boxes"].shape[0], task_preds["boxes"].shape[-1]), dtype=torch.bool
+            )
+            assignment = (
+                empty,
+                task_preds["boxes"].new_zeros(empty.shape, dtype=torch.long),
+                task_preds["boxes"].new_zeros((*empty.shape, 4)),
+                task_preds["boxes"].new_zeros((task_preds["boxes"].shape[-1], 2)),
+                task_preds["boxes"].new_ones((task_preds["boxes"].shape[-1], 1)),
+            )
+        else:
+            assignment = self.human_det.get_assignment(task_preds, task_batch)
+
+        # The rest of the pose code expects global class IDs, so map human head
+        # labels back from [person, face] to their shared dataset class IDs.
+        cls = task_batch.get("cls")
+        if torch.is_tensor(cls) and cls.numel():
+            person_cls, face_cls = self.human_global_classes[:2]
+            cls_long = cls.to(self.device).view(-1).long()
+            mapped = torch.where(
+                cls_long.eq(1),
+                torch.full_like(cls_long, int(face_cls)),
+                torch.full_like(cls_long, int(person_cls)),
+            ).view_as(cls)
+            task_batch = {**task_batch, "cls": mapped.to(device=cls.device, dtype=cls.dtype)}
+        return task_preds, task_batch, assignment
+
     @staticmethod
     def _assignment_key(image_mask: torch.Tensor) -> tuple[bool, ...]:
         """Convert an image mask into a hashable assignment-cache key."""
@@ -1966,6 +2074,13 @@ class YOLO26PS25DLoss:
     def _safe_zero(tensor: torch.Tensor) -> torch.Tensor:
         """Return a graph-connected scalar zero without large FP16 reductions."""
         return tensor.float().sum() * 0.0
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        """Parse bool-like config values without importing CLI helpers into the loss module."""
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
 
 
 class YOLO26PS25DE2ELoss:

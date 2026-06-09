@@ -244,6 +244,8 @@ def active_tasks_from_stage(stage: dict[str, Any]) -> set[str]:
         if isinstance(runtime_tasks, str):
             runtime_tasks = [item.strip() for item in runtime_tasks.split(",") if item.strip()]
         tasks = {str(task).strip().lower() for task in runtime_tasks}
+        if "pose" in tasks:
+            tasks.add("human_det")
         return tasks
     train = stage.get("train") or {}
     loss = stage.get("loss") or {}
@@ -259,6 +261,19 @@ def active_tasks_from_stage(stage: dict[str, Any]) -> set[str]:
     if train.get("scene_seg_head") or float(loss.get("scene_seg", 0.0)):
         tasks.add("scene")
     return tasks
+
+
+def branch_trainable_from_stage(stage: dict[str, Any], group: str, active: bool) -> bool:
+    """Return whether a head branch should update weights for the current stage."""
+    train = stage.get("train") or {}
+    loss = stage.get("loss") or {}
+    if train.get("all"):
+        return True
+    if group == "det":
+        return train_flag_enabled(train, "det_head", default=float(loss.get("det", 0.0)) > 0 or active)
+    if group == "human_det":
+        return train_flag_enabled(train, "human_det_head", default=False) or float(loss.get("human_det", 0.0)) > 0
+    return train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=active)
 
 
 def complete_loss_weights(stage: dict[str, Any]) -> dict[str, float]:
@@ -1037,7 +1052,7 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                 trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=default)
                 trainable = bool(train.get("all")) or (default and trainable)
             else:
-                trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=group in active_groups)
+                trainable = branch_trainable_from_stage(self.stage_cfg, group, group in active_groups)
             for name in names:
                 module = getattr(head, name, None)
                 if module is None:
@@ -1352,8 +1367,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tal-metric-chunk-gt", type=positive_int)
     parser.add_argument("--pose-anchor-topk", type=int)
     parser.add_argument("--pose-anchor-radius", type=float)
-    parser.add_argument("--pose-xy-loss", choices=("bbox", "grid", "pixel", "mpjpe"))
+    parser.add_argument("--pose-xy-loss", choices=("bbox", "grid", "pixel", "mpjpe", "oks", "yolo", "keypoint"))
     parser.add_argument("--pose-xy-beta", type=float)
+    parser.add_argument("--pose-oks-conf-weight", action="store_true")
+    parser.add_argument("--no-pose-oks-conf-weight", dest="pose_oks_conf_weight", action="store_false")
+    parser.set_defaults(pose_oks_conf_weight=None)
+    parser.add_argument("--pose-oks-max-px", type=float)
+    parser.add_argument("--pose-oks-max-box-frac", type=float)
+    parser.add_argument("--pose-oks-loss-clip", type=float)
     parser.add_argument("--pose-mpjpe-hard-px", type=float)
     parser.add_argument("--pose-mpjpe-hard-gain", type=float)
     parser.add_argument("--pose-mpjpe-hard-power", type=float)
@@ -1569,6 +1590,16 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     pose_xy_beta = args.pose_xy_beta if args.pose_xy_beta is not None else defaults.get("pose_xy_beta")
     if pose_xy_beta is not None:
         overrides["pose_xy_beta"] = float(pose_xy_beta)
+    for key, cli_key in (
+        ("pose_oks_conf_weight", "pose_oks_conf_weight"),
+        ("pose_oks_max_px", "pose_oks_max_px"),
+        ("pose_oks_max_box_frac", "pose_oks_max_box_frac"),
+        ("pose_oks_loss_clip", "pose_oks_loss_clip"),
+    ):
+        cli_value = getattr(args, cli_key, None)
+        value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = bool(value) if key == "pose_oks_conf_weight" else float(value)
     for key, cli_key in (
         ("pose_mpjpe_hard_px", "pose_mpjpe_hard_px"),
         ("pose_mpjpe_hard_gain", "pose_mpjpe_hard_gain"),

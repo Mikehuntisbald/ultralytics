@@ -190,6 +190,9 @@ CFG_FLOAT_KEYS = frozenset(
         "prodigy_d_coef",
         "prodigy_growth_rate",
         "pose_xy_beta",
+        "pose_oks_max_px",
+        "pose_oks_max_box_frac",
+        "pose_oks_loss_clip",
         "hard_image_boost",
         "pose_mpjpe_hard_px",
         "pose_mpjpe_hard_gain",
@@ -288,6 +291,7 @@ CFG_BOOL_KEYS = frozenset(
         "profile",
         "end2end",
         "class_aware_sampling",
+        "pose_oks_conf_weight",
     }
 )
 
