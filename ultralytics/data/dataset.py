@@ -50,7 +50,7 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
-UNIFIED_CACHE_VERSION = "1.0.9"
+UNIFIED_CACHE_VERSION = "1.0.10"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
 ADE20K_150_LABEL_MAPPING = {0: 255, **{i: i - 1 for i in range(1, 151)}}
@@ -776,7 +776,7 @@ class YOLODataset(BaseDataset):
         flags = task_flags or {}
         if bool(flags.get("has_scene_seg")):
             sources.append("ade20k")
-        if bool(flags.get("has_person_mask")):
+        if bool(flags.get("has_person_mask")) and source not in {"ochuman"}:
             sources.append("coco_person_mask")
         if bool(flags.get("has_pose3d")):
             if source in {"3dpw", "agora", "h3wb"}:
@@ -988,8 +988,33 @@ class YOLODataset(BaseDataset):
         return arr
 
     @staticmethod
-    def _normalize_segment(mask: list, width: int, height: int) -> np.ndarray | None:
-        arr = np.asarray(mask, dtype=np.float32).reshape(-1, 2)
+    def _normalize_segment(mask: list | np.ndarray, width: int, height: int) -> np.ndarray | None:
+        if mask is None:
+            return None
+        if isinstance(mask, np.ndarray):
+            arr = mask.astype(np.float32, copy=False).reshape(-1, 2)
+        elif not mask:
+            return None
+        elif isinstance(mask[0], (list, tuple, np.ndarray)):
+            first = mask[0]
+            is_point_list = len(first) == 2 and all(isinstance(x, (int, float, np.number)) for x in first)
+            if is_point_list:
+                arr = np.asarray(mask, dtype=np.float32).reshape(-1, 2)
+            else:
+                points = []
+                for segment in mask:
+                    arr_i = YOLODataset._normalize_segment(segment, width, height)
+                    if arr_i is not None:
+                        points.append(arr_i)
+                if not points:
+                    return None
+                if len(points) == 1:
+                    return points[0]
+                return np.concatenate(merge_multi_segment([p.reshape(-1).tolist() for p in points]), axis=0).astype(
+                    np.float32
+                )
+        else:
+            arr = np.asarray(mask, dtype=np.float32).reshape(-1, 2)
         if len(arr) < 3:
             return None
         if arr[:, 0].max(initial=0) > 2 or arr[:, 1].max(initial=0) > 2:
@@ -999,7 +1024,7 @@ class YOLODataset(BaseDataset):
 
     @staticmethod
     def _mask_file_to_segment(mask_file: str, width: int, height: int) -> np.ndarray | None:
-        """Approximate a binary instance-mask file as its largest contour polygon."""
+        """Approximate a binary instance-mask file as a merged external-contour polygon."""
         mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             return None
@@ -1008,22 +1033,87 @@ class YOLODataset(BaseDataset):
         contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-        contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-        if len(contour) < 3:
+        segments = [c.reshape(-1, 2).astype(np.float32) for c in contours if len(c) >= 3 and cv2.contourArea(c) > 0]
+        if not segments:
             return None
+        if len(segments) > 1:
+            contour = np.concatenate(merge_multi_segment([s.reshape(-1).tolist() for s in segments]), axis=0).astype(
+                np.float32
+            )
+        else:
+            contour = segments[0]
         contour[:, 0] /= width
         contour[:, 1] /= height
         return contour
 
     @staticmethod
+    def _decode_compressed_rle_counts(counts: str | bytes) -> list[int] | None:
+        """Decode COCO compressed RLE counts without requiring pycocotools."""
+        data = counts if isinstance(counts, bytes) else str(counts).encode("ascii", errors="ignore")
+        runs, p = [], 0
+        while p < len(data):
+            x = 0
+            k = 0
+            more = True
+            while more:
+                c = data[p] - 48
+                p += 1
+                x |= (c & 0x1F) << (5 * k)
+                more = bool(c & 0x20)
+                if not more and (c & 0x10):
+                    x |= -1 << (5 * (k + 1))
+                k += 1
+            if len(runs) > 2:
+                x += runs[-2]
+            runs.append(int(x))
+        return runs
+
+    @staticmethod
+    def _decode_rle_mask(rle: dict, width: int, height: int) -> np.ndarray | None:
+        """Decode COCO uncompressed or compressed RLE into a binary HxW mask."""
+        size = rle.get("size") or [height, width]
+        if len(size) < 2:
+            return None
+        h, w = int(size[0]), int(size[1])
+        if h <= 0 or w <= 0:
+            return None
+        counts = rle.get("counts")
+        if isinstance(counts, (list, tuple)):
+            runs = [int(x) for x in counts]
+        elif isinstance(counts, (str, bytes)):
+            runs = YOLODataset._decode_compressed_rle_counts(counts)
+        else:
+            return None
+        if not runs:
+            return None
+        total = h * w
+        flat = np.zeros(total, dtype=np.uint8)
+        idx = 0
+        value = 0
+        for run in runs:
+            if run < 0:
+                return None
+            end = min(idx + run, total)
+            if value and end > idx:
+                flat[idx:end] = 1
+            idx += run
+            value ^= 1
+            if idx >= total:
+                break
+        mask = flat.reshape((h, w), order="F")
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        return mask
+
+    @staticmethod
     def _rle_to_segment(rle: dict, width: int, height: int) -> np.ndarray | None:
-        """Approximate a COCO RLE mask as its largest contour polygon."""
+        """Approximate a COCO RLE mask as a merged external-contour polygon."""
         try:
             from pycocotools import mask as mask_utils
 
             mask = mask_utils.decode(rle)
         except Exception:
-            return None
+            mask = YOLODataset._decode_rle_mask(rle, width, height)
         if mask is None:
             return None
         if mask.ndim == 3:
@@ -1033,20 +1123,26 @@ class YOLODataset(BaseDataset):
         contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-        contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-        if len(contour) < 3:
+        segments = [c.reshape(-1, 2).astype(np.float32) for c in contours if len(c) >= 3 and cv2.contourArea(c) > 0]
+        if not segments:
             return None
+        if len(segments) > 1:
+            contour = np.concatenate(merge_multi_segment([s.reshape(-1).tolist() for s in segments]), axis=0).astype(
+                np.float32
+            )
+        else:
+            contour = segments[0]
         contour[:, 0] /= width
         contour[:, 1] /= height
         return contour
 
     @staticmethod
     def _dummy_segment_from_box(box: list[float]) -> np.ndarray:
-        """Return a bbox polygon for non-mask instances."""
+        """Return a zero-area polygon inside a bbox for non-mask instances."""
         cx, cy, bw, bh = box
         x1, y1 = cx - bw * 0.5, cy - bh * 0.5
         x2, y2 = cx + bw * 0.5, cy + bh * 0.5
-        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        return np.array([[x1, y1], [x2, y1], [x2, y1]], dtype=np.float32)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list.

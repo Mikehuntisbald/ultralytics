@@ -15,9 +15,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from ultralytics.data.converter import merge_multi_segment
 
 
 VISION_ROOT = Path("/home/haoyi/Downloads/datasets/vision_benchmarks")
@@ -114,7 +122,7 @@ def polygon_area(poly: list[float]) -> float:
     return abs(sum(xs[i] * ys[(i + 1) % len(xs)] - xs[(i + 1) % len(xs)] * ys[i] for i in range(len(xs)))) * 0.5
 
 
-def largest_polygon(segmentation: object) -> list[list[float]] | None:
+def merged_polygon(segmentation: object) -> list[list[float]] | None:
     if not isinstance(segmentation, list) or not segmentation:
         return None
     if all(isinstance(x, (int, float)) for x in segmentation):
@@ -122,7 +130,10 @@ def largest_polygon(segmentation: object) -> list[list[float]] | None:
     polygons = [poly for poly in segmentation if isinstance(poly, list) and len(poly) >= 6]
     if not polygons:
         return None
-    poly = max(polygons, key=polygon_area)
+    if len(polygons) > 1:
+        points = np.concatenate(merge_multi_segment(polygons), axis=0).reshape(-1, 2)
+        return [[float(x), float(y)] for x, y in points]
+    poly = polygons[0]
     return [[float(poly[i]), float(poly[i + 1])] for i in range(0, len(poly) - 1, 2)]
 
 
@@ -141,7 +152,7 @@ def make_mask_instance(ann: dict, source: str, include_keypoints: bool) -> dict 
     if len(bbox) < 4 or bbox[2] <= 1 or bbox[3] <= 1:
         return None
     segmentation = ann.get("segmentation")
-    person_mask = largest_polygon(segmentation) or compressed_rle(segmentation)
+    person_mask = merged_polygon(segmentation) or compressed_rle(segmentation)
     if person_mask is None:
         return None
     inst = {
