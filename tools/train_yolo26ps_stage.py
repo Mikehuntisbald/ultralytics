@@ -424,7 +424,11 @@ class YOLO26PSStageValidator(DetectionValidator):
                 keep = pred[:, 4] > self.args.conf
                 if classes is not None:
                     keep &= (pred[:, 5:6] == classes).any(1)
-                idx = torch.where(keep)[0][: self.args.max_det]
+                # End-to-end deploy outputs are already top-k, but class filtering can leave sparse indices.
+                # Keep pose indices aligned while preserving the highest-confidence boxes for source metrics.
+                idx = torch.where(keep)[0]
+                if idx.numel():
+                    idx = idx[pred[idx, 4].argsort(descending=True)[: self.args.max_det]]
                 x = pred[idx]
                 preds_out.append(
                     {
