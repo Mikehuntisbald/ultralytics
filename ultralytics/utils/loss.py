@@ -1777,7 +1777,7 @@ class YOLO26PS25DLoss:
         if "masks" not in batch or not torch.is_tensor(batch["masks"]):
             return zero
 
-        task_preds, task_batch, assignment = self._get_assignment(preds, batch, image_mask, assignment_cache)
+        task_preds, task_batch, assignment = self._get_person_mask_assignment(preds, batch, image_mask, assignment_cache)
         if task_batch["batch_idx"].numel() == 0:
             return zero
         fg_mask, target_gt_idx, target_bboxes, _, _ = assignment
@@ -1931,6 +1931,28 @@ class YOLO26PS25DLoss:
         if "human_boxes" not in preds or "human_scores" not in preds:
             return self._get_assignment(preds, batch, image_mask, cache)
 
+        return self._get_human_assignment(preds, batch, image_mask)
+
+    def _get_person_mask_assignment(
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, Any],
+        image_mask: torch.Tensor,
+        cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], tuple]:
+        """Return person-mask assignment, preferring the human detector's person/face matcher."""
+        if "human_boxes" not in preds or "human_scores" not in preds:
+            return self._get_assignment(preds, batch, image_mask, cache)
+
+        return self._get_human_assignment(preds, batch, image_mask)
+
+    def _get_human_assignment(
+        self,
+        preds: dict[str, torch.Tensor],
+        batch: dict[str, Any],
+        image_mask: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], tuple]:
+        """Return assignment from the human detector and map its labels back to global class ids."""
         human_batch = self._human_det_batch(batch, preds["boxes"].shape[0])
         human_mask = image_mask & self._task_image_mask(human_batch, "has_det", preds["boxes"].shape[0])
         task_preds = self._select_preds_by_images(
@@ -1952,7 +1974,7 @@ class YOLO26PS25DLoss:
         else:
             assignment = self.human_det.get_assignment(task_preds, task_batch)
 
-        # The rest of the pose code expects global class IDs, so map human head
+        # Downstream pose/mask code expects global class IDs, so map human-head
         # labels back from [person, face] to their shared dataset class IDs.
         cls = task_batch.get("cls")
         if torch.is_tensor(cls) and cls.numel():

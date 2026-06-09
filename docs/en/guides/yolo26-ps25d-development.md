@@ -686,8 +686,9 @@ Code-level guardrails:
 
 - `active_tasks_from_stage()` in `tools/train_yolo26ps_stage.py` auto-adds `human_det` when `pose` is active.
 - `branch_trainable_from_stage()` keeps `human_det` frozen unless `train.human_det_head: true` or `loss.human_det > 0`.
-- `YOLO26PS25DLoss._get_pose_assignment()` in `ultralytics/utils/loss.py` prefers `human_boxes/human_scores` when the
-  human detector is present, then maps human-det labels back to global `person_cls` and `face_cls`.
+- `YOLO26PS25DLoss._get_pose_assignment()` and `_get_person_mask_assignment()` in `ultralytics/utils/loss.py` prefer
+  `human_boxes/human_scores` when the human detector is present, then map human-det labels back to global `person_cls`
+  and `face_cls`.
 
 ### Human Detector Branch Contract
 
@@ -714,6 +715,10 @@ For current pose-only Stage C:
 
 This is why `human_det` appears in a pose-only recipe: it supplies the proposal boxes that pose consumes, but it does not
 learn unless the stage explicitly enables the human-det loss or trainability.
+
+For Stage D person-mask training, use the same contract: `active_tasks: [human_det, mask]`, `loss.human_det: 0.0`, and
+`train.human_det_head: false`. The frozen human detector supplies person assignment for the mask coefficients, while
+only the mask/prototype branch learns.
 
 ### Dense Pose Anchors
 

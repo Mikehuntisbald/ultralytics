@@ -1612,7 +1612,7 @@ stages:
       coco_person_mask: 75
       ochuman: 25
     train_runtime:
-      active_tasks: [mask]
+      active_tasks: [human_det, mask]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 42
