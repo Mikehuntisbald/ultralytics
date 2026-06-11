@@ -1,0 +1,7 @@
+source_run: runs/detect/yolo26ps_stage_a_detection_det_recover_best_reinitopt_fillvram_b28
+source_last: runs/detect/yolo26ps_stage_a_detection_det_recover_best_reinitopt_fillvram_b28/weights/last.pt
+saved_from_epoch: 4
+source_results_epoch5: 5,25718,1.22403,1.62589,0.00649,0,0,0,0,0,0,0.45178,0.3312,0.31834,0.23108,0.33766,0.24387,0.75148,0.58814,0.74089,0.46197,0.79794,0.47127,0,0,0,0,0,0,0.09706,0.06357,0,0,0,0,1.00657,1.7389,0.00767,0,0,0,0,0,0,1,1,1
+objects365_only_data: /home/user/datasets/vision_benchmarks/YOLO26PS_STAGE_A/yolo26ps_stage_a_objects365_only_local.yaml
+objects365_only_plan: ultralytics/cfg/datasets/yolo26-ps25d-plan-objects365-only.yaml
+resume_checkpoint: runs/stage_a_detection_det_recover_best_reinitopt_fillvram/epoch5_before_objects365_only/last_objects365_only_resume.pt

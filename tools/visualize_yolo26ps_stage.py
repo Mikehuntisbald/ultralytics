@@ -45,6 +45,7 @@ DEFAULT_OUT = ROOT / "examples"
 SOURCE_ORDER = (
     "coco_person_mask",
     "ochuman",
+    "coco_keypoints",
     "coco_wholebody",
     "3dpw",
     "agora",
@@ -52,10 +53,10 @@ SOURCE_ORDER = (
     "crowdhuman",
     "wider_face",
 )
-POSE_SOURCES = {"coco_wholebody", "ochuman", "3dpw", "agora"}
+POSE_SOURCES = {"coco_keypoints", "coco_wholebody", "ochuman", "3dpw", "agora"}
 MASK_SOURCES = {"coco_person_mask", "ochuman"}
 ALL_CLASS_BOX_SOURCES = {"objects365"}
-PERSON_BOX_SOURCES = {"coco_person_mask", "ochuman", "coco_wholebody", "3dpw", "agora", "crowdhuman"}
+PERSON_BOX_SOURCES = {"coco_person_mask", "ochuman", "coco_keypoints", "coco_wholebody", "3dpw", "agora", "crowdhuman"}
 FACE_BOX_SOURCES = {"wider_face"}
 PERSON_CLS = 0
 FACE_CLS = 365
@@ -152,6 +153,8 @@ def source_from_path(path: str) -> str:
         return "3dpw"
     if "agora" in text:
         return "agora"
+    if "coco_keypoints" in text:
+        return "coco_keypoints"
     if "coco_2017" in text or "/coco/" in text:
         return "coco_wholebody"
     return "unknown"
@@ -325,9 +328,20 @@ def human_det_available(head: Any) -> bool:
     return getattr(head, "human_cv2", None) is not None and getattr(head, "human_cv3", None) is not None
 
 
+def pose_det_available(head: Any) -> bool:
+    """Return whether this checkpoint has a standalone pose detector branch."""
+    if head is None:
+        return False
+    if bool(getattr(head, "end2end", False)):
+        return getattr(head, "one2one_pose_cv2", None) is not None and getattr(head, "one2one_pose_cv3", None) is not None
+    return getattr(head, "pose_cv2", None) is not None and getattr(head, "pose_cv3", None) is not None
+
+
 def active_tasks_for_source(source: str, args: argparse.Namespace, head: Any | None = None) -> set[str]:
     """Return head branches needed for source-aware deploy outputs."""
     if source in POSE_SOURCES:
+        if pose_det_available(head) and source not in MASK_SOURCES:
+            return {"pose"}
         tasks = {"human_det" if human_det_available(head) else "det", "pose"}
         if source in MASK_SOURCES:
             tasks.add("mask")
@@ -354,10 +368,32 @@ def run_inference(
     ratio_pad = predictor.batch_ratio_pad[0] if getattr(predictor, "batch_ratio_pad", None) else None
     with torch.no_grad():
         raw = model.model(im)
-    deploy = raw[0] if isinstance(raw, (tuple, list)) else raw
+    deploy = raw
+    if isinstance(raw, (tuple, list)) and len(raw) == 2 and torch.is_tensor(raw[0]):
+        deploy = official_pose_to_deploy(raw[0])
+    if isinstance(raw, (tuple, list)) and len(raw) == 2 and isinstance(raw[0], (tuple, list)):
+        deploy = raw[0]
     if not (isinstance(deploy, (tuple, list)) and len(deploy) >= 5):
         raise RuntimeError(f"Unexpected YOLO26-PS output type: {type(raw)}")
     return deploy[:5], ratio_pad, im
+
+
+def official_pose_to_deploy(pred: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert official YOLO pose deploy tensor [xyxy, conf, cls, kpts] to the PS visualization tuple."""
+    if pred.ndim != 3 or pred.shape[-1] < 9:
+        raise RuntimeError(f"Unexpected official pose output shape: {tuple(pred.shape)}")
+    det = pred[..., :6].clone()
+    kpts = pred[..., 6:].reshape(pred.shape[0], pred.shape[1], -1, 3)
+    boxes = det[..., :4]
+    wh = (boxes[..., 2:4] - boxes[..., 0:2]).clamp(min=1.0)
+    pose25d = pred.new_zeros((*kpts.shape[:3], 4))
+    pose25d[..., 0] = (kpts[..., 0] - boxes[..., 0:1]) / wh[..., 0:1]
+    pose25d[..., 1] = (kpts[..., 1] - boxes[..., 1:2]) / wh[..., 1:2]
+    pose25d[..., 3] = kpts[..., 2]
+    empty_coef = pred.new_zeros((pred.shape[0], pred.shape[1], 32))
+    empty_proto = pred.new_zeros((pred.shape[0], 32, 0, 0))
+    empty_scene = pred.new_zeros((pred.shape[0], 0, 0, 0))
+    return det, pose25d, empty_coef, empty_proto, empty_scene
 
 
 def prepare_predictions(

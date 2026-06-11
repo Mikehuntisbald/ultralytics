@@ -342,7 +342,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             head.set_active_tasks(active_tasks_for_source(source, args, head))
         with torch.no_grad():
             deploy, ratio_pad, im = run_inference(model, predictor, image, args)
-            raw = model.model(im)[1]
+            model_out = model.model(im)
+            raw = model_out[1] if isinstance(model_out, (tuple, list)) and len(model_out) == 2 else {}
             preds = prepare_predictions(deploy, im, image.shape[:2], ratio_pad, source, args)
             raw_poses = raw_pose_predictions_with_anchor(model, raw, im, image.shape[:2], ratio_pad, source, args)
         if len(preds["boxes"]):

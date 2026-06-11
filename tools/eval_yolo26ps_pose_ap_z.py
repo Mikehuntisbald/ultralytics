@@ -149,6 +149,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     head.max_det = args.max_det
     model.predict(records[0]["image"], imgsz=args.imgsz, conf=args.conf, iou=args.iou, max_det=args.max_det, save=False, verbose=False, device=args.device)
     predictor = model.predictor
+    head = model.model.model[-1]
+    if hasattr(head, "set_active_tasks"):
+        head.set_active_tasks(active_tasks_for_source(records[0]["source"], args, head))
+    head.max_det = args.max_det
     model.model.eval()
 
     dets: list[tuple[float, float, int]] = []

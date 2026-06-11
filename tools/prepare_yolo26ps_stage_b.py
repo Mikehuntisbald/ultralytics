@@ -63,7 +63,10 @@ def load_coco_wholebody(coco_json: Path) -> tuple[dict[int, dict], dict[int, lis
     for ann in data.get("annotations", []):
         if int(ann.get("category_id", 1)) != 1 or int(ann.get("iscrowd", 0)):
             continue
-        if len(ann.get("bbox") or []) < 4:
+        bbox = ann.get("bbox") or []
+        if len(bbox) < 4:
+            continue
+        if float(bbox[2]) <= 0 or float(bbox[3]) <= 0:
             continue
         anns_by_image[int(ann["image_id"])].append(ann)
     return images, anns_by_image
@@ -88,6 +91,7 @@ def make_coco_record(image: dict, annotations: list[dict], image_path: Path) -> 
         )
     return {
         "image": str(image_path.resolve()),
+        "source": "coco_wholebody",
         "width": int(image["width"]),
         "height": int(image["height"]),
         "instances": instances,
