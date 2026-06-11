@@ -1,13 +1,13 @@
 path: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI
-train: stage_b_train.txt
-val: stage_b_val.txt
+train: stage_b_coco_keypoints_train.txt
+val: stage_b_coco_keypoints_val.txt
 unified_schema: true
 unified_labels:
-  train: labels/stage_b/train
-  val: labels/stage_b/val
+  train: labels/stage_b_coco_keypoints/train
+  val: labels/stage_b_coco_keypoints/val
 unified_manifest:
-  train: manifests/stage_b_train.jsonl
-  val: manifests/stage_b_val.jsonl
+  train: manifests/stage_b_coco_keypoints_train.jsonl
+  val: manifests/stage_b_coco_keypoints_val.jsonl
 nc: 366
 person_cls: 0
 face_cls: 365

@@ -1,0 +1,36 @@
+path: /home/haoyi/Downloads/datasets/vision_benchmarks/YOLO26PS_STAGE_MULTI
+train: stage_d_train.txt
+val: stage_d_val.txt
+unified_schema: true
+unified_labels:
+  train: labels/stage_d/train
+  val: labels/stage_d/val
+unified_manifest:
+  train: manifests/stage_d_train.jsonl
+  val: manifests/stage_d_val.jsonl
+nc: 1
+person_cls: 0
+person_only: true
+kpt_shape:
+- 17
+- 3
+flip_idx:
+- 0
+- 2
+- 1
+- 4
+- 3
+- 6
+- 5
+- 8
+- 7
+- 10
+- 9
+- 12
+- 11
+- 14
+- 13
+- 16
+- 15
+names:
+  0: Person

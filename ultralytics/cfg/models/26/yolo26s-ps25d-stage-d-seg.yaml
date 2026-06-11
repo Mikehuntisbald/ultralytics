@@ -1,0 +1,4 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Alias config for YOLO26s-PS Stage D person-only segmentation.
+# The parser resolves this to yolo26-ps25d-stage-d-seg.yaml and sets scale=s.

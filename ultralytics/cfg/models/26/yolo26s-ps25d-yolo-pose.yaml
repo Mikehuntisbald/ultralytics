@@ -1,0 +1,5 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO26s-PS25D with an official YOLO26s-pose-style P3-P5 pose neck/head plus an extra z channel.
+scale: s
+__base__: yolo26-ps25d-yolo-pose.yaml
