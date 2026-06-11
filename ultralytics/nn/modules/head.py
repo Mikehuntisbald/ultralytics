@@ -20,6 +20,15 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
+TASK_ALIASES = {"mask": "seg", "person_mask": "seg", "scene": "sem", "scene_seg": "sem"}
+
+
+def _normalize_task_name(task) -> str:
+    """Normalize staged task aliases used by training plans."""
+    name = str(task).strip().lower()
+    return TASK_ALIASES.get(name, name)
+
+
 __all__ = (
     "OBB",
     "Classify",
@@ -29,6 +38,7 @@ __all__ = (
     "Segment",
     "SemanticSegment",
     "YOLO26PSDetect25D",
+    "YOLO26PSSegment",
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
@@ -426,6 +436,101 @@ class Segment26(Segment):
             self.proto.fuse()
 
 
+class YOLO26PSSegment(Segment26):
+    """YOLO26-PS Stage D person-only segment head with official Segment26-compatible weights."""
+
+    def __init__(self, nc: int = 1, nm: int = 32, npr: int = 256, person_cls: int = 0, reg_max=1, end2end=False, ch: tuple = ()):
+        """Initialize a Segment26 head plus optional P2 fusion for higher-resolution prototypes."""
+        super().__init__(nc, nm, npr, reg_max, end2end, ch[:3])
+        self.person_cls = int(person_cls)
+        self.face_cls = -1
+        self.scene_nc = 0
+        self.kpt_shape = [17, 4]
+        self.output_stride = 4
+        self.active_tasks = {"det", "seg"}
+        self.loss_names = (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+            "pose2d_loss",
+            "pose_z_loss",
+            "pose_vis_loss",
+            "pose_rle_loss",
+            "bone_loss",
+            "person_mask_loss",
+            "scene_seg_loss",
+            "human_box_loss",
+            "human_cls_loss",
+            "human_dfl_loss",
+        )
+        self.p2_refine = Conv(ch[3], ch[0], 1) if len(ch) > 3 else None
+        self.p2_gate = nn.Parameter(torch.zeros(1)) if self.p2_refine is not None else None
+
+    def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
+        """Set active branches, keeping standard detection active when masks need assignments."""
+        if tasks in (None, "all", True):
+            tasks = {"det", "seg"}
+        elif isinstance(tasks, str):
+            tasks = {_normalize_task_name(x) for x in tasks.split(",") if x.strip()}
+        else:
+            tasks = {_normalize_task_name(x) for x in tasks}
+        if "seg" in tasks:
+            tasks.add("det")
+        self.active_tasks = tasks or {"det"}
+
+    def _active_tasks(self) -> set[str]:
+        """Return normalized active task names."""
+        tasks = getattr(self, "active_tasks", {"det", "seg"})
+        if tasks in (None, "all", True):
+            return {"det", "seg"}
+        if isinstance(tasks, str):
+            return {_normalize_task_name(x) for x in tasks.split(",") if x.strip()} or {"det"}
+        return {_normalize_task_name(x) for x in tasks} or {"det"}
+
+    def _proto_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Fuse the detector P2 feature into the P3 proto path without changing Segment26 parameter names."""
+        feats = list(x[: self.nl])
+        if self.p2_refine is not None and len(x) > self.nl:
+            p2 = F.interpolate(self.p2_refine(x[self.nl]), size=feats[0].shape[2:], mode="nearest")
+            feats[0] = feats[0] + self.p2_gate.to(dtype=p2.dtype) * p2
+        return feats
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Return Segment26-compatible predictions with P2-enhanced prototypes."""
+        x_head = list(x[: self.nl])
+        outputs = Detect.forward(self, x_head)
+        preds = outputs[1] if isinstance(outputs, tuple) else outputs
+        proto = self.proto(self._proto_features(x))
+        if isinstance(preds, dict):
+            if self.end2end:
+                preds["one2many"]["proto"] = proto
+                preds["one2one"]["proto"] = (
+                    tuple(p.detach() for p in proto) if isinstance(proto, tuple) else proto.detach()
+                )
+            else:
+                preds["proto"] = proto
+        if self.training:
+            return preds
+        return (outputs, proto) if self.export else ((outputs[0], proto), preds)
+
+    def _deploy_outputs(self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None = None, tasks: set[str] | None = None):
+        """Decode deploy tensors using the PS multi-task tuple contract."""
+        boxes = self._get_decode_boxes(preds).permute(0, 2, 1)
+        scores = preds["scores"].sigmoid().permute(0, 2, 1)
+        score, cls, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coef = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.nm))
+        if "mask_coefficient" in preds:
+            mask_coef = preds["mask_coefficient"].permute(0, 2, 1)
+            mask_coef = mask_coef.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        det_out = torch.cat([boxes, score, cls.to(boxes.dtype)], dim=-1)
+        pose25d = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.kpt_shape[0], self.kpt_shape[1]))
+        if proto is None:
+            proto = boxes.new_zeros((boxes.shape[0], self.nm, 0, 0))
+        scene_seg = boxes.new_zeros((boxes.shape[0], 0, 0, 0))
+        return det_out, pose25d, mask_coef, proto, scene_seg
+
+
 class PoseResidualAdapter(nn.Module):
     """Residual per-scale feature adapter used only before the pose head."""
 
@@ -464,13 +569,17 @@ class YOLO26PSDetect25D(Detect):
         scene_nc: int = 150,
         person_cls: int = 0,
         pose_channels: int | None = None,
+        pose_feature_count: int | None = None,
+        pose_head_type: str = "simple",
         reg_max=1,
         end2end=False,
         ch: tuple = (),
         human_nc: int = 2,
     ):
         """Initialize detection, 2.5D pose, person mask, and scene segmentation branches."""
-        if len(ch) % 2 == 0 and len(ch) > 4:
+        if pose_feature_count is not None and 0 < int(pose_feature_count) < len(ch):
+            det_ch, pose_ch = tuple(ch[: len(ch) - int(pose_feature_count)]), tuple(ch[-int(pose_feature_count) :])
+        elif len(ch) % 2 == 0 and len(ch) > 4:
             det_ch, pose_ch = tuple(ch[: len(ch) // 2]), tuple(ch[len(ch) // 2 :])
         else:
             det_ch = pose_ch = tuple(ch)
@@ -479,6 +588,8 @@ class YOLO26PSDetect25D(Detect):
         self.pose_feature_count = len(pose_ch)
         self.kpt_shape = list(kpt_shape)
         self.nk = self.kpt_shape[0] * self.kpt_shape[1]
+        self.pose_xy_conf_shape = [self.kpt_shape[0], 3]
+        self.pose_xy_conf_nk = self.pose_xy_conf_shape[0] * self.pose_xy_conf_shape[1]
         self.nm = nm
         self.scene_nc = scene_nc
         self.person_cls = nc + person_cls if person_cls < 0 else person_cls
@@ -489,7 +600,8 @@ class YOLO26PSDetect25D(Detect):
         self.input_stride = 32
         self.output_stride = 4
         self.z_normalization = "bbox_height"
-        self.active_tasks = {"det", "pose", "mask", "scene"}
+        self.pose_head_type = str(pose_head_type).lower()
+        self.active_tasks = {"det", "pose", "seg", "sem"}
         self.loss_names = (
             "box_loss",
             "cls_loss",
@@ -497,6 +609,7 @@ class YOLO26PSDetect25D(Detect):
             "pose2d_loss",
             "pose_z_loss",
             "pose_vis_loss",
+            "pose_rle_loss",
             "bone_loss",
             "person_mask_loss",
             "scene_seg_loss",
@@ -511,9 +624,52 @@ class YOLO26PSDetect25D(Detect):
         c_pose = int(pose_channels) if pose_channels else max(pose_ch[0] // 4, self.nk)
         c_pose = max(c_pose, self.nk)
         self.pose_channels = c_pose
-        self.cv4 = nn.ModuleList(
-            nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3), nn.Conv2d(c_pose, self.nk, 1)) for x in pose_ch
-        )
+        self.pose_nc = 1
+        self.pose_no = self.pose_nc + self.reg_max * 4
+        if self.pose_head_type == "pose26":
+            c_pose = max(pose_ch[0] // 4, self.kpt_shape[0] * (3 + 2))
+            self.pose_channels = c_pose
+            c2_pose = max((16, pose_ch[0] // 4, self.reg_max * 4))
+            c3_pose = max(pose_ch[0], min(self.pose_nc, 100))
+            self.pose_cv2 = nn.ModuleList(
+                nn.Sequential(Conv(x, c2_pose, 3), Conv(c2_pose, c2_pose, 3), nn.Conv2d(c2_pose, 4 * self.reg_max, 1))
+                for x in pose_ch
+            )
+            self.pose_cv3 = (
+                nn.ModuleList(
+                    nn.Sequential(Conv(x, c3_pose, 3), Conv(c3_pose, c3_pose, 3), nn.Conv2d(c3_pose, self.pose_nc, 1))
+                    for x in pose_ch
+                )
+                if self.legacy
+                else nn.ModuleList(
+                    nn.Sequential(
+                        nn.Sequential(DWConv(x, x, 3), Conv(x, c3_pose, 1)),
+                        nn.Sequential(DWConv(c3_pose, c3_pose, 3), Conv(c3_pose, c3_pose, 1)),
+                        nn.Conv2d(c3_pose, self.pose_nc, 1),
+                    )
+                    for x in pose_ch
+                )
+            )
+            self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3)) for x in pose_ch)
+            self.cv4_kpts = nn.ModuleList(nn.Conv2d(c_pose, self.pose_xy_conf_nk, 1) for _ in pose_ch)
+            self.cv4_z = nn.ModuleList(nn.Conv2d(c_pose, self.kpt_shape[0], 1) for _ in pose_ch)
+            self.nk_sigma = self.kpt_shape[0] * 2
+            self.cv4_sigma = nn.ModuleList(nn.Conv2d(c_pose, self.nk_sigma, 1) for _ in pose_ch)
+            self.flow_model = RealNVP()
+            for z_head in self.cv4_z:
+                nn.init.zeros_(z_head.weight)
+                nn.init.zeros_(z_head.bias)
+        else:
+            self.pose_cv2 = None
+            self.pose_cv3 = None
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(Conv(x, c_pose, 3), Conv(c_pose, c_pose, 3), nn.Conv2d(c_pose, self.nk, 1)) for x in pose_ch
+            )
+            self.cv4_kpts = None
+            self.cv4_z = None
+            self.cv4_sigma = None
+            self.flow_model = None
+            self.nk_sigma = 0
 
         c_mask = max(det_ch[0] // 4, self.nm)
         self.cv5 = nn.ModuleList(
@@ -535,7 +691,12 @@ class YOLO26PSDetect25D(Detect):
         if end2end:
             self.one2one_human_cv2 = copy.deepcopy(self.one2one_cv2)
             self.one2one_human_cv3 = self._clone_cls_head(self.one2one_cv3, self.human_nc)
+            self.one2one_pose_cv2 = copy.deepcopy(self.pose_cv2) if self.pose_cv2 is not None else None
+            self.one2one_pose_cv3 = copy.deepcopy(self.pose_cv3) if self.pose_cv3 is not None else None
             self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv4_kpts = copy.deepcopy(self.cv4_kpts) if self.cv4_kpts is not None else None
+            self.one2one_cv4_z = copy.deepcopy(self.cv4_z) if self.cv4_z is not None else None
+            self.one2one_cv4_sigma = copy.deepcopy(self.cv4_sigma) if self.cv4_sigma is not None else None
             self.one2one_cv5 = copy.deepcopy(self.cv5)
 
     @staticmethod
@@ -610,6 +771,18 @@ class YOLO26PSDetect25D(Detect):
                 cls_tower[-1].bias.data[: self.human_nc] = math.log(
                     5 / self.human_nc / (640 / self.stride[i]) ** 2
                 )
+        pose_branches = []
+        if getattr(self, "pose_cv2", None) is not None and getattr(self, "pose_cv3", None) is not None:
+            pose_branches.append((self.pose_cv2, self.pose_cv3))
+        if self.end2end and getattr(self, "one2one_pose_cv2", None) is not None:
+            pose_branches.append((self.one2one_pose_cv2, self.one2one_pose_cv3))
+        pose_stride = self.stride[-len(self.pose_cv2) :] if getattr(self, "pose_cv2", None) is not None else ()
+        for box_head, cls_head in pose_branches:
+            for i, (box_tower, cls_tower) in enumerate(zip(box_head, cls_head)):
+                box_tower[-1].bias.data[:] = 2.0
+                cls_tower[-1].bias.data[: self.pose_nc] = math.log(
+                    5 / self.pose_nc / (640 / pose_stride[i]) ** 2
+                )
 
     def enable_pose_adapter(self, hidden_ratio: float = 0.5, scale: float = 1.0) -> nn.Module:
         """Attach a residual feature adapter used only by the pose head."""
@@ -637,7 +810,12 @@ class YOLO26PSDetect25D(Detect):
             cls_head=self.cv3,
             human_box_head=getattr(self, "human_cv2", None),
             human_cls_head=getattr(self, "human_cv3", None),
+            pose_box_head=getattr(self, "pose_cv2", None),
+            pose_cls_head=getattr(self, "pose_cv3", None),
             pose_head=self.cv4,
+            kpts_head=getattr(self, "cv4_kpts", None),
+            kpts_z_head=getattr(self, "cv4_z", None),
+            kpts_sigma_head=getattr(self, "cv4_sigma", None),
             mask_head=self.cv5,
         )
 
@@ -649,7 +827,12 @@ class YOLO26PSDetect25D(Detect):
             cls_head=self.one2one_cv3,
             human_box_head=getattr(self, "one2one_human_cv2", None),
             human_cls_head=getattr(self, "one2one_human_cv3", None),
+            pose_box_head=getattr(self, "one2one_pose_cv2", None),
+            pose_cls_head=getattr(self, "one2one_pose_cv3", None),
             pose_head=self.one2one_cv4,
+            kpts_head=getattr(self, "one2one_cv4_kpts", None),
+            kpts_z_head=getattr(self, "one2one_cv4_z", None),
+            kpts_sigma_head=getattr(self, "one2one_cv4_sigma", None),
             mask_head=self.one2one_cv5,
         )
 
@@ -657,22 +840,28 @@ class YOLO26PSDetect25D(Detect):
         """Return normalized active task names for staged training/inference."""
         tasks = getattr(self, "active_tasks", None)
         if tasks in (None, "all", True):
-            return {"det", "pose", "mask", "scene"}
+            return {"det", "pose", "seg", "sem"}
         if isinstance(tasks, str):
-            return {x.strip() for x in tasks.split(",") if x.strip()} or {"det"}
-        return set(tasks) or {"det"}
+            return {_normalize_task_name(x) for x in tasks.split(",") if x.strip()} or {"det"}
+        return {_normalize_task_name(x) for x in tasks} or {"det"}
 
     def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
         """Set active task branches for staged training/inference."""
         if tasks in (None, "all", True):
-            self.active_tasks = {"det", "pose", "mask", "scene"}
+            self.active_tasks = {"det", "pose", "seg", "sem"}
         elif isinstance(tasks, str):
-            self.active_tasks = {x.strip() for x in tasks.split(",") if x.strip()}
+            self.active_tasks = {_normalize_task_name(x) for x in tasks.split(",") if x.strip()}
         else:
-            self.active_tasks = set(tasks)
+            self.active_tasks = {_normalize_task_name(x) for x in tasks}
 
     def _head_args_for_tasks(self, tasks: set[str], one2one: bool = False) -> dict[str, torch.nn.Module | None]:
         """Return branch heads for the currently active tasks."""
+        pose_box_head = getattr(self, "one2one_pose_cv2" if one2one else "pose_cv2", None)
+        pose_cls_head = getattr(self, "one2one_pose_cv3" if one2one else "pose_cv3", None)
+        pose_head = getattr(self, "one2one_cv4" if one2one else "cv4", None)
+        kpts_head = getattr(self, "one2one_cv4_kpts" if one2one else "cv4_kpts", None)
+        kpts_z_head = getattr(self, "one2one_cv4_z" if one2one else "cv4_z", None)
+        kpts_sigma_head = getattr(self, "one2one_cv4_sigma" if one2one else "cv4_sigma", None)
         human_box_head = getattr(self, "one2one_human_cv2" if one2one else "human_cv2", None)
         human_cls_head = getattr(self, "one2one_human_cv3" if one2one else "human_cv3", None)
         return dict(
@@ -680,8 +869,13 @@ class YOLO26PSDetect25D(Detect):
             cls_head=(self.one2one_cv3 if one2one else self.cv3) if "det" in tasks else None,
             human_box_head=human_box_head if "human_det" in tasks else None,
             human_cls_head=human_cls_head if "human_det" in tasks else None,
-            pose_head=(self.one2one_cv4 if one2one else self.cv4) if "pose" in tasks else None,
-            mask_head=(self.one2one_cv5 if one2one else self.cv5) if "mask" in tasks else None,
+            pose_box_head=pose_box_head if "pose" in tasks else None,
+            pose_cls_head=pose_cls_head if "pose" in tasks else None,
+            pose_head=pose_head if "pose" in tasks else None,
+            kpts_head=kpts_head if "pose" in tasks else None,
+            kpts_z_head=kpts_z_head if "pose" in tasks else None,
+            kpts_sigma_head=kpts_sigma_head if "pose" in tasks else None,
+            mask_head=(self.one2one_cv5 if one2one else self.cv5) if "seg" in tasks else None,
             tasks=tasks,
         )
 
@@ -692,7 +886,12 @@ class YOLO26PSDetect25D(Detect):
         cls_head: torch.nn.Module,
         human_box_head: torch.nn.Module | None = None,
         human_cls_head: torch.nn.Module | None = None,
+        pose_box_head: torch.nn.Module | None = None,
+        pose_cls_head: torch.nn.Module | None = None,
         pose_head: torch.nn.Module | None = None,
+        kpts_head: torch.nn.Module | None = None,
+        kpts_z_head: torch.nn.Module | None = None,
+        kpts_sigma_head: torch.nn.Module | None = None,
         mask_head: torch.nn.Module | None = None,
         tasks: set[str] | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -722,12 +921,59 @@ class YOLO26PSDetect25D(Detect):
                     [human_cls_head[i](det_x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], 2
                 )
         if pose_head is not None:
-            preds["pose25d"] = torch.cat([pose_head[i](pose_x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
+            if kpts_head is not None:
+                features = [pose_head[i](pose_x[i]) for i in range(self.pose_feature_count)]
+                if pose_box_head is not None and pose_cls_head is not None:
+                    preds["pose_boxes"] = torch.cat(
+                        [
+                            pose_box_head[i](pose_x[i]).view(bs, 4 * self.reg_max, -1)
+                            for i in range(self.pose_feature_count)
+                        ],
+                        2,
+                    )
+                    preds["pose_scores"] = torch.cat(
+                        [pose_cls_head[i](pose_x[i]).view(bs, self.pose_nc, -1) for i in range(self.pose_feature_count)],
+                        2,
+                    )
+                    preds["pose_feats"] = pose_x
+                pose_xy_conf = torch.cat(
+                    [kpts_head[i](features[i]).view(bs, self.pose_xy_conf_nk, -1) for i in range(self.pose_feature_count)],
+                    2,
+                )
+                pose_z = (
+                    torch.cat(
+                        [kpts_z_head[i](features[i]).view(bs, self.kpt_shape[0], -1) for i in range(self.pose_feature_count)],
+                        2,
+                    )
+                    if kpts_z_head is not None
+                    else None
+                )
+                preds["pose25d"] = self._expand_pose26_to_pose25d(pose_xy_conf, pose_z)
+                if self.training and kpts_sigma_head is not None:
+                    preds["pose_sigma"] = torch.cat(
+                        [kpts_sigma_head[i](features[i]).view(bs, self.nk_sigma, -1) for i in range(self.pose_feature_count)],
+                        2,
+                    )
+            else:
+                preds["pose25d"] = torch.cat(
+                    [pose_head[i](pose_x[i]).view(bs, self.nk, -1) for i in range(self.pose_feature_count)], 2
+                )
         if mask_head is not None:
             preds["mask_coefficient"] = torch.cat(
                 [mask_head[i](det_x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
-            )
+                )
         return preds
+
+    def _expand_pose26_to_pose25d(self, pose_xy_conf: torch.Tensor, pose_z: torch.Tensor | None = None) -> torch.Tensor:
+        """Map Pose26-style [x, y, conf] keypoints to PS25D [x, y, z, conf] logits."""
+        bs = pose_xy_conf.shape[0]
+        pose_xy_conf = pose_xy_conf.view(bs, self.kpt_shape[0], 3, -1)
+        pose25d = pose_xy_conf.new_zeros(bs, self.kpt_shape[0], self.kpt_shape[1], pose_xy_conf.shape[-1])
+        pose25d[:, :, 0:2] = pose_xy_conf[:, :, 0:2]
+        if pose_z is not None:
+            pose25d[:, :, 2:3] = pose_z.view(bs, self.kpt_shape[0], 1, -1)
+        pose25d[:, :, 3:4] = pose_xy_conf[:, :, 2:3]
+        return pose25d.view(bs, self.nk, -1)
 
     def _can_parallel_det_human_heads(
         self,
@@ -814,8 +1060,8 @@ class YOLO26PSDetect25D(Detect):
     def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | tuple:
         """Run the multi-task head and return raw training maps or deployment tensors."""
         tasks = self._active_tasks()
-        need_mask = "mask" in tasks
-        need_scene = "scene" in tasks
+        need_mask = "seg" in tasks
+        need_scene = "sem" in tasks
         proto = scene_seg = None
         det_x, _ = self.split_features(x)
         if need_mask or need_scene:
@@ -862,8 +1108,9 @@ class YOLO26PSDetect25D(Detect):
     def _get_decode_xyxy(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode boxes to dynamic image-space xyxy coordinates."""
         shape = preds["feats"][0].shape
+        stride = preds.get("stride", self.stride)
         if self.dynamic or self.shape != shape:
-            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(preds["feats"], self.stride, 0.5))
+            self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(preds["feats"], stride, 0.5))
             self.shape = shape
         return dist2bbox(self.dfl(preds["boxes"]), self.anchors.unsqueeze(0), xywh=False, dim=1) * self.strides
 
@@ -871,8 +1118,32 @@ class YOLO26PSDetect25D(Detect):
         self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None, scene_seg: torch.Tensor | None, tasks: set[str]
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Decode and top-k gather all task outputs for deployment."""
-        use_human_det = "human_det" in tasks and "det" not in tasks and "human_boxes" in preds and "human_scores" in preds
-        det_preds = {**preds, "boxes": preds["human_boxes"], "scores": preds["human_scores"]} if use_human_det else preds
+        use_pose_det = (
+            "pose" in tasks
+            and "pose_boxes" in preds
+            and "pose_scores" in preds
+            and "pose25d" in preds
+        )
+        use_human_det = (
+            not use_pose_det
+            and "human_det" in tasks
+            and "det" not in tasks
+            and "human_boxes" in preds
+            and "human_scores" in preds
+        )
+        if use_human_det:
+            det_preds = {**preds, "boxes": preds["human_boxes"], "scores": preds["human_scores"]}
+        elif use_pose_det:
+            pose_stride = self.stride[-int(getattr(self, "pose_feature_count", len(self.stride))) :]
+            det_preds = {
+                **preds,
+                "boxes": preds["pose_boxes"],
+                "scores": preds["pose_scores"],
+                "feats": preds["pose_feats"],
+                "stride": pose_stride,
+            }
+        else:
+            det_preds = preds
         boxes = self._get_decode_xyxy(det_preds).permute(0, 2, 1)
         scores = det_preds["scores"].sigmoid().permute(0, 2, 1)
 
@@ -881,6 +1152,8 @@ class YOLO26PSDetect25D(Detect):
             person_cls = boxes.new_tensor(float(self.person_cls))
             face_cls = boxes.new_tensor(float(self.face_cls))
             cls = torch.where(cls.long().eq(0), person_cls, face_cls)
+        elif use_pose_det:
+            cls = torch.full_like(cls, float(self.person_cls))
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
         det_out = torch.cat([boxes, score, cls], dim=-1)
         if tasks in ({"det"}, {"human_det"}):
@@ -941,7 +1214,8 @@ class YOLO26PSDetect25D(Detect):
 
     def fuse(self) -> None:
         """Remove one-to-many branches for fused end-to-end inference."""
-        self.cv2 = self.cv3 = self.human_cv2 = self.human_cv3 = self.cv4 = self.cv5 = None
+        self.cv2 = self.cv3 = self.human_cv2 = self.human_cv3 = self.pose_cv2 = self.pose_cv3 = self.cv4 = self.cv5 = None
+        self.cv4_kpts = self.cv4_z = self.cv4_sigma = self.flow_model = None
 
 
 class SemanticSegment(nn.Module):

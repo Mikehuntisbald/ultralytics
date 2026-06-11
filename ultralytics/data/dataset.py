@@ -50,7 +50,7 @@ from .utils import (
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
-UNIFIED_CACHE_VERSION = "1.0.10"
+UNIFIED_CACHE_VERSION = "1.0.11"
 UNIFIED_TASK_FLAG_KEYS = ("has_det", "has_pose2d", "has_pose3d", "has_person_mask", "has_scene_seg")
 UNIFIED_INSTANCE_FLAG_KEYS = ("has_bbox", "has_body2d", "has_body3d", "has_person_mask")
 ADE20K_150_LABEL_MAPPING = {0: 255, **{i: i - 1 for i in range(1, 151)}}
@@ -62,6 +62,8 @@ SOURCE_ALIASES = {
     "widerface": "wider_face",
     "wider_face": "wider_face",
     "coco": "coco_wholebody",
+    "coco_keypoints": "coco_keypoints",
+    "coco-keypoints": "coco_keypoints",
     "coco_wholebody": "coco_wholebody",
     "coco-wholebody": "coco_wholebody",
     "coco_person": "coco_person_mask",
@@ -88,10 +90,12 @@ PATH_SOURCE_MARKERS = (
     ("h3wb", ("h3wb", "human36m", "human3.6m")),
     ("ade20k", ("ade20k", "adechallenge", "adechallengedata2016")),
     ("coco_person_mask", ("coco_person_mask",)),
+    ("coco_keypoints", ("coco_keypoints", "coco-keypoints")),
     ("coco_wholebody", ("coco_wholebody", "coco-wholebody", "coco_2017", "coco2017")),
 )
 PERSON_ONLY_SOURCES = {
     "crowdhuman",
+    "coco_keypoints",
     "coco_wholebody",
     "coco_person_mask",
     "ochuman",
@@ -693,6 +697,12 @@ class YOLODataset(BaseDataset):
             cls = self._category_to_id(inst, names)
             if not has_bbox or bbox is None or cls is None:
                 continue
+            if self.data.get("person_only"):
+                person_cls = int(self.data.get("person_cls", 0))
+                category = str(inst.get("category", "")).strip().lower()
+                if int(cls) != person_cls and category != "person":
+                    continue
+                cls = 0
             box = self._normalize_bbox(bbox, width, height, inst.get("bbox_format", record.get("bbox_format", "xyxy")))
             if box is None:
                 continue
@@ -782,14 +792,14 @@ class YOLODataset(BaseDataset):
             if source in {"3dpw", "agora", "h3wb"}:
                 sources.append(source)
         if bool(flags.get("has_pose2d")):
-            if source in {"coco_wholebody", "ochuman", "3dpw", "agora", "h3wb"}:
+            if source in {"coco_keypoints", "coco_wholebody", "ochuman", "3dpw", "agora", "h3wb"}:
                 sources.append(source)
             else:
                 sources.append("coco_wholebody")
         if bool(flags.get("has_det")):
             if source in {"objects365", "crowdhuman", "wider_face"}:
                 sources.append(source)
-            elif source in {"coco_wholebody", "coco_person_mask", "ochuman", "3dpw", "agora", "h3wb"}:
+            elif source in {"coco_keypoints", "coco_wholebody", "coco_person_mask", "ochuman", "3dpw", "agora", "h3wb"}:
                 sources.append(source)
         return list(dict.fromkeys(s for s in sources if s))
 
@@ -1138,11 +1148,16 @@ class YOLODataset(BaseDataset):
 
     @staticmethod
     def _dummy_segment_from_box(box: list[float]) -> np.ndarray:
-        """Return a zero-area polygon inside a bbox for non-mask instances."""
+        """Return a bbox polygon for non-mask instances.
+
+        Unified labels may still pass segments through geometric transforms before
+        formatting. A zero-area placeholder would collapse the transformed bbox,
+        so keep a simple rectangular contour that preserves the instance extent.
+        """
         cx, cy, bw, bh = box
         x1, y1 = cx - bw * 0.5, cy - bh * 0.5
         x2, y2 = cx + bw * 0.5, cy + bh * 0.5
-        return np.array([[x1, y1], [x2, y1], [x2, y1]], dtype=np.float32)
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build and append transforms to the list.

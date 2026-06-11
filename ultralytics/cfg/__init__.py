@@ -198,6 +198,8 @@ CFG_FLOAT_KEYS = frozenset(
         "pose_mpjpe_hard_gain",
         "pose_mpjpe_hard_power",
         "pose_mpjpe_hard_max",
+        "o2m",
+        "final_o2m",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -249,6 +251,7 @@ CFG_INT_KEYS = frozenset(
         "tal_high_gt_topk2_one2one",
         "tal_metric_chunk_gt",
         "prodigy_slice_p",
+        "o2m_decay_updates",
         "train_profile_steps",
         "save_period",
     }

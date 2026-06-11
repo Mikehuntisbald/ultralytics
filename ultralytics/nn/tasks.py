@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     TorchVision,
     WorldDetect,
     YOLO26PSDetect25D,
+    YOLO26PSSegment,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
@@ -585,7 +586,7 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        if isinstance(self.model[-1], YOLO26PSDetect25D):
+        if isinstance(self.model[-1], (YOLO26PSDetect25D, YOLO26PSSegment)):
             return YOLO26PS25DE2ELoss(self) if getattr(self, "end2end", False) else YOLO26PS25DLoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
@@ -651,6 +652,8 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
+        if isinstance(self.model[-1], YOLO26PSSegment):
+            return YOLO26PS25DE2ELoss(self) if getattr(self, "end2end", False) else YOLO26PS25DLoss(self)
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
 
@@ -1849,6 +1852,7 @@ def parse_model(d, ch, verbose=True):
                 Segment,
                 Segment26,
                 YOLO26PSDetect25D,
+                YOLO26PSSegment,
                 YOLOESegment,
                 YOLOESegment26,
                 Pose,
@@ -1857,10 +1861,15 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
-            if m is YOLO26PSDetect25D and len(args) == 6:
-                args.append(None)
+            if m is YOLO26PSDetect25D:
+                if len(args) == 6:
+                    args.extend([None, None, "simple"])
+                elif len(args) == 7:
+                    args.extend([None, "simple"])
+                elif len(args) == 8:
+                    args.append("simple")
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
+            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26 or m is YOLO26PSSegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
@@ -1868,6 +1877,7 @@ def parse_model(d, ch, verbose=True):
                 Segment,
                 Segment26,
                 YOLO26PSDetect25D,
+                YOLO26PSSegment,
                 YOLOESegment,
                 YOLOESegment26,
                 Pose,

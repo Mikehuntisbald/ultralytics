@@ -165,6 +165,10 @@ cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disa
 det_focal_gamma: 0.0 # (float) detection focal gamma; 0 disables focal modulation
 det_focal_alpha: 0.25 # (float) detection focal alpha; set <=0 to disable alpha balancing
 dfl: 1.5 # (float) distribution focal loss gain
+o2m: # (float, optional) one-to-many branch gain for YOLO26 end-to-end losses; unset keeps local defaults
+final_o2m: # (float, optional) final one-to-many branch gain after decay
+o2m_decay_updates: # (int, optional) updates for exponential one-to-many gain decay; <=0 disables decay
+o2m_mix_mode: normalized # (str) E2E loss branch mix mode: normalized or additive/official
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)

@@ -22,7 +22,7 @@ from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.nn.tasks import torch_safe_load
 from ultralytics.utils import LOGGER, RANK, YAML, nms, ops
-from ultralytics.utils.metrics import DetMetrics
+from ultralytics.utils.metrics import DetMetrics, OKS_SIGMA, PoseMetrics, kpt_iou
 from ultralytics.utils.torch_utils import unwrap_model
 
 
@@ -30,6 +30,7 @@ DATA_ROOT = Path("/home/haoyi/Downloads/datasets/vision_benchmarks")
 STAGE_A_ROOT = DATA_ROOT / "YOLO26PS_STAGE_A"
 DATA_YAML = STAGE_A_ROOT / "yolo26ps_stage_a.yaml"
 MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d.yaml"
+STAGE_D_MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-seg.yaml"
 PLAN_YAML = ROOT / "ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml"
 STAGE_DATA_YAMLS = {
     "A_detection": DATA_YAML,
@@ -57,7 +58,7 @@ STAGE_DATA_YAMLS = {
     "C_pose25d_refine2d_targeteasy_neckprobe": ROOT
     / "ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targeteasy.yaml",
     "C_det_reanchor": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_c_det_reanchor.yaml",
-    "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask.yaml",
+    "D_person_mask": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask_person_only.yaml",
     "D_det_recover_objects365": DATA_YAML,
     "D_det_recover_objects365_unfreeze": DATA_YAML,
     "D_det_recover_objects365_shock": DATA_YAML,
@@ -68,15 +69,29 @@ STAGE_DATA_YAMLS = {
     "F_full_finetune_pose_heavy": ROOT / "ultralytics/cfg/datasets/yolo26ps_stage_f_full_finetune.yaml",
 }
 
-LOSS_KEYS = ("det", "human_det", "pose2d", "pose_z", "pose_vis", "bone", "person_mask", "scene_seg")
+LOSS_KEYS = ("det", "human_det", "pose2d", "pose_z", "pose_vis", "pose_rle", "bone", "person_mask", "scene_seg")
 MIXED_AUG_KEYS = ("mosaic", "mixup", "copy_paste", "cutmix")
 BRANCH_MODULES = {
     "det": ("cv2", "cv3", "one2one_cv2", "one2one_cv3"),
     "human_det": ("human_cv2", "human_cv3", "one2one_human_cv2", "one2one_human_cv3"),
-    "pose": ("cv4", "one2one_cv4"),
+    "pose": (
+        "pose_cv2",
+        "pose_cv3",
+        "one2one_pose_cv2",
+        "one2one_pose_cv3",
+        "cv4",
+        "one2one_cv4",
+        "cv4_kpts",
+        "one2one_cv4_kpts",
+        "cv4_z",
+        "one2one_cv4_z",
+        "cv4_sigma",
+        "one2one_cv4_sigma",
+        "flow_model",
+    ),
     "pose_adapter": ("pose_adapter",),
-    "mask": ("cv5", "one2one_cv5", "proto"),
-    "scene": ("scene_seg",),
+    "seg": ("cv5", "one2one_cv5", "proto"),
+    "sem": ("scene_seg",),
     "p2_dense": ("p2_refine",),
 }
 BRANCH_TRAIN_FLAGS = {
@@ -84,8 +99,8 @@ BRANCH_TRAIN_FLAGS = {
     "human_det": "human_det_head",
     "pose": "body25d_head",
     "pose_adapter": "pose_adapter",
-    "mask": "mask_head",
-    "scene": "scene_seg_head",
+    "seg": "seg_head",
+    "sem": "sem_head",
 }
 MODEL_GROUP_RANGES = {
     "backbone": (0, 11),
@@ -115,17 +130,37 @@ HEAD_BN_ALIASES = {
     "pose_head": "pose",
     "pose_adapter": "pose_adapter",
     "pose_only_adapter": "pose_adapter",
-    "d": "mask",
-    "stage_d": "mask",
-    "person_mask": "mask",
-    "mask_head": "mask",
-    "e": "scene",
-    "stage_e": "scene",
-    "scene_seg": "scene",
-    "scene_seg_head": "scene",
+    "d": "seg",
+    "stage_d": "seg",
+    "person_mask": "seg",
+    "person_seg": "seg",
+    "instance_seg": "seg",
+    "mask": "seg",
+    "mask_head": "seg",
+    "seg": "seg",
+    "seg_head": "seg",
+    "e": "sem",
+    "stage_e": "sem",
+    "scene_seg": "sem",
+    "scene_seg_head": "sem",
+    "scene": "sem",
+    "sem": "sem",
+    "sem_head": "sem",
+    "semantic_seg": "sem",
+    "semantic_seg_head": "sem",
     "p2": "p2_dense",
     "p2_refine": "p2_dense",
     "adapter": "p2_dense",
+}
+
+TASK_ALIASES = {
+    "mask": "seg",
+    "person_mask": "seg",
+    "person_seg": "seg",
+    "instance_seg": "seg",
+    "scene": "sem",
+    "scene_seg": "sem",
+    "semantic_seg": "sem",
 }
 
 
@@ -222,6 +257,19 @@ def truthy(value: Any) -> bool:
     return bool(value)
 
 
+def normalize_task_name(task: Any) -> str:
+    """Normalize staged task/branch aliases to canonical training branch names."""
+    name = str(task).strip().lower()
+    return TASK_ALIASES.get(name, name)
+
+
+def branch_flag_enabled(train: dict[str, Any], canonical_key: str, legacy_key: str, default: bool = True) -> bool:
+    """Read a canonical train flag with support for the previous legacy key."""
+    if canonical_key in train:
+        return train_flag_enabled(train, canonical_key, default=default)
+    return train_flag_enabled(train, legacy_key, default=default)
+
+
 def scale_gain(value: Any) -> float:
     """Convert [min, max] scale range into Ultralytics scale gain."""
     if isinstance(value, (list, tuple)) and len(value) == 2:
@@ -243,23 +291,23 @@ def active_tasks_from_stage(stage: dict[str, Any]) -> set[str]:
     if runtime_tasks:
         if isinstance(runtime_tasks, str):
             runtime_tasks = [item.strip() for item in runtime_tasks.split(",") if item.strip()]
-        tasks = {str(task).strip().lower() for task in runtime_tasks}
-        if "pose" in tasks:
-            tasks.add("human_det")
+        tasks = {normalize_task_name(task) for task in runtime_tasks}
         return tasks
     train = stage.get("train") or {}
     loss = stage.get("loss") or {}
     tasks = {"det"}
     if train.get("all"):
-        return {"det", "human_det", "pose", "mask", "scene"}
+        return {"det", "human_det", "pose", "seg", "sem"}
     if train.get("human_det_head") or float(loss.get("human_det", 0.0)):
         tasks.add("human_det")
-    if train.get("body25d_head") or any(float(loss.get(k, 0.0)) for k in ("pose2d", "pose_z", "pose_vis", "bone")):
+    if train.get("body25d_head") or any(
+        float(loss.get(k, 0.0)) for k in ("pose2d", "pose_z", "pose_vis", "pose_rle", "bone")
+    ):
         tasks.add("pose")
-    if train.get("mask_head") or float(loss.get("person_mask", 0.0)):
-        tasks.add("mask")
-    if train.get("scene_seg_head") or float(loss.get("scene_seg", 0.0)):
-        tasks.add("scene")
+    if train.get("seg_head", train.get("mask_head")) or float(loss.get("person_mask", 0.0)):
+        tasks.add("seg")
+    if train.get("sem_head", train.get("scene_seg_head")) or float(loss.get("scene_seg", 0.0)):
+        tasks.add("sem")
     return tasks
 
 
@@ -273,6 +321,10 @@ def branch_trainable_from_stage(stage: dict[str, Any], group: str, active: bool)
         return train_flag_enabled(train, "det_head", default=float(loss.get("det", 0.0)) > 0 or active)
     if group == "human_det":
         return train_flag_enabled(train, "human_det_head", default=False) or float(loss.get("human_det", 0.0)) > 0
+    if group == "seg":
+        return branch_flag_enabled(train, "seg_head", "mask_head", default=active)
+    if group == "sem":
+        return branch_flag_enabled(train, "sem_head", "scene_seg_head", default=active)
     return train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=active)
 
 
@@ -304,8 +356,12 @@ def load_stage_pretrain(model: YOLO, weights: Path) -> None:
             if new_key in target and new_key not in transfer and value.shape == target[new_key].shape:
                 transfer[new_key] = value
                 remapped += 1
+    person_rows = _transfer_person_only_cls_rows(source, target, transfer, final_old, final_new)
     model.model.load_state_dict(transfer, strict=False)
-    LOGGER.info(f"Transferred {len(transfer)}/{len(target)} items from stage pretrain weights ({remapped} final-head remapped)")
+    LOGGER.info(
+        f"Transferred {len(transfer)}/{len(target)} items from stage pretrain weights "
+        f"({remapped} final-head remapped, {person_rows} person-only cls rows)"
+    )
     model.ckpt = {"model": model.model}
     model.ckpt_path = str(weights)
 
@@ -318,6 +374,32 @@ def _final_layer_prefix(state_dict: dict[str, torch.Tensor]) -> int | None:
         if len(parts) > 1 and parts[0] == "model" and parts[1].isdigit():
             layers.append(int(parts[1]))
     return max(layers) if layers else None
+
+
+def _transfer_person_only_cls_rows(
+    source: dict[str, torch.Tensor],
+    target: dict[str, torch.Tensor],
+    transfer: dict[str, torch.Tensor],
+    final_old: int | None,
+    final_new: int | None,
+    person_row: int = 0,
+) -> int:
+    """Slice COCO person logits from an 80-class YOLO seg head into a 1-class Stage D head."""
+    if final_old is None or final_new is None:
+        return 0
+    old_prefix, new_prefix = f"model.{final_old}.", f"model.{final_new}."
+    copied = 0
+    for key, value in source.items():
+        if not key.startswith(old_prefix) or not any(x in key for x in (".cv3.", ".one2one_cv3.", ".proto.semseg.")):
+            continue
+        new_key = new_prefix + key[len(old_prefix) :]
+        if new_key not in target or new_key in transfer:
+            continue
+        dst = target[new_key]
+        if value.ndim >= 1 and dst.shape[0] == 1 and value.shape[0] > person_row and value.shape[1:] == dst.shape[1:]:
+            transfer[new_key] = value[person_row : person_row + 1].clone()
+            copied += 1
+    return copied
 
 
 def apply_loss_overrides(stage: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -373,6 +455,7 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
         "momentum",
         "weight_decay",
         "warmup_epochs",
+        "warmup_momentum",
         "warmup_bias_lr",
         "prodigy_d0",
         "prodigy_d_coef",
@@ -385,6 +468,12 @@ def stage_defaults(plan: dict[str, Any], stage_name: str) -> dict[str, Any]:
         "cos_lr",
         "amp",
         "cache",
+        "nbs",
+        "close_mosaic",
+        "o2m",
+        "final_o2m",
+        "o2m_decay_updates",
+        "o2m_mix_mode",
     ):
         if optimizer_cfg.get(key) is not None:
             defaults[key] = optimizer_cfg[key]
@@ -468,11 +557,16 @@ class YOLO26PSStageValidator(DetectionValidator):
         self.person_cls = int(self.data.get("person_cls", 0))
         self.face_cls = int(self.data.get("face_cls", max(self.nc - 1, 0)))
         self.stage_metric_buckets = {name: DetMetrics(names=self.names) for name in self._stage_bucket_names()}
+        self.pose_metrics = PoseMetrics(names=self.names)
+        self.kpt_shape = self.data.get("kpt_shape", [17, 3])
+        nkpt = int(self.kpt_shape[0]) if self.kpt_shape else 17
+        self.sigma = OKS_SIGMA if self.kpt_shape == [17, 3] else np.ones(nkpt) / nkpt
         self.stage_task_counts = {"pose2d": 0, "pose3d": 0, "person_mask": 0, "scene_seg": 0}
         self.pose2d_mpjpes: list[float] = []
         self.pose2d_input_mpjpes: list[float] = []
         self.pose2d_box_h_norms: list[float] = []
         self.pose2d_source_stats = {
+            "coco_keypoints": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
             "coco_wholebody": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
             "ochuman": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
             "3dpw": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
@@ -507,6 +601,8 @@ class YOLO26PSStageValidator(DetectionValidator):
             return "wider_face"
         if "ochuman" in parts or "ochuman" in normalized:
             return "ochuman"
+        if "coco_keypoints" in parts or "coco_keypoints" in normalized:
+            return "coco_keypoints"
         if "coco_wholebody" in parts or "coco_2017" in parts or "coco2017" in normalized:
             return "coco_wholebody"
         if "3dpw" in parts or "3dpw" in normalized:
@@ -572,6 +668,7 @@ class YOLO26PSStageValidator(DetectionValidator):
 
             pbatch = self._prepare_batch(si, batch)
             predn = self._prepare_pred(pred)
+            pose_stat = self._process_pose_batch(predn, pbatch, batch, si)
             self._update_pose2d_mpjpe(predn, pbatch, batch, si)
             cls = pbatch["cls"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
@@ -584,6 +681,8 @@ class YOLO26PSStageValidator(DetectionValidator):
                 "im_name": Path(pbatch["im_file"]).name,
             }
             self.metrics.update_stats(stat)
+            if pose_stat is not None:
+                self.pose_metrics.update_stats(pose_stat)
 
             source = self._source_name(pbatch["im_file"])
             if source == "objects365":
@@ -629,6 +728,63 @@ class YOLO26PSStageValidator(DetectionValidator):
                         pbatch["ori_shape"],
                         self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
                     )
+
+    def _process_pose_batch(
+        self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any], batch: dict[str, Any], si: int
+    ) -> dict[str, np.ndarray] | None:
+        """Return COCO OKS pose TP stats for pose-capable person instances."""
+        if "pose25d" not in predn or predn["pose25d"].numel() == 0:
+            return None
+        keypoints = batch.get("keypoints")
+        if keypoints is None or not torch.is_tensor(keypoints) or keypoints.numel() == 0:
+            return None
+        idx = batch["batch_idx"] == si
+        if not bool(idx.any()):
+            return None
+        gt_cls_all = batch["cls"][idx].view(-1).to(self.device)
+        gt_kpts = keypoints[idx].to(self.device).float()
+        instance_flags = batch.get("instance_flags")
+        flags = instance_flags[idx].to(self.device).bool() if torch.is_tensor(instance_flags) else None
+        gt_pose_mask = flags[:, 1] if flags is not None else gt_kpts[..., 2].gt(0).any(-1)
+        gt_pose_mask &= gt_cls_all.long().eq(self.person_cls)
+        gt_pose_mask &= gt_kpts[..., 2].gt(0).sum(-1).ge(1)
+        pred_mask = predn["cls"].long().eq(self.person_cls)
+        pred_boxes = predn["bboxes"][pred_mask]
+        pred_pose = predn["pose25d"][pred_mask]
+        pred_conf = predn["conf"][pred_mask]
+        pred_cls = predn["cls"][pred_mask]
+        if pred_boxes.numel() == 0 and not bool(gt_pose_mask.any()):
+            return None
+
+        gt_cls = gt_cls_all[gt_pose_mask]
+        gt_boxes = pbatch["bboxes"][gt_pose_mask]
+        gt_kpts = gt_kpts[gt_pose_mask].clone()
+        if gt_kpts.numel():
+            gt_kpts[..., 0] *= pbatch["imgsz"][1]
+            gt_kpts[..., 1] *= pbatch["imgsz"][0]
+        pred_xy = self._pose_norm_to_input_xy(pred_pose, pred_boxes)
+        pred_kpts = pred_pose.new_zeros((pred_pose.shape[0], pred_pose.shape[1], 3))
+        if pred_pose.numel():
+            pred_kpts[..., :2] = pred_xy
+            pred_kpts[..., 2] = pred_pose[..., 3]
+
+        if gt_cls.shape[0] == 0 or pred_cls.shape[0] == 0:
+            tp_p = np.zeros((pred_cls.shape[0], self.niou), dtype=bool)
+        else:
+            area = ops.xyxy2xywh(gt_boxes)[:, 2:].prod(1) * 0.53
+            iou = kpt_iou(gt_kpts, pred_kpts, sigma=self.sigma, area=area)
+            tp_p = self.match_predictions(pred_cls, gt_cls, iou).cpu().numpy()
+        target_cls = gt_cls.cpu().numpy()
+        pred_cls_np = pred_cls.cpu().numpy()
+        return {
+            "tp": np.zeros((pred_cls.shape[0], self.niou), dtype=bool),
+            "tp_p": tp_p,
+            "conf": pred_conf.cpu().numpy(),
+            "pred_cls": pred_cls_np,
+            "target_cls": target_cls,
+            "target_img": np.unique(target_cls),
+            "im_name": Path(pbatch["im_file"]).name,
+        }
 
     def _update_pose2d_mpjpe(
         self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any], batch: dict[str, Any], si: int
@@ -751,11 +907,13 @@ class YOLO26PSStageValidator(DetectionValidator):
         if RANK == 0:
             for metric in self.stage_metric_buckets.values():
                 self._gather_stage_metric(metric)
+            self._gather_stage_metric(self.pose_metrics)
             self._gather_stage_counts()
             self._gather_pose2d_metrics()
         elif RANK > 0:
             for metric in self.stage_metric_buckets.values():
                 self._gather_stage_metric(metric)
+            self._gather_stage_metric(self.pose_metrics)
             self._gather_stage_counts()
             self._gather_pose2d_metrics()
 
@@ -813,6 +971,7 @@ class YOLO26PSStageValidator(DetectionValidator):
             self.pose2d_input_mpjpes = []
             self.pose2d_box_h_norms = []
             self.pose2d_source_stats = {
+                "coco_keypoints": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
                 "coco_wholebody": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
                 "3dpw": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
                 "agora": {"mpjpes": [], "input_mpjpes": [], "box_h_norms": [], "matched": 0, "total": 0},
@@ -862,10 +1021,38 @@ class YOLO26PSStageValidator(DetectionValidator):
     def get_stats(self) -> dict[str, Any]:
         stats = super().get_stats()
         stats.update(self._stage_results())
+        stats.update(self._pose_ap_results())
         stats.update(self._pose2d_results())
         for name, count in self.stage_task_counts.items():
             stats[f"metrics/stage/{name}_images"] = count
         return stats
+
+    def _pose_ap_results(self) -> dict[str, float]:
+        """Return OKS pose AP metrics for the active validation split."""
+        results = {
+            "metrics/pose/precision(P)": 0.0,
+            "metrics/pose/recall(P)": 0.0,
+            "metrics/pose/mAP50(P)": 0.0,
+            "metrics/pose/mAP75(P)": 0.0,
+            "metrics/pose/mAP50-95(P)": 0.0,
+        }
+        has_stats = bool(self.pose_metrics.stats.get("target_cls")) and any(
+            len(x) for x in self.pose_metrics.stats["target_cls"]
+        )
+        if not has_stats:
+            return results
+        self.pose_metrics.process(save_dir=self.save_dir / "pose_metrics", plot=False, on_plot=self.on_plot)
+        pose_p = np.asarray(self.pose_metrics.pose.p)
+        pose_r = np.asarray(self.pose_metrics.pose.r)
+        pose_ap75 = float(self.pose_metrics.pose.map75)
+        results["metrics/pose/precision(P)"] = float(pose_p.mean()) if pose_p.size else 0.0
+        results["metrics/pose/recall(P)"] = float(pose_r.mean()) if pose_r.size else 0.0
+        results["metrics/pose/mAP50(P)"] = float(self.pose_metrics.pose.map50)
+        results["metrics/pose/mAP75(P)"] = pose_ap75
+        results["metrics/pose/mAP50-95(P)"] = float(self.pose_metrics.pose.map)
+        self.pose_metrics.clear_stats()
+        self.pose_metrics.clear_image_metrics()
+        return results
 
     def _pose2d_results(self) -> dict[str, float]:
         mpjpes = np.asarray(self.pose2d_mpjpes, dtype=np.float32)
@@ -880,6 +1067,7 @@ class YOLO26PSStageValidator(DetectionValidator):
         out.update(self._pose2d_array_results("metrics/pose2d/mpjpe_input", input_mpjpes, suffix="px"))
         out.update(self._pose2d_array_results("metrics/pose2d/mpjpe_box_h_norm", box_h_norms))
         source_prefix = {
+            "coco_keypoints": "metrics/pose2d/source/coco",
             "coco_wholebody": "metrics/pose2d/source/coco",
             "ochuman": "metrics/pose2d/source/ochuman",
             "3dpw": "metrics/pose2d/source/3dpw",
@@ -1039,15 +1227,16 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         """Freeze inactive or explicitly frozen head modules and keep them in eval mode."""
         train = self.stage_cfg.get("train") or {}
         active_groups = set(tasks)
-        if {"mask", "scene"} & tasks:
+        if {"seg", "sem"} & tasks:
             active_groups.add("p2_dense")
+        branch_modules = self._branch_modules_for_head(head)
 
         frozen: list[str] = []
-        for group, names in BRANCH_MODULES.items():
+        for group, names in branch_modules.items():
             if group == "p2_dense":
                 default = group in active_groups
-                trainable = train_flag_enabled(train, "mask_head", default=False) or train_flag_enabled(
-                    train, "scene_seg_head", default=False
+                trainable = branch_flag_enabled(train, "seg_head", "mask_head", default=False) or branch_flag_enabled(
+                    train, "sem_head", "scene_seg_head", default=False
                 )
                 trainable = bool(train.get("all")) or (default and trainable)
             elif group == "pose_adapter":
@@ -1068,6 +1257,18 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                     for p in module.parameters():
                         p.requires_grad = bool(trainable)
         return frozen
+
+    @staticmethod
+    def _branch_modules_for_head(head: nn.Module) -> dict[str, tuple[str, ...]]:
+        """Return logical branch modules, accounting for Segment-style Stage D heads."""
+        modules = dict(BRANCH_MODULES)
+        if head.__class__.__name__ == "YOLO26PSSegment":
+            modules["human_det"] = ()
+            modules["pose"] = ()
+            modules["seg"] = ("cv4", "one2one_cv4", "proto")
+            modules["sem"] = ()
+            modules["p2_dense"] = ("p2_refine", "p2_gate")
+        return modules
 
     def _apply_bn_policy(self, model: nn.Module, head: nn.Module, tasks: set[str]) -> list[str]:
         """Lock BatchNorm/Norm stats by model group or head branch while allowing selected head BN to update."""
@@ -1092,7 +1293,7 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         if head_bn_cfg is None:
             return locked
 
-        branch_policy = self._resolve_head_bn_policy(head_bn_cfg, tasks)
+        branch_policy = self._resolve_head_bn_policy(head, head_bn_cfg, tasks)
         for group, freeze_bn in branch_policy.items():
             modules = self._head_branch_modules(head, group, train)
             if not modules:
@@ -1131,9 +1332,9 @@ class YOLO26PSStageTrainer(DetectionTrainer):
             return {group: True for group in groups}
         return {}
 
-    def _resolve_head_bn_policy(self, value: Any, tasks: set[str]) -> dict[str, bool]:
+    def _resolve_head_bn_policy(self, head: nn.Module, value: Any, tasks: set[str]) -> dict[str, bool]:
         """Resolve freeze_head_bn config to branch -> freeze_bn."""
-        groups = set(BRANCH_MODULES)
+        groups = set(self._branch_modules_for_head(head))
         if isinstance(value, dict):
             policy: dict[str, bool] = {}
             for key, freeze_bn in value.items():
@@ -1147,13 +1348,12 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         freeze_all = truthy(value)
         return {group: freeze_all for group in groups}
 
-    @staticmethod
-    def _head_branch_modules(head: nn.Module, group: str, train: dict[str, Any]) -> list[nn.Module]:
+    def _head_branch_modules(self, head: nn.Module, group: str, train: dict[str, Any]) -> list[nn.Module]:
         """Return modules that belong to a logical head branch."""
-        names = BRANCH_MODULES.get(group, ())
+        names = self._branch_modules_for_head(head).get(group, ())
         if group == "p2_dense":
-            names = names if train_flag_enabled(train, "mask_head", default=False) or train_flag_enabled(
-                train, "scene_seg_head", default=False
+            names = names if branch_flag_enabled(train, "seg_head", "mask_head", default=False) or branch_flag_enabled(
+                train, "sem_head", "scene_seg_head", default=False
             ) else ()
         return [module for name in names if (module := getattr(head, name, None)) is not None]
 
@@ -1305,7 +1505,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain", type=Path, help="optional detection pretrain to partially load into --model")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--data", type=Path, help="dataset YAML; defaults to the selected stage YAML")
-    parser.add_argument("--model", type=Path, default=MODEL_YAML)
+    parser.add_argument("--model", type=Path)
     parser.add_argument("--plan", type=Path, default=PLAN_YAML)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--imgsz", type=int, nargs="+", help="one square size or two values: height width")
@@ -1350,6 +1550,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--momentum", type=float)
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--warmup-epochs", type=float)
+    parser.add_argument("--warmup-momentum", type=float)
     parser.add_argument("--warmup-bias-lr", type=float)
     parser.add_argument("--prodigy-d0", type=float)
     parser.add_argument("--prodigy-d-coef", type=float)
@@ -1472,13 +1673,13 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         batch=batch,
         val_batch=int(val_batch) if val_batch is not None else None,
         val_workers=int(val_workers) if val_workers is not None else None,
-        nbs=batch * accumulate,
+        nbs=int(defaults.get("nbs", batch * accumulate)),
         workers=int(args.workers if args.workers is not None else defaults.get("workers", 8)),
         freeze=int(args.freeze if args.freeze is not None else defaults.get("freeze", 0)),
         project=str(args.project),
         name=args.name or f"yolo26ps_{args.stage.lower()}",
         task="detect",
-        close_mosaic=0,
+        close_mosaic=int(defaults.get("close_mosaic", 0)),
         patience=50,
         resume=args.resume,
         fraction=args.fraction,
@@ -1536,6 +1737,8 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         overrides["cache"] = cache
     for key in MIXED_AUG_KEYS:
         overrides[key] = float(augment.get(key, 0.0))
+    if "translate" in augment:
+        overrides["translate"] = float(augment["translate"])
     if "scale" in augment:
         overrides["scale"] = scale_gain(augment["scale"])
     if "rotate" in augment:
@@ -1549,6 +1752,7 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
         ("momentum", "momentum"),
         ("weight_decay", "weight_decay"),
         ("warmup_epochs", "warmup_epochs"),
+        ("warmup_momentum", "warmup_momentum"),
         ("warmup_bias_lr", "warmup_bias_lr"),
         ("prodigy_d0", "prodigy_d0"),
         ("prodigy_d_coef", "prodigy_d_coef"),
@@ -1557,6 +1761,10 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)
+        if value is not None:
+            overrides[key] = value
+    for key in ("o2m", "final_o2m", "o2m_decay_updates", "o2m_mix_mode"):
+        value = defaults.get(key)
         if value is not None:
             overrides[key] = value
     for key, cli_on, cli_off in (
@@ -1702,6 +1910,15 @@ def main() -> None:
             args.data = data_yaml if data_yaml.is_absolute() else ROOT / data_yaml
         else:
             args.data = STAGE_DATA_YAMLS.get(args.stage, DATA_YAML)
+    if args.model is None:
+        model_yaml = stage.get("model_yaml")
+        if model_yaml:
+            model_yaml = Path(model_yaml)
+            args.model = model_yaml if model_yaml.is_absolute() else ROOT / model_yaml
+        elif args.stage == "D_person_mask":
+            args.model = STAGE_D_MODEL_YAML
+        else:
+            args.model = MODEL_YAML
     YOLO26PSStageTrainer.stage_cfg = stage
     maybe_prepare(args)
     model = YOLO(str(args.weights or args.model))
