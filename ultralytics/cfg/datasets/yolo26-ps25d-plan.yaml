@@ -137,12 +137,13 @@ loss:
     pose2d: 1.0
     pose_z: 0.5
     pose_vis: 0.3
+    pose_rle: 1.0
     bone: 0.1
     person_mask: 0.7
     scene_seg: 0.2
   partial_label_logic:
     has_det: [det]
-    has_pose2d: [pose2d, pose_vis]
+    has_pose2d: [pose2d, pose_vis, pose_rle]
     has_pose3d: [pose_z, bone]
     has_person_mask: [person_mask]
     has_scene_seg: [scene_seg]
@@ -207,8 +208,8 @@ stages:
     legacy_weighted_list: train_weighted_legacy.txt
     sampling: weighted_random_with_replacement
     sampling_weights:
-      objects365: 90
-      crowdhuman: 4
+      objects365: 92
+      crowdhuman: 2
       wider_face: 6
     train_runtime:
       active_tasks: [det]
@@ -220,8 +221,8 @@ stages:
       freeze: 0
       no_val: false
       sampling: weighted_random_with_replacement
-      optimizer: Prodigy
-      lr0: 1.0
+      optimizer: AdamW
+      lr0: 0.0001
       lrf: 1.0
       momentum: 0.9
       weight_decay: 0.0005
@@ -252,7 +253,7 @@ stages:
       small_object_sampling: true
       small_object_source: objects365
       small_object_area: 1024.0
-      small_object_boost: 2.0
+      small_object_boost: 1.8
       small_object_crop: 0.1
       small_object_crop_source: objects365
       small_object_crop_area: 1024.0
@@ -291,8 +292,10 @@ stages:
       crowdhuman: 15
       wider_face: 50
       3dpw: 10
-      agora: 17
+      # agora: 17
       ochuman: 8
+      agora: 5
+      coco_person_mask: 12
     train_runtime:
       active_tasks: [human_det]
       imgsz: [576, 768]
@@ -327,7 +330,7 @@ stages:
         det: true
         human_det: false
         pose: true
-        seg: true
+        seg: false
         sem: true
         p2_dense: true
       tal_topk_one2many: 10
@@ -454,9 +457,9 @@ stages:
       sem_head: false
     loss:
       det: 1.0
-      pose2d: 24.0
+      pose2d: 12.0
       pose_z: 0.0
-      pose_vis: 4.0
+      pose_vis: 1.0
       pose_rle: 1.0
       bone: 0.0
     augment:
@@ -469,23 +472,25 @@ stages:
       flip: 0.5
   C_pose25d_warmup:
     epochs: 3
-    samples_per_epoch: 20000
+    samples_per_epoch: 40000
     val_samples: 2000
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      coco_keypoints: 30
+      coco_wholebody: 40
       3dpw: 30
-      agora: 40
+      agora: 30
     train_runtime:
       active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 20
-      accumulate: 4
+      batch: 96
+      val_batch: 32
+      accumulate: 1
       workers: 20
-      optimizer: Prodigy
-      lr0: 1.0
+      optimizer: AdamW
+      lr0: 0.0000145982
       lrf: 1.0
       momentum: 0.9
       weight_decay: 0.0005
@@ -493,7 +498,7 @@ stages:
       warmup_bias_lr: 0.0
       prodigy_d0: 0.000001
       prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.02
+      prodigy_growth_rate: 1.005
       prodigy_slice_p: 11
       prodigy_decouple: true
       prodigy_use_bias_correction: false
@@ -502,18 +507,29 @@ stages:
       freeze_model_bn:
         backbone: true
         det_neck: true
-        pose_neck: true
+        pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
-      pose_anchor_topk: 16
-      pose_anchor_radius: 0.5
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
+      pose_xy_loss: oks
+      pose_oks_conf_weight: false
+      pose_oks_max_px: 0.0
+      pose_oks_max_box_frac: 0.0
+      pose_oks_loss_clip: 1.0
       scheduler: constant
       cos_lr: false
       ema: true
@@ -523,16 +539,17 @@ stages:
       det_neck: false
       pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
       det: 1.0
-      pose2d: 24.0
-      pose_z: 16.8
-      pose_vis: 4.0
+      pose2d: 12.0
+      pose_z: 4.8
+      pose_vis: 1.0
       pose_rle: 1.0
-      bone: 0.0
+      bone: 0.1
     augment:
       mosaic: 1.0
       mixup: 0.0
@@ -545,12 +562,13 @@ stages:
     epochs: 30
     samples_per_epoch: 100000
     val_samples: 2000
-    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_detreplay.yaml
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
-      coco_keypoints: 30
+      coco_wholebody: 40
       3dpw: 30
-      agora: 40
+      agora: 30
       # objects365: 92
       # crowdhuman: 2
       # wider_face: 6
@@ -558,12 +576,12 @@ stages:
       active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 12
-      val_batch: 32
-      accumulate: 4
+      batch: 120
+      val_batch: 48
+      accumulate: 1
       workers: 20
-      optimizer: Prodigy
-      lr0: 1.0
+      optimizer: AdamW
+      lr0: 0.0000145982
       lrf: 1.0
       momentum: 0.9
       weight_decay: 0.0005
@@ -583,20 +601,21 @@ stages:
         pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
       tal_high_gt_threshold: 900
-      tal_high_gt_topk_one2many: 8
-      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk_one2many: 10
+      tal_high_gt_topk_one2one: 7
       tal_high_gt_topk2_one2one: 1
       tal_metric_chunk_gt: 256
-      pose_anchor_topk: 16
-      pose_anchor_radius: 0.5
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
       pose_xy_loss: oks
       pose_oks_conf_weight: false
       pose_oks_max_px: 0.0
@@ -604,7 +623,7 @@ stages:
       pose_oks_loss_clip: 1.0
       pose_fitness: mpjpe
       det_class_mask_normalization: none
-      det_partial_cls_positive_only: true
+      det_partial_cls_positive_only: false
       scheduler: constant
       cos_lr: false
       ema: true
@@ -614,16 +633,17 @@ stages:
       det_neck: false
       pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
       det: 1.0
-      pose2d: 24.0
-      pose_z: 16.8
-      pose_vis: 4.0
+      pose2d: 12.0
+      pose_z: 4.8
+      pose_vis: 1.0
       pose_rle: 1.0
-      bone: 0.0
+      bone: 0.1
     augment:
       mosaic: 1.0
       mixup: 0.0
@@ -636,6 +656,7 @@ stages:
     epochs: 30
     samples_per_epoch: 100000
     val_samples: 2000
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_poseonly_ochuman.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
@@ -644,7 +665,7 @@ stages:
       agora: 60
       # ochuman: 10
     train_runtime:
-      active_tasks: [human_det, pose]
+      active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 64
@@ -658,9 +679,9 @@ stages:
       weight_decay: 0.0005
       warmup_epochs: 0.0
       warmup_bias_lr: 0.0
-      prodigy_d0: 0.00000862714
+      prodigy_d0: 0.000001
       prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.01
+      prodigy_growth_rate: 1.005
       prodigy_slice_p: 11
       prodigy_decouple: true
       prodigy_use_bias_correction: false
@@ -672,20 +693,21 @@ stages:
         pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
       tal_high_gt_threshold: 900
       tal_high_gt_topk_one2many: 8
       tal_high_gt_topk_one2one: 6
       tal_high_gt_topk2_one2one: 1
       tal_metric_chunk_gt: 256
-      pose_anchor_topk: 16
-      pose_anchor_radius: 0.5
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
       pose_xy_loss: oks
       pose_oks_conf_weight: false
       pose_oks_max_px: 0.0 #160
@@ -693,7 +715,7 @@ stages:
       pose_oks_loss_clip: 1.0
       pose_fitness: mpjpe
       det_class_mask_normalization: none
-      det_partial_cls_positive_only: true
+      det_partial_cls_positive_only: false
       scheduler: constant
       cos_lr: false
       ema: true
@@ -703,14 +725,16 @@ stages:
       det_neck: false
       pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
-      det: 0.0
-      pose2d: 1.0
-      pose_z: 0.7
-      pose_vis: 0.3
+      det: 1.0
+      pose2d: 12.0
+      pose_z: 8.4
+      pose_vis: 1.0
+      pose_rle: 1.0
       bone: 0.1
     augment:
       mosaic: 0.0
@@ -724,6 +748,7 @@ stages:
     epochs: 6
     samples_per_epoch: 44006
     val_samples: 3000
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targetclean.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
@@ -732,7 +757,7 @@ stages:
       3dpw: 20
       ochuman: 0
     train_runtime:
-      active_tasks: [human_det, pose]
+      active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -757,21 +782,30 @@ stages:
       freeze_model_bn:
         backbone: true
         det_neck: true
-        pose_neck: true
+        pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
-      pose_anchor_topk: 24
-      pose_anchor_radius: 0.65
-      pose_xy_loss: pixel
-      pose_xy_beta: 0.05
-      pose_fitness: mpjpe_input
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
+      pose_xy_loss: oks
+      pose_oks_conf_weight: false
+      pose_oks_max_px: 0.0
+      pose_oks_max_box_frac: 0.0
+      pose_oks_loss_clip: 1.0
+      pose_fitness: mpjpe
       pose_fitness_sources:
         coco: 1.0
         agora: 1.0
@@ -784,16 +818,18 @@ stages:
     train:
       backbone: false
       det_neck: false
-      pose_neck: false
+      pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
-      det: 0.0
-      pose2d: 1.2
-      pose_z: 0.0
-      pose_vis: 0.2
+      det: 1.0
+      pose2d: 12.0
+      pose_z: 8.4
+      pose_vis: 1.0
+      pose_rle: 1.0
       bone: 0.0
     augment:
       mosaic: 0.0
@@ -807,6 +843,7 @@ stages:
     epochs: 6
     samples_per_epoch: 13274
     val_samples: 1119
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targetstrict.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
@@ -815,7 +852,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [human_det, pose]
+      active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -840,21 +877,30 @@ stages:
       freeze_model_bn:
         backbone: true
         det_neck: true
-        pose_neck: true
+        pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
-      pose_anchor_topk: 24
-      pose_anchor_radius: 0.65
-      pose_xy_loss: pixel
-      pose_xy_beta: 0.05
-      pose_fitness: mpjpe_input
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
+      pose_xy_loss: oks
+      pose_oks_conf_weight: false
+      pose_oks_max_px: 0.0
+      pose_oks_max_box_frac: 0.0
+      pose_oks_loss_clip: 1.0
+      pose_fitness: mpjpe
       pose_fitness_sources:
         coco: 1.0
         agora: 1.0
@@ -866,16 +912,18 @@ stages:
     train:
       backbone: false
       det_neck: false
-      pose_neck: false
+      pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
-      det: 0.0
-      pose2d: 1.2
+      det: 1.0
+      pose2d: 24.0
       pose_z: 0.0
-      pose_vis: 0.2
+      pose_vis: 4.0
+      pose_rle: 1.0
       bone: 0.0
     augment:
       mosaic: 0.0
@@ -889,6 +937,7 @@ stages:
     epochs: 8
     samples_per_epoch: 1225
     val_samples: 107
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-yolo-pose.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_c_pose25d_targeteasy.yaml
     sampling: weighted_random_with_replacement
     sampling_weights:
@@ -897,7 +946,7 @@ stages:
       3dpw: 0
       ochuman: 0
     train_runtime:
-      active_tasks: [human_det, pose]
+      active_tasks: [pose]
       imgsz: [576, 768]
       pad_stride: 32
       batch: 24
@@ -922,21 +971,30 @@ stages:
       freeze_model_bn:
         backbone: true
         det_neck: true
-        pose_neck: true
+        pose_neck: false
       freeze_head_bn:
         det: true
+        human_det: true
         pose: false
         seg: true
         sem: true
         p2_dense: true
-      tal_topk_one2many: 7
-      tal_topk_one2one: 5
+      tal_topk_one2many: 10
+      tal_topk_one2one: 7
       tal_topk2_one2one: 1
-      pose_anchor_topk: 24
-      pose_anchor_radius: 0.65
-      pose_xy_loss: pixel
-      pose_xy_beta: 0.05
-      pose_fitness: mpjpe_input
+      tal_high_gt_threshold: 900
+      tal_high_gt_topk_one2many: 8
+      tal_high_gt_topk_one2one: 6
+      tal_high_gt_topk2_one2one: 1
+      tal_metric_chunk_gt: 256
+      pose_anchor_topk: 0
+      pose_anchor_radius: 0.0
+      pose_xy_loss: oks
+      pose_oks_conf_weight: false
+      pose_oks_max_px: 0.0
+      pose_oks_max_box_frac: 0.0
+      pose_oks_loss_clip: 1.0
+      pose_fitness: mpjpe
       pose_fitness_sources:
         agora: 1.0
       pose_fitness_p90_weight: 0.25
@@ -947,16 +1005,18 @@ stages:
     train:
       backbone: false
       det_neck: false
-      pose_neck: false
+      pose_neck: true
       det_head: false
+      human_det_head: false
       body25d_head: true
       seg_head: false
       sem_head: false
     loss:
-      det: 0.0
-      pose2d: 1.2
+      det: 1.0
+      pose2d: 24.0
       pose_z: 0.0
-      pose_vis: 0.2
+      pose_vis: 4.0
+      pose_rle: 1.0
       bone: 0.0
     augment:
       mosaic: 0.0
@@ -966,44 +1026,142 @@ stages:
       scale: [0.9, 1.1]
       rotate: [-5, 5]
       flip: 0.5
-  D_person_mask:
-    epochs: 35
-    samples_per_epoch: 40000
-    val_samples: 2000
+  D_person_mask_warmup: &stage_d_person_mask_warmup
+    description: Stage D warmup; replace the branch after the shared backbone with official YOLO26-seg P3-P5 neck/head, import yolo26s-seg person weights, and keep P2 fusion disabled.
+    epochs: 3
+    samples_per_epoch: 100000
+    val_samples: 1000
     plots: false
-    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-seg.yaml
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-segbranch.yaml
     data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask_person_only.yaml
+    init:
+      base_checkpoint: runs/detect/yolo26ps_c_pose25d_fixedlr_1p46e5_guard_fixedcls/weights/best.pt
+      seg_pretrain: pretrains/yolo26s-seg.pt
+      seg_pretrain_scope: neck_head
+      seg_pretrain_person_row: 0
+      note: Copy YOLO26s-seg neck/head into the person-only Stage D branch; the C backbone and other branches stay frozen.
     sampling: weighted_random_with_replacement
     sampling_weights:
       coco_person_mask: 95
       ochuman: 5
     train_runtime:
-      active_tasks: [det, seg]
+      active_tasks: [seg]
       imgsz: [576, 768]
       pad_stride: 32
-      batch: 72
-      val_batch: 20
+      batch: 96
+      val_batch: 16
       accumulate: 1
-      workers: 10
-      val_workers: 10
-      optimizer: Prodigy
-      lr0: 1.0
+      workers: 4
+      val_workers: 4
+      nbs: 96
+      optimizer: AdamW
+      lr0: 0.0001
       lrf: 1.0
       momentum: 0.9
       weight_decay: 0.0005
       warmup_epochs: 0.0
       warmup_bias_lr: 0.0
-      prodigy_d0: 0.000001
-      prodigy_d_coef: 1.0
-      prodigy_growth_rate: 1.005
-      prodigy_slice_p: 11
-      prodigy_decouple: true
-      prodigy_use_bias_correction: false
-      prodigy_safeguard_warmup: true
+      person_mask_assignment_head: seg
+      person_mask_decode_head: seg
+      seg_branch: official_yolo26seg_p3_p5
+      seg_pretrain_scope: neck_head
+      use_p2_refine: false
+      p2_gate_init: 0.0
+      train_head_modules: [cv2, cv3, one2one_cv2, one2one_cv3, cv4, one2one_cv4, proto]
+      freeze_head_modules: [p2_refine, p2_gate]
       freeze_trainable_bn: false
       freeze_model_bn:
         backbone: true
         det_neck: true
+        seg_neck: false
+        pose_neck: true
+      freeze_head_bn:
+        det: true
+        human_det: true
+        pose: true
+        seg: false
+        sem: true
+        p2_dense: true
+      tal_topk_one2many: 7
+      tal_topk_one2one: 5
+      tal_topk2_one2one: 1
+      scheduler: constant
+      cos_lr: false
+      ema: true
+      amp: true
+    train:
+      backbone: false
+      det_neck: false
+      seg_neck: true
+      pose_neck: false
+      det_head: false
+      human_det_head: false
+      body25d_head: false
+      seg_head: true
+      sem_head: false
+    loss:
+      det: 1.0
+      human_det: 0.0
+      pose2d: 0.0
+      pose_z: 0.0
+      pose_vis: 0.0
+      person_mask: 1.0
+      person_mask_dice: 0.0
+      bone: 0.0
+    augment:
+      mosaic: 0.0
+      mixup: 0.0
+      copy_paste: 0.0
+      cutmix: 0.0
+      scale: [0.7, 1.3]
+      rotate: [-10, 10]
+      flip: 0.5
+  D_person_mask: &stage_d_person_mask_main
+    description: Stage D main train; continue from warmup, enable learned zero-init det-P2 to seg-P3 fusion, and train only the seg neck/head plus the P2 gate/refine path.
+    epochs: 30
+    samples_per_epoch: 100000
+    val_samples: 1000
+    plots: false
+    model_yaml: ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-segbranch.yaml
+    data_yaml: ultralytics/cfg/datasets/yolo26ps_stage_d_person_mask_person_only.yaml
+    init:
+      resume_from: runs/detect/yolo26ps_d_segbranch_warmup_yolo26seg_pretrain_e3_b96_0616_004902/weights/last.pt
+      base_checkpoint: runs/detect/yolo26ps_c_pose25d_fixedlr_1p46e5_guard_fixedcls/weights/best.pt
+      seg_pretrain: pretrains/yolo26s-seg.pt
+      p2_gate_init: 0.0
+      note: Formal training starts from the warmup checkpoint; the saved P2 gate remains zero until this phase updates it.
+    sampling: weighted_random_with_replacement
+    sampling_weights:
+      coco_person_mask: 95
+      ochuman: 5
+    train_runtime:
+      active_tasks: [seg]
+      imgsz: [576, 768]
+      pad_stride: 32
+      batch: 96
+      val_batch: 16
+      accumulate: 1
+      workers: 4
+      val_workers: 4
+      nbs: 96
+      optimizer: AdamW
+      lr0: 0.0001
+      lrf: 1.0
+      momentum: 0.9
+      weight_decay: 0.0005
+      warmup_epochs: 0.0
+      warmup_bias_lr: 0.0
+      person_mask_assignment_head: seg
+      person_mask_decode_head: seg
+      seg_branch: official_yolo26seg_p3_p5
+      use_p2_refine: true
+      p2_gate_init: 0.0
+      train_head_modules: [p2_refine, p2_gate, cv2, cv3, one2one_cv2, one2one_cv3, cv4, one2one_cv4, proto]
+      freeze_trainable_bn: false
+      freeze_model_bn:
+        backbone: true
+        det_neck: true
+        seg_neck: false
         pose_neck: true
       freeze_head_bn:
         det: true
@@ -1022,17 +1180,21 @@ stages:
     train:
       backbone: false
       det_neck: false
+      seg_neck: true
       pose_neck: false
       det_head: false
+      human_det_head: false
       body25d_head: false
       seg_head: true
       sem_head: false
     loss:
-      det: 0.0
+      det: 1.0
+      human_det: 0.0
       pose2d: 0.0
       pose_z: 0.0
       pose_vis: 0.0
       person_mask: 1.0
+      person_mask_dice: 0.0
       bone: 0.0
     augment:
       mosaic: 0.0
@@ -1042,6 +1204,12 @@ stages:
       scale: [0.7, 1.3]
       rotate: [-10, 10]
       flip: 0.5
+  D_person_mask_segbranch_warmup:
+    <<: *stage_d_person_mask_warmup
+    alias_for: D_person_mask_warmup
+  D_person_mask_segbranch:
+    <<: *stage_d_person_mask_main
+    alias_for: D_person_mask
   D_det_recover_objects365_prodigy_fast:
     epochs: 30
     samples_per_epoch: 400000
