@@ -1,0 +1,5 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Alias config for YOLO26s-PS Stage D det-neck-adapted segmentation.
+scale: s
+__base__: yolo26-ps25d-stage-d-detneck-seg.yaml

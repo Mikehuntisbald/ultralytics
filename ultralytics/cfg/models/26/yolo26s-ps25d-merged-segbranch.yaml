@@ -1,0 +1,4 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Alias config for YOLO26s-PS full det/pose2.5D plus Stage-D segbranch.
+# The parser resolves this to yolo26-ps25d-merged-segbranch.yaml and sets scale=s.
