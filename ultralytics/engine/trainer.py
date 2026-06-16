@@ -952,6 +952,7 @@ class BaseTrainer:
                 self.args.model = self.args.resume = str(last)  # reinstate model
                 for k in (
                     "imgsz",
+                    "epochs",
                     "batch",
                     "nbs",
                     "device",
@@ -967,6 +968,10 @@ class BaseTrainer:
                     "freeze",
                     "val",
                     "plots",
+                    "sampling",
+                    "samples_per_epoch",
+                    "sampling_weights",
+                    "person_mask_dice_weight",
                 ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])

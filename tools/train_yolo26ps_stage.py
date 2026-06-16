@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
+from ultralytics.models.yolo.segment import SegmentationValidator
 from ultralytics.nn.tasks import torch_safe_load
 from ultralytics.utils import LOGGER, RANK, YAML, nms, ops
 from ultralytics.utils.metrics import DetMetrics, OKS_SIGMA, PoseMetrics, kpt_iou
@@ -31,6 +32,7 @@ STAGE_A_ROOT = DATA_ROOT / "YOLO26PS_STAGE_A"
 DATA_YAML = STAGE_A_ROOT / "yolo26ps_stage_a.yaml"
 MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d.yaml"
 STAGE_D_MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-seg.yaml"
+STAGE_D_SEGBRANCH_MODEL_YAML = ROOT / "ultralytics/cfg/models/26/yolo26s-ps25d-stage-d-segbranch.yaml"
 PLAN_YAML = ROOT / "ultralytics/cfg/datasets/yolo26-ps25d-plan.yaml"
 STAGE_DATA_YAMLS = {
     "A_detection": DATA_YAML,
@@ -100,11 +102,13 @@ BRANCH_TRAIN_FLAGS = {
     "pose": "body25d_head",
     "pose_adapter": "pose_adapter",
     "seg": "seg_head",
+    "seg_neck": "seg_neck",
     "sem": "sem_head",
 }
 MODEL_GROUP_RANGES = {
     "backbone": (0, 11),
     "det_neck": (11, 29),
+    "seg_neck": (0, 0),
     "pose_neck": (29, -1),
 }
 NORM_TYPES = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
@@ -139,6 +143,7 @@ HEAD_BN_ALIASES = {
     "mask_head": "seg",
     "seg": "seg",
     "seg_head": "seg",
+    "seg_neck": "seg",
     "e": "sem",
     "stage_e": "sem",
     "scene_seg": "sem",
@@ -151,6 +156,8 @@ HEAD_BN_ALIASES = {
     "p2": "p2_dense",
     "p2_refine": "p2_dense",
     "adapter": "p2_dense",
+    "seg_adapt": "p2_dense",
+    "seg_adapter": "p2_dense",
 }
 
 TASK_ALIASES = {
@@ -199,6 +206,29 @@ def normalize_imgsz(value: Any) -> int | list[int]:
     return int(value)
 
 
+def normalize_name_list(value: Any) -> set[str]:
+    """Normalize a YAML/CLI module-name list to lowercase names."""
+    if value in (None, False):
+        return set()
+    if isinstance(value, str):
+        raw = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    return {str(x).strip().lower() for x in raw if str(x).strip()}
+
+
+def normalize_decode_head(value: Any) -> str:
+    """Normalize staged person-mask assignment/decode head names."""
+    head = str(value or "seg").strip().lower()
+    if head in {"seg", "segment", "mask", "det", "default"}:
+        return "seg"
+    if head in {"human", "human_det", "person", "person_face"}:
+        return "human"
+    return "seg"
+
+
 def normalize_cache(value: Any) -> bool | str | None:
     """Normalize cache values from CLI/YAML for Ultralytics overrides."""
     if value is None or isinstance(value, bool):
@@ -245,7 +275,7 @@ def train_flag_enabled(train: dict[str, Any], key: str, default: bool = True) ->
 
 def train_group_enabled(train: dict[str, Any], key: str, default: bool = True) -> bool:
     """Read model-group trainability with a legacy fallback for the old combined neck key."""
-    if key in {"det_neck", "pose_neck"} and key not in train and "neck" in train:
+    if key in {"det_neck", "seg_neck", "pose_neck"} and key not in train and "neck" in train:
         return train_flag_enabled(train, "neck", default=default)
     return train_flag_enabled(train, key, default=default)
 
@@ -357,10 +387,12 @@ def load_stage_pretrain(model: YOLO, weights: Path) -> None:
                 transfer[new_key] = value
                 remapped += 1
     person_rows = _transfer_person_only_cls_rows(source, target, transfer, final_old, final_new)
+    tail_human = _transfer_tail_aligned_human_head(source, target, transfer, final_old, final_new)
     model.model.load_state_dict(transfer, strict=False)
     LOGGER.info(
         f"Transferred {len(transfer)}/{len(target)} items from stage pretrain weights "
-        f"({remapped} final-head remapped, {person_rows} person-only cls rows)"
+        f"({remapped} final-head remapped, {person_rows} person-only cls rows, "
+        f"{tail_human} tail-aligned human-det items)"
     )
     model.ckpt = {"model": model.model}
     model.ckpt_path = str(weights)
@@ -400,6 +432,134 @@ def _transfer_person_only_cls_rows(
             transfer[new_key] = value[person_row : person_row + 1].clone()
             copied += 1
     return copied
+
+
+def _head_branch_layers(state_dict: dict[str, torch.Tensor], final_layer: int | None, branch: str) -> list[int]:
+    """Return sorted per-scale layer indices for a final-head branch."""
+    if final_layer is None:
+        return []
+    prefix = f"model.{final_layer}.{branch}."
+    layers = set()
+    for key in state_dict:
+        if not key.startswith(prefix):
+            continue
+        part = key[len(prefix) :].split(".", 1)[0]
+        if part.isdigit():
+            layers.add(int(part))
+    return sorted(layers)
+
+
+def _transfer_tail_aligned_human_head(
+    source: dict[str, torch.Tensor],
+    target: dict[str, torch.Tensor],
+    transfer: dict[str, torch.Tensor],
+    final_old: int | None,
+    final_new: int | None,
+) -> int:
+    """Map 4-scale PS human-det heads to 3-scale Stage D P3-P5 adapter heads.
+
+    Stage C/A human_det is P2-P5, while the det-neck adapter segment head consumes only
+    PAN P3-P5. Same-name partial loading would silently copy P2/P3/P4 into P3/P4/P5,
+    so align the target's three scales with the source tail instead.
+    """
+    copied = 0
+    if final_old is None or final_new is None:
+        return copied
+    for branch in ("human_cv2", "human_cv3", "one2one_human_cv2", "one2one_human_cv3"):
+        src_layers = _head_branch_layers(source, final_old, branch)
+        dst_layers = _head_branch_layers(target, final_new, branch)
+        if not src_layers or not dst_layers or len(src_layers) <= len(dst_layers):
+            continue
+        layer_map = dict(zip(dst_layers, src_layers[-len(dst_layers) :]))
+        src_prefix = f"model.{final_old}.{branch}."
+        dst_prefix = f"model.{final_new}.{branch}."
+        for dst_layer, src_layer in layer_map.items():
+            src_layer_prefix = f"{src_prefix}{src_layer}."
+            dst_layer_prefix = f"{dst_prefix}{dst_layer}."
+            for key, value in source.items():
+                if not key.startswith(src_layer_prefix):
+                    continue
+                new_key = dst_layer_prefix + key[len(src_layer_prefix) :]
+                if new_key in target and value.shape == target[new_key].shape:
+                    transfer[new_key] = value
+                    copied += 1
+    return copied
+
+
+def _copy_seg_pretrain_tensor(
+    target: dict[str, torch.Tensor],
+    transfer: dict[str, torch.Tensor],
+    new_key: str,
+    value: torch.Tensor,
+    person_row: int,
+) -> bool:
+    """Copy a source tensor, slicing COCO person rows when the Stage D tensor is person-only."""
+    if new_key not in target:
+        return False
+    dst = target[new_key]
+    if value.shape == dst.shape:
+        transfer[new_key] = value
+        return True
+    if value.ndim >= 1 and dst.shape[0] == 1 and value.shape[0] > person_row and value.shape[1:] == dst.shape[1:]:
+        transfer[new_key] = value[person_row : person_row + 1].clone()
+        return True
+    return False
+
+
+def load_seg_head_pretrain(
+    model: YOLO, weights: Path, person_row: int = 0, scope: str = "head", neck_offset: int | None = None
+) -> None:
+    """Load YOLO26 segmentation pretrained weights into a Stage D segmentation branch."""
+    yaml_file = getattr(model.model, "yaml_file", None) or "model"
+    scope = str(scope or "head").strip().lower()
+    LOGGER.info(f"Loading YOLO26 seg {scope} weights into {yaml_file}: {weights}")
+    ckpt, _ = torch_safe_load(weights)
+    source_model = (ckpt.get("ema") or ckpt["model"]).float()
+    source = source_model.state_dict()
+    target = model.model.state_dict()
+    final_old, final_new = _final_layer_prefix(source), _final_layer_prefix(target)
+    transfer: dict[str, torch.Tensor] = {}
+    copied = 0
+    skipped = 0
+    if final_old is None or final_new is None:
+        LOGGER.warning("Could not identify final head layer while loading seg head pretrain.")
+        return
+    if scope in {"all", "backbone_neck_head", "full"}:
+        for key, value in source.items():
+            if key.startswith(f"model.{final_old}."):
+                continue
+            if key in target and value.shape == target[key].shape:
+                transfer[key] = value
+                copied += 1
+    if scope in {"neck_head", "segbranch", "branch", "all", "backbone_neck_head", "full"}:
+        # Map the official yolo26-seg neck layers 11..22 onto the Stage D segbranch neck.
+        # For yolo26-ps25d-stage-d-segbranch.yaml the seg neck starts at layer 20 because
+        # layers 11..19 are the frozen PS detector neck used only for P2 fusion.
+        offset = int(9 if neck_offset is None else neck_offset)
+        for key, value in source.items():
+            parts = key.split(".", 2)
+            if len(parts) < 3 or parts[0] != "model" or not parts[1].isdigit():
+                continue
+            layer = int(parts[1])
+            if not (11 <= layer < final_old):
+                continue
+            new_key = f"model.{layer + offset}.{parts[2]}"
+            if _copy_seg_pretrain_tensor(target, transfer, new_key, value, person_row):
+                copied += 1
+    old_prefix, new_prefix = f"model.{final_old}.", f"model.{final_new}."
+    for key, value in source.items():
+        if not key.startswith(old_prefix):
+            continue
+        rel = key[len(old_prefix) :]
+        if rel.startswith(("seg_adapt.", "p2_refine.", "human_")) or rel.startswith("one2one_human_"):
+            continue
+        new_key = new_prefix + rel
+        if _copy_seg_pretrain_tensor(target, transfer, new_key, value, person_row):
+            copied += 1
+        else:
+            skipped += 1
+    model.model.load_state_dict(transfer, strict=False)
+    LOGGER.info(f"Transferred {len(transfer)} YOLO26 seg {scope} items from {weights} ({skipped} head items skipped).")
 
 
 def apply_loss_overrides(stage: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -1131,6 +1291,159 @@ class YOLO26PSStageValidator(DetectionValidator):
         return results
 
 
+class YOLO26PSStageDMaskValidator(SegmentationValidator):
+    """Stage D validator that evaluates adapter masks from the configured detection branch."""
+
+    def __init__(self, *args, decode_head: str = "seg", **kwargs):
+        """Initialize the Stage D mask validator with an explicit decode branch."""
+        super().__init__(*args, **kwargs)
+        self.decode_head = normalize_decode_head(decode_head)
+
+    def init_metrics(self, model):
+        """Initialize segmentation metrics and keep a handle to the adapter head for raw human-det decoding."""
+        super().init_metrics(model)
+        layers = getattr(model, "model", None)
+        if hasattr(layers, "model"):
+            layers = layers.model
+        self.head = layers[-1]
+        self.nc = 1
+        self.names = {0: "Person"}
+        self.metrics.names = self.names
+
+    def _raw_one2many(self, preds):
+        """Return the raw one-to-many dict for branch-specific mask decoding."""
+        raw = preds[1] if isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[1], dict) else None
+        if raw is None and isinstance(preds, dict):
+            raw = preds
+        if isinstance(raw, dict) and "one2many" in raw:
+            raw = raw["one2many"]
+        return raw
+
+    def _raw_prediction_tensor(self, raw: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build an NMS input tensor from raw boxes/scores and mask coefficients."""
+        use_human = self.decode_head == "human" and "human_boxes" in raw and "human_scores" in raw
+        decode_raw = raw
+        if use_human:
+            decode_raw = {
+                **raw,
+                "boxes": raw["human_boxes"],
+                "scores": raw["human_scores"][:, :1],
+                "feats": raw.get("human_feats", raw.get("feats")),
+            }
+        self.head._get_decode_boxes(decode_raw)
+        boxes = self.head.decode_bboxes(
+            self.head.dfl(decode_raw["boxes"]), self.head.anchors.unsqueeze(0), xywh=False
+        )
+        boxes = (boxes * self.head.strides).permute(0, 2, 1)
+        scores = decode_raw["scores"][:, :1].sigmoid().permute(0, 2, 1)
+        mask_coef = raw["mask_coefficient"].permute(0, 2, 1)
+        return torch.cat((ops.xyxy2xywh(boxes), scores, mask_coef), dim=2).permute(0, 2, 1)
+
+    def postprocess(self, preds):
+        """Decode boxes and aligned mask coefficients from raw one-to-many Stage D outputs."""
+        raw = self._raw_one2many(preds)
+        if not isinstance(raw, dict) or "mask_coefficient" not in raw:
+            return super().postprocess(preds[0] if isinstance(preds, tuple) else preds)
+        proto = raw.get("proto")
+        if isinstance(proto, tuple):
+            proto = proto[0]
+        if proto is None:
+            raise RuntimeError("Stage D mask validator requires proto outputs.")
+
+        pred = self._raw_prediction_tensor(raw)
+        outputs = nms.non_max_suppression(
+            pred,
+            self.args.conf,
+            self.args.iou,
+            nc=1,
+            multi_label=True,
+            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            end2end=False,
+        )
+        imgsz = [4 * x for x in proto.shape[2:]]
+        processed = []
+        for i, x in enumerate(outputs):
+            pred_i = {"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5] * 0, "extra": x[:, 6:]}
+            coefficient = pred_i["extra"]
+            pred_i["masks"] = (
+                self.process(proto[i], coefficient, pred_i["bboxes"], shape=imgsz)
+                if coefficient.shape[0]
+                else torch.zeros(
+                    (0, *(imgsz if self.process is ops.process_mask_native else proto.shape[2:])),
+                    dtype=torch.uint8,
+                    device=pred_i["bboxes"].device,
+                )
+            )
+            processed.append(pred_i)
+        return processed
+
+    def _mask_image_enabled(self, batch: dict[str, Any], si: int) -> bool:
+        """Return whether this validation image has person-mask supervision."""
+        has_mask = batch.get("has_person_mask")
+        return bool(torch.is_tensor(has_mask) and si < has_mask.numel() and bool(has_mask[si]))
+
+    def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
+        """Prepare only person instances with mask supervision for Stage D mask metrics."""
+        prepared = super()._prepare_batch(si, batch)
+        if prepared["cls"].numel() == 0:
+            return prepared
+
+        keep = prepared["cls"].long().eq(int(self.data.get("person_cls", 0)))
+        flags = batch.get("instance_flags")
+        idx = batch["batch_idx"] == si
+        if torch.is_tensor(flags) and flags.numel():
+            flags_i = flags[idx].to(keep.device).bool()
+            if flags_i.ndim == 2 and flags_i.shape[0] == keep.shape[0] and flags_i.shape[1] > 3:
+                keep &= flags_i[:, 3]
+        prepared["cls"] = prepared["cls"][keep] * 0
+        prepared["bboxes"] = prepared["bboxes"][keep]
+        prepared["masks"] = prepared["masks"][keep]
+        return prepared
+
+    def update_metrics(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
+        """Update metrics only on images that carry person-mask labels."""
+        mask_preds = []
+        mask_indices = []
+        for si, pred in enumerate(preds):
+            if not self._mask_image_enabled(batch, si):
+                continue
+            keep = pred["cls"].long().eq(0)
+            pred = {
+                **pred,
+                "bboxes": pred["bboxes"][keep],
+                "conf": pred["conf"][keep],
+                "cls": pred["cls"][keep] * 0,
+                "extra": pred["extra"][keep] if "extra" in pred else pred.get("extra", pred["bboxes"].new_zeros((0, 0))),
+                "masks": pred["masks"][keep],
+            }
+            mask_indices.append(si)
+            mask_preds.append(pred)
+
+        if not mask_preds:
+            return
+        local_batch = dict(batch)
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.shape[:1] == (len(preds),):
+                local_batch[key] = value[mask_indices]
+            elif key in {"im_file", "ori_shape", "ratio_pad"} and isinstance(value, (list, tuple)):
+                local_batch[key] = [value[i] for i in mask_indices]
+        old_batch_idx = batch["batch_idx"]
+        selected = torch.zeros_like(old_batch_idx, dtype=torch.bool)
+        for new_i, old_i in enumerate(mask_indices):
+            m = old_batch_idx == old_i
+            selected |= m
+        local_batch["batch_idx"] = old_batch_idx[selected].clone()
+        for new_i, old_i in enumerate(mask_indices):
+            local_batch["batch_idx"][local_batch["batch_idx"] == old_i] = new_i
+        inst_count = old_batch_idx.shape[0]
+        for key in ("cls", "bboxes", "segments", "keypoints", "body_kpts_3d", "instance_flags"):
+            value = batch.get(key)
+            if torch.is_tensor(value) and value.shape[:1] == (inst_count,):
+                local_batch[key] = value[selected]
+        super().update_metrics(mask_preds, local_batch)
+
+
 class YOLO26PSStageTrainer(DetectionTrainer):
     """Single trainer for all YOLO26-PS stages; stages only change config, not loss code."""
 
@@ -1178,12 +1491,26 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         if hasattr(head, "set_active_tasks"):
             head.set_active_tasks(tasks)
         self._apply_optional_pose_adapter(model, log=False)
+        runtime = self.stage_cfg.get("train_runtime") or {}
+        loss_cfg = self.stage_cfg.get("loss") or {}
+        assignment_head = normalize_decode_head(
+            runtime.get("person_mask_assignment_head", loss_cfg.get("person_mask_assignment_head", "seg"))
+        )
+        decode_head = normalize_decode_head(runtime.get("person_mask_decode_head", assignment_head))
+        model.person_mask_assignment_head = assignment_head
+        model.person_mask_decode_head = decode_head
+        setattr(head, "person_mask_decode_head", decode_head)
+        setattr(head, "use_human_det_branch", assignment_head == "human" or decode_head == "human")
+        if hasattr(head, "use_p2_refine"):
+            head.use_p2_refine = truthy(runtime.get("use_p2_refine", getattr(head, "use_p2_refine", False)))
         model.loss_weights = complete_loss_weights(self.stage_cfg)
         frozen_groups = self._apply_model_trainability(model, freeze=freeze)
         frozen = self._apply_branch_trainability(head, tasks, freeze=freeze)
         bn_locks = self._apply_bn_policy(model, head, tasks)
         if log:
             LOGGER.info(f"Stage active tasks: {sorted(tasks)}")
+            if "seg" in tasks:
+                LOGGER.info(f"Stage person-mask assignment/decode heads: {assignment_head}/{decode_head}")
             LOGGER.info(f"Stage task loss weights: {model.loss_weights}")
             if frozen_groups:
                 LOGGER.info(f"Stage frozen/eval model groups: {', '.join(frozen_groups)}")
@@ -1196,6 +1523,21 @@ class YOLO26PSStageTrainer(DetectionTrainer):
     def _model_group_range(model: nn.Module, group: str) -> range:
         """Return model layer indices for a named trainability group."""
         layers = getattr(model, "model", [])
+        yaml_file = str(getattr(model, "yaml_file", "") or "")
+        head_name = layers[-1].__class__.__name__ if layers else ""
+        is_stage_d_segbranch = "stage-d-segbranch" in yaml_file or (head_name == "YOLO26PSSegment" and len(layers) >= 33)
+        if is_stage_d_segbranch:
+            ranges = {
+                "backbone": (0, 11),
+                "det_neck": (11, 20),
+                "seg_neck": (20, -1),
+                "pose_neck": (len(layers), len(layers)),
+            }
+            start, end = ranges[group]
+            stop = len(layers) + end if end < 0 else end
+            start = max(0, min(start, len(layers)))
+            stop = max(start, min(stop, len(layers) - 1 if group == "seg_neck" else len(layers)))
+            return range(start, stop)
         start, end = MODEL_GROUP_RANGES[group]
         stop = len(layers) + end if end < 0 else end
         start = max(0, min(start, len(layers)))
@@ -1226,6 +1568,9 @@ class YOLO26PSStageTrainer(DetectionTrainer):
     def _apply_branch_trainability(self, head: nn.Module, tasks: set[str], freeze: bool = True) -> list[str]:
         """Freeze inactive or explicitly frozen head modules and keep them in eval mode."""
         train = self.stage_cfg.get("train") or {}
+        runtime = self.stage_cfg.get("train_runtime") or {}
+        allowed_modules = normalize_name_list(runtime.get("train_head_modules") or runtime.get("train_head_module_names"))
+        blocked_modules = normalize_name_list(runtime.get("freeze_head_modules") or runtime.get("freeze_head_module_names"))
         active_groups = set(tasks)
         if {"seg", "sem"} & tasks:
             active_groups.add("p2_dense")
@@ -1240,7 +1585,6 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                 )
                 trainable = bool(train.get("all")) or (default and trainable)
             elif group == "pose_adapter":
-                runtime = self.stage_cfg.get("train_runtime") or {}
                 default = truthy(runtime.get("pose_adapter", False)) and "pose" in active_groups
                 trainable = train_flag_enabled(train, BRANCH_TRAIN_FLAGS[group], default=default)
                 trainable = bool(train.get("all")) or (default and trainable)
@@ -1250,24 +1594,37 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                 module = getattr(head, name, None)
                 if module is None:
                     continue
-                if not trainable:
+                module_name = name.lower()
+                module_trainable = bool(trainable)
+                if allowed_modules and module_name not in allowed_modules:
+                    module_trainable = False
+                if module_name in blocked_modules:
+                    module_trainable = False
+                if not module_trainable and isinstance(module, nn.Module):
                     module.eval()
+                if not module_trainable:
                     frozen.append(name)
                 if freeze:
-                    for p in module.parameters():
-                        p.requires_grad = bool(trainable)
+                    if isinstance(module, nn.Parameter):
+                        module.requires_grad = module_trainable
+                    elif isinstance(module, nn.Module):
+                        for p in module.parameters():
+                            p.requires_grad = module_trainable
         return frozen
 
     @staticmethod
     def _branch_modules_for_head(head: nn.Module) -> dict[str, tuple[str, ...]]:
         """Return logical branch modules, accounting for Segment-style Stage D heads."""
         modules = dict(BRANCH_MODULES)
-        if head.__class__.__name__ == "YOLO26PSSegment":
-            modules["human_det"] = ()
+        if head.__class__.__name__ in {"YOLO26PSSegment", "YOLO26PSAdapterSegment"}:
+            modules["det"] = ()
+            modules["human_det"] = ("human_cv2", "human_cv3", "one2one_human_cv2", "one2one_human_cv3")
             modules["pose"] = ()
-            modules["seg"] = ("cv4", "one2one_cv4", "proto")
+            modules["seg"] = ("cv2", "cv3", "one2one_cv2", "one2one_cv3", "cv4", "one2one_cv4", "proto")
             modules["sem"] = ()
-            modules["p2_dense"] = ("p2_refine", "p2_gate")
+            modules["p2_dense"] = ("seg_adapt", "p2_refine", "p2_gate")
+            if head.__class__.__name__ == "YOLO26PSSegment":
+                modules["p2_dense"] = ("p2_refine", "p2_gate")
         return modules
 
     def _apply_bn_policy(self, model: nn.Module, head: nn.Module, tasks: set[str]) -> list[str]:
@@ -1321,6 +1678,7 @@ class YOLO26PSStageTrainer(DetectionTrainer):
                 name = str(key).strip().lower()
                 if name == "neck":
                     policy["det_neck"] = truthy(freeze_bn)
+                    policy["seg_neck"] = truthy(freeze_bn)
                     policy["pose_neck"] = truthy(freeze_bn)
                 elif name in groups:
                     policy[name] = truthy(freeze_bn)
@@ -1355,7 +1713,7 @@ class YOLO26PSStageTrainer(DetectionTrainer):
             names = names if branch_flag_enabled(train, "seg_head", "mask_head", default=False) or branch_flag_enabled(
                 train, "sem_head", "scene_seg_head", default=False
             ) else ()
-        return [module for name in names if (module := getattr(head, name, None)) is not None]
+        return [module for name in names if isinstance((module := getattr(head, name, None)), nn.Module)]
 
     def _setup_train(self):
         super()._setup_train()
@@ -1463,6 +1821,19 @@ class YOLO26PSStageTrainer(DetectionTrainer):
 
     def get_validator(self):
         self.loss_names = getattr(unwrap_model(self.model).model[-1], "loss_names", ("box_loss", "cls_loss", "dfl_loss"))
+        tasks = active_tasks_from_stage(self.stage_cfg)
+        if "seg" in tasks and not ({"pose", "sem"} & tasks):
+            runtime = self.stage_cfg.get("train_runtime") or {}
+            loss_cfg = self.stage_cfg.get("loss") or {}
+            assignment_head = runtime.get("person_mask_assignment_head", loss_cfg.get("person_mask_assignment_head", "seg"))
+            decode_head = runtime.get("person_mask_decode_head", assignment_head)
+            return YOLO26PSStageDMaskValidator(
+                self.test_loader,
+                save_dir=self.save_dir,
+                args=copy(self.args),
+                _callbacks=self.callbacks,
+                decode_head=decode_head,
+            )
         return YOLO26PSStageValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
@@ -1494,6 +1865,9 @@ class YOLO26PSStageTrainer(DetectionTrainer):
         if not self.args.val:
             LOGGER.info("Skipping final validation because val=False.")
             return
+        if "seg" in active_tasks_from_stage(self.stage_cfg):
+            LOGGER.info("Skipping final fused validation for Stage D; per-epoch mask validation uses raw adapter outputs.")
+            return
         return super().final_eval()
 
 
@@ -1503,6 +1877,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", default="A_detection_stable", help="stage name under plan['stages']")
     parser.add_argument("--weights", type=Path, help="optional same-architecture checkpoint to start from")
     parser.add_argument("--pretrain", type=Path, help="optional detection pretrain to partially load into --model")
+    parser.add_argument("--seg-pretrain", type=Path, help="optional YOLO26 segmentation checkpoint to load final head from")
+    parser.add_argument(
+        "--seg-pretrain-scope",
+        choices=("head", "neck_head", "all"),
+        default="head",
+        help="which YOLO26 segmentation weights to import from --seg-pretrain",
+    )
+    parser.add_argument("--seg-pretrain-neck-offset", type=int, help="target layer offset for yolo26-seg neck import")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--data", type=Path, help="dataset YAML; defaults to the selected stage YAML")
     parser.add_argument("--model", type=Path)
@@ -1589,6 +1971,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pose-adapter", action="store_true", help="disable the pose-only residual feature adapter")
     parser.add_argument("--pose-adapter-hidden-ratio", type=float)
     parser.add_argument("--pose-adapter-scale", type=float)
+    parser.add_argument("--train-head-modules", help="comma/space separated head module names to keep trainable")
+    parser.add_argument("--freeze-head-modules", help="comma/space separated head module names to force frozen")
+    parser.add_argument(
+        "--freeze-head-bn",
+        help="head BN policy, e.g. seg=true,p2_dense=false or comma names to freeze",
+    )
+    parser.add_argument("--person-mask-assignment-head", choices=("seg", "human"))
+    parser.add_argument("--person-mask-decode-head", choices=("seg", "human"))
+    parser.add_argument("--person-mask-dice-weight", type=float, help="optional cropped Dice gain for person masks")
+    parser.add_argument("--mosaic", type=float)
+    parser.add_argument("--mixup", type=float)
+    parser.add_argument("--copy-paste", type=float)
+    parser.add_argument("--cutmix", type=float)
+    parser.add_argument("--translate", type=float)
+    parser.add_argument("--scale", type=float)
+    parser.add_argument("--degrees", type=float)
+    parser.add_argument("--fliplr", type=float)
+    parser.add_argument("--hsv-h", type=float)
+    parser.add_argument("--hsv-s", type=float)
+    parser.add_argument("--hsv-v", type=float)
+    parser.add_argument("--erasing", type=float)
     parser.add_argument("--det-class-mask-normalization", choices=("sqrt", "linear", "none", "off"))
     parser.add_argument("--det-partial-cls-positive-only", action="store_true")
     parser.add_argument("--no-det-partial-cls-positive-only", action="store_true")
@@ -1736,14 +2139,24 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     if cache is not None:
         overrides["cache"] = cache
     for key in MIXED_AUG_KEYS:
-        overrides[key] = float(augment.get(key, 0.0))
-    if "translate" in augment:
-        overrides["translate"] = float(augment["translate"])
-    if "scale" in augment:
+        cli_value = getattr(args, key)
+        overrides[key] = float(cli_value if cli_value is not None else augment.get(key, 0.0))
+    for key in ("translate", "hsv_h", "hsv_s", "hsv_v", "erasing"):
+        cli_value = getattr(args, key)
+        value = cli_value if cli_value is not None else augment.get(key)
+        if value is not None:
+            overrides[key] = float(value)
+    if args.scale is not None:
+        overrides["scale"] = float(args.scale)
+    elif "scale" in augment:
         overrides["scale"] = scale_gain(augment["scale"])
-    if "rotate" in augment:
+    if args.degrees is not None:
+        overrides["degrees"] = float(args.degrees)
+    elif "rotate" in augment:
         overrides["degrees"] = rotate_gain(augment["rotate"])
-    if "flip" in augment:
+    if args.fliplr is not None:
+        overrides["fliplr"] = float(args.fliplr)
+    elif "flip" in augment:
         overrides["fliplr"] = float(augment["flip"])
     for key, cli_key in (
         ("optimizer", "optimizer"),
@@ -1840,6 +2253,7 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     for key, cli_key in (
         ("pose_adapter_hidden_ratio", "pose_adapter_hidden_ratio"),
         ("pose_adapter_scale", "pose_adapter_scale"),
+        ("person_mask_dice_weight", "person_mask_dice_weight"),
     ):
         cli_value = getattr(args, cli_key)
         value = cli_value if cli_value is not None else defaults.get(key)
@@ -1885,11 +2299,34 @@ def build_overrides(args: argparse.Namespace, plan: dict[str, Any], stage: dict[
     return overrides
 
 
+def resolve_stage_init_paths(args: argparse.Namespace, stage: dict[str, Any]) -> None:
+    """Apply optional checkpoint defaults from stage['init'] when the CLI did not provide them."""
+    init = stage.get("init") or {}
+
+    def _stage_path(value: Any) -> Path | None:
+        if value in (None, ""):
+            return None
+        path = Path(value)
+        return path if path.is_absolute() else ROOT / path
+
+    if args.weights is None:
+        args.weights = _stage_path(init.get("resume_from") or init.get("weights"))
+    if args.weights is None and args.pretrain is None:
+        args.pretrain = _stage_path(init.get("base_checkpoint") or init.get("pretrain"))
+    if args.weights is None and args.seg_pretrain is None:
+        args.seg_pretrain = _stage_path(init.get("seg_pretrain"))
+    if init.get("seg_pretrain_scope") and args.seg_pretrain_scope == "head":
+        args.seg_pretrain_scope = str(init["seg_pretrain_scope"])
+    if args.seg_pretrain_neck_offset is None and init.get("seg_pretrain_neck_offset") is not None:
+        args.seg_pretrain_neck_offset = int(init["seg_pretrain_neck_offset"])
+
+
 def main() -> None:
     """Train the requested stage."""
     args = parse_args()
     plan = load_plan(args.plan)
     stage = stage_config(plan, args.stage)
+    resolve_stage_init_paths(args, stage)
     if args.pose_adapter or args.no_pose_adapter:
         stage = dict(stage)
         runtime = dict(stage.get("train_runtime") or {})
@@ -1902,6 +2339,35 @@ def main() -> None:
             runtime = dict(stage.get("train_runtime") or {})
             runtime[key] = float(value)
             stage["train_runtime"] = runtime
+    for arg_name, runtime_key in (
+        ("train_head_modules", "train_head_modules"),
+        ("freeze_head_modules", "freeze_head_modules"),
+        ("person_mask_assignment_head", "person_mask_assignment_head"),
+        ("person_mask_decode_head", "person_mask_decode_head"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            stage = dict(stage)
+            runtime = dict(stage.get("train_runtime") or {})
+            runtime[runtime_key] = (
+                sorted(normalize_name_list(value)) if runtime_key.endswith("modules") else normalize_decode_head(value)
+            )
+            stage["train_runtime"] = runtime
+    if args.freeze_head_bn is not None:
+        stage = dict(stage)
+        runtime = dict(stage.get("train_runtime") or {})
+        text = args.freeze_head_bn.strip()
+        if "=" in text:
+            policy = {}
+            for item in text.replace(",", " ").split():
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                policy[key.strip()] = truthy(value)
+            runtime["freeze_head_bn"] = policy
+        else:
+            runtime["freeze_head_bn"] = text
+        stage["train_runtime"] = runtime
     stage = apply_loss_overrides(stage, args)
     if args.data is None:
         data_yaml = stage.get("data_yaml")
@@ -1927,6 +2393,13 @@ def main() -> None:
             LOGGER.warning("--pretrain is ignored when --weights is provided; same-architecture checkpoint already loaded.")
         else:
             load_stage_pretrain(model, args.pretrain)
+    if args.seg_pretrain:
+        load_seg_head_pretrain(
+            model,
+            args.seg_pretrain,
+            scope=args.seg_pretrain_scope,
+            neck_offset=args.seg_pretrain_neck_offset,
+        )
     model.train(trainer=YOLO26PSStageTrainer, **build_overrides(args, plan, stage))
 
 

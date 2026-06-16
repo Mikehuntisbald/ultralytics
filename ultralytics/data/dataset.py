@@ -300,6 +300,7 @@ class YOLODataset(BaseDataset):
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
         for lb in labels:
             lb.setdefault("det_class_mask", self._det_class_mask_for_image(lb["im_file"]))
+        labels = self._apply_person_only_labels(labels)
 
         # Check if the dataset is all boxes or all segments
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
@@ -358,7 +359,39 @@ class YOLODataset(BaseDataset):
         labels = cache["labels"]
         if not labels:
             raise RuntimeError(f"No valid unified labels found in {cache_path}.")
+        labels = self._apply_person_only_labels(labels)
         self.im_files = [lb["im_file"] for lb in labels]
+        return labels
+
+    def _apply_person_only_labels(self, labels: list[dict]) -> list[dict]:
+        """Filter/remap labels for person-only staged datasets after any cache source is loaded."""
+        if not self.data.get("person_only"):
+            return labels
+        person_cls = int(self.data.get("person_cls", 0))
+        for lb in labels:
+            cls = np.asarray(lb.get("cls", np.zeros((0, 1), dtype=np.float32))).reshape(-1, 1)
+            if not len(cls):
+                continue
+            instance_flags = lb.get("instance_flags")
+            keep = cls[:, 0].astype(int) == person_cls
+            if instance_flags is not None and len(instance_flags) == len(cls):
+                flags = np.asarray(instance_flags)
+                if flags.ndim == 1:
+                    keep |= flags.astype(bool)
+                elif flags.shape[1] >= 4:
+                    keep |= flags[:, 3].astype(bool)
+            lb["cls"] = np.zeros((int(keep.sum()), 1), dtype=cls.dtype)
+            for key in ("bboxes", "keypoints", "body_kpts_3d", "instance_flags"):
+                value = lb.get(key)
+                if value is not None and len(value) == len(keep):
+                    lb[key] = value[keep]
+            segments = lb.get("segments")
+            if segments and len(segments) == len(keep):
+                lb["segments"] = [segment for segment, keep_one in zip(segments, keep) if keep_one]
+            person_mask = lb.get("person_mask")
+            if person_mask and len(person_mask) == len(keep):
+                lb["person_mask"] = [mask for mask, keep_one in zip(person_mask, keep) if keep_one]
+            lb["det_class_mask"] = np.array([True], dtype=bool)
         return labels
 
     def cache_unified_labels(self, path: Path, cache_hash: str | None = None) -> dict:

@@ -16,7 +16,7 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, DWConv, RepConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
@@ -37,7 +37,9 @@ __all__ = (
     "RTDETRDecoder",
     "Segment",
     "SemanticSegment",
+    "YOLO26PSAdapterSegment",
     "YOLO26PSDetect25D",
+    "YOLO26PSMergedSegment25D",
     "YOLO26PSSegment",
     "YOLOEDetect",
     "YOLOESegment",
@@ -343,6 +345,8 @@ class Segment(Detect):
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with mask coefficients."""
         preds = super()._inference(x)
+        if "mask_coefficient" not in x:
+            return preds
         return torch.cat([preds, x["mask_coefficient"]], dim=1)
 
     def forward_head(
@@ -465,6 +469,7 @@ class YOLO26PSSegment(Segment26):
         )
         self.p2_refine = Conv(ch[3], ch[0], 1) if len(ch) > 3 else None
         self.p2_gate = nn.Parameter(torch.zeros(1)) if self.p2_refine is not None else None
+        self.use_p2_refine = self.p2_refine is not None
 
     def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
         """Set active branches, keeping standard detection active when masks need assignments."""
@@ -487,20 +492,24 @@ class YOLO26PSSegment(Segment26):
             return {_normalize_task_name(x) for x in tasks.split(",") if x.strip()} or {"det"}
         return {_normalize_task_name(x) for x in tasks} or {"det"}
 
-    def _proto_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Fuse the detector P2 feature into the P3 proto path without changing Segment26 parameter names."""
+    def _fused_head_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Optionally fuse the extra P2 feature into the Segment26 P3 feature."""
         feats = list(x[: self.nl])
-        if self.p2_refine is not None and len(x) > self.nl:
+        if self.p2_refine is not None and len(x) > self.nl and bool(getattr(self, "use_p2_refine", True)):
             p2 = F.interpolate(self.p2_refine(x[self.nl]), size=feats[0].shape[2:], mode="nearest")
             feats[0] = feats[0] + self.p2_gate.to(dtype=p2.dtype) * p2
         return feats
 
+    def _proto_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return the Segment26 features used by the prototype path."""
+        return self._fused_head_features(x)
+
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
-        """Return Segment26-compatible predictions with P2-enhanced prototypes."""
-        x_head = list(x[: self.nl])
+        """Return Segment26-compatible predictions with optional P2-enhanced P3 features."""
+        x_head = self._fused_head_features(x)
         outputs = Detect.forward(self, x_head)
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
-        proto = self.proto(self._proto_features(x))
+        proto = self.proto(x_head)
         if isinstance(preds, dict):
             if self.end2end:
                 preds["one2many"]["proto"] = proto
@@ -513,10 +522,315 @@ class YOLO26PSSegment(Segment26):
             return preds
         return (outputs, proto) if self.export else ((outputs[0], proto), preds)
 
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes/classes and append mask coefficients for segmentation validation."""
+        preds = Detect._inference(self, x)
+        if "mask_coefficient" not in x:
+            return preds
+        return torch.cat([preds, x["mask_coefficient"]], dim=1)
+
     def _deploy_outputs(self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None = None, tasks: set[str] | None = None):
         """Decode deploy tensors using the PS multi-task tuple contract."""
         boxes = self._get_decode_boxes(preds).permute(0, 2, 1)
         scores = preds["scores"].sigmoid().permute(0, 2, 1)
+        score, cls, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coef = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.nm))
+        if "mask_coefficient" in preds:
+            mask_coef = preds["mask_coefficient"].permute(0, 2, 1)
+            mask_coef = mask_coef.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        det_out = torch.cat([boxes, score, cls.to(boxes.dtype)], dim=-1)
+        pose25d = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.kpt_shape[0], self.kpt_shape[1]))
+        if proto is None:
+            proto = boxes.new_zeros((boxes.shape[0], self.nm, 0, 0))
+        scene_seg = boxes.new_zeros((boxes.shape[0], 0, 0, 0))
+        return det_out, pose25d, mask_coef, proto, scene_seg
+
+
+class YOLO26PSAdapterSegment(Segment26):
+    """Stage D segment head that reuses the frozen PS det neck through RepConv adapters."""
+
+    def __init__(
+        self,
+        nc: int = 1,
+        nm: int = 32,
+        npr: int = 256,
+        person_cls: int = 0,
+        reg_max=1,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize official Segment26 layers behind PS det-neck channel adapters."""
+        seg_ch = (128, 256, 512)
+        super().__init__(nc, nm, npr, reg_max, end2end, seg_ch)
+        self.person_cls = int(person_cls)
+        self.face_cls = -1
+        self.scene_nc = 0
+        self.kpt_shape = [17, 4]
+        self.output_stride = 4
+        self.active_tasks = {"det", "seg"}
+        self.loss_names = (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+            "pose2d_loss",
+            "pose_z_loss",
+            "pose_vis_loss",
+            "pose_rle_loss",
+            "bone_loss",
+            "person_mask_loss",
+            "scene_seg_loss",
+            "human_box_loss",
+            "human_cls_loss",
+            "human_dfl_loss",
+        )
+        det_ch = tuple(ch)
+        has_p2 = len(det_ch) >= 4
+        p3_offset = 1 if has_p2 else 0
+        self.seg_adapt = nn.ModuleList(
+            RepConv(det_ch[i + p3_offset], seg_ch[i], 3, 1) for i in range(min(3, len(det_ch) - p3_offset))
+        )
+        self.p2_refine = RepConv(det_ch[0], seg_ch[0], 3, 2) if has_p2 else None
+        self.p2_gate = nn.Parameter(torch.ones(1)) if self.p2_refine is not None else None
+        self.human_nc = 2
+        self.face_cls = 365
+        self.human_global_classes = (self.person_cls, self.face_cls)
+        human_ch = det_ch[p3_offset : p3_offset + self.nl]
+        c2 = max((16, human_ch[0] // 4, self.reg_max * 4))
+        c3 = max(human_ch[0], min(self.human_nc, 100))
+        self.human_cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in human_ch
+        )
+        self.human_cv3 = nn.ModuleList(
+            nn.Sequential(
+                nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                nn.Conv2d(c3, self.human_nc, 1),
+            )
+            for x in human_ch
+        )
+        if end2end:
+            self.one2one_human_cv2 = copy.deepcopy(self.human_cv2)
+            self.one2one_human_cv3 = copy.deepcopy(self.human_cv3)
+
+    @property
+    def end2end(self):
+        """Use the official Segment26 E2E contract whenever one-to-one towers are present."""
+        return self._uses_end2end()
+
+    @end2end.setter
+    def end2end(self, value):
+        """Keep compatibility with Detect initialization and old checkpoints."""
+        self._end2end = value
+
+    def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
+        """Set active branches, keeping standard detection active when masks need assignments."""
+        if tasks in (None, "all", True):
+            tasks = {"det", "seg"}
+        elif isinstance(tasks, str):
+            tasks = {_normalize_task_name(x) for x in tasks.split(",") if x.strip()}
+        else:
+            tasks = {_normalize_task_name(x) for x in tasks}
+        if "seg" in tasks:
+            tasks.add("det")
+        self.active_tasks = tasks or {"det"}
+
+    def _active_tasks(self) -> set[str]:
+        """Return normalized active task names."""
+        tasks = getattr(self, "active_tasks", {"det", "seg"})
+        if tasks in (None, "all", True):
+            return {"det", "seg"}
+        if isinstance(tasks, str):
+            return {_normalize_task_name(x) for x in tasks.split(",") if x.strip()} or {"det"}
+        return {_normalize_task_name(x) for x in tasks} or {"det"}
+
+    def _adapt_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Map PS det-neck P3-P5 features into the official YOLO26s-seg channel contract."""
+        offset = 1 if self.p2_refine is not None and len(x) > len(self.seg_adapt) else 0
+        adapted = [adapter(x[i + offset]) for i, adapter in enumerate(self.seg_adapt)]
+        if offset and adapted:
+            p2 = self.p2_refine(x[0])
+            if tuple(p2.shape[2:]) != tuple(adapted[0].shape[2:]):
+                p2 = F.interpolate(p2, size=adapted[0].shape[2:], mode="nearest")
+            adapted[0] = adapted[0] + self.p2_gate.to(dtype=p2.dtype) * p2
+        return adapted
+
+    def _uses_end2end(self) -> bool:
+        """Return whether this adapter head has a usable one-to-one Segment26 branch."""
+        return hasattr(self, "one2one_cv2") and hasattr(self, "one2one_cv3") and hasattr(self, "one2one_cv4")
+
+    def _proto_features(self, x: list[torch.Tensor], adapted: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return adapted P3-P5 features for the official Segment26 proto path."""
+        return list(adapted)
+
+    @staticmethod
+    def _clone_cls_head(cls_head: nn.ModuleList, nc: int) -> nn.ModuleList:
+        """Clone a YOLO classification tower and replace its final logits with ``nc`` classes."""
+        cloned = copy.deepcopy(cls_head)
+        for tower in cloned:
+            final = tower[-1]
+            if isinstance(final, nn.Conv2d):
+                tower[-1] = nn.Conv2d(
+                    final.in_channels,
+                    nc,
+                    final.kernel_size,
+                    final.stride,
+                    final.padding,
+                    final.dilation,
+                    final.groups,
+                    final.bias is not None,
+                    final.padding_mode,
+                )
+        return cloned
+
+    def copy_human_head_from_det(self) -> None:
+        """Initialize the person-only human detector from compatible detector towers."""
+        self._copy_human_branch_from_det(self.cv2, self.cv3, self.human_cv2, self.human_cv3)
+        if self._uses_end2end() and getattr(self, "one2one_human_cv2", None) is not None:
+            self._copy_human_branch_from_det(
+                self.one2one_cv2,
+                self.one2one_cv3,
+                self.one2one_human_cv2,
+                self.one2one_human_cv3,
+            )
+
+    def _copy_human_branch_from_det(
+        self,
+        src_box: nn.ModuleList,
+        src_cls: nn.ModuleList,
+        dst_box: nn.ModuleList,
+        dst_cls: nn.ModuleList,
+    ) -> None:
+        """Best-effort seed of a human branch from a compatible detector branch."""
+        for src_tower, dst_tower in zip(src_box, dst_box):
+            try:
+                dst_tower.load_state_dict(src_tower.state_dict(), strict=True)
+            except RuntimeError:
+                pass
+        for src_tower, dst_tower in zip(src_cls, dst_cls):
+            src_state = src_tower.state_dict()
+            dst_state = dst_tower.state_dict()
+            for key, value in src_state.items():
+                if key in dst_state and dst_state[key].shape == value.shape:
+                    dst_state[key].copy_(value)
+            src_final = src_tower[-1]
+            dst_final = dst_tower[-1]
+            dst_tower.load_state_dict(dst_state, strict=False)
+            if isinstance(src_final, nn.Conv2d) and isinstance(dst_final, nn.Conv2d):
+                person_row = int(self.person_cls)
+                if 0 <= person_row < src_final.weight.shape[0]:
+                    with torch.no_grad():
+                        dst_final.weight[0].copy_(src_final.weight[person_row])
+                        if src_final.bias is not None and dst_final.bias is not None:
+                            dst_final.bias[0].copy_(src_final.bias[person_row])
+
+    def bias_init(self):
+        """Initialize official seg towers plus frozen human-det assignment towers."""
+        super().bias_init()
+        human_branches = []
+        if getattr(self, "human_cv2", None) is not None and getattr(self, "human_cv3", None) is not None:
+            human_branches.append((self.human_cv2, self.human_cv3))
+        if self._uses_end2end() and getattr(self, "one2one_human_cv2", None) is not None:
+            human_branches.append((self.one2one_human_cv2, self.one2one_human_cv3))
+        for box_head, cls_head in human_branches:
+            for i, (box_tower, cls_tower) in enumerate(zip(box_head, cls_head)):
+                box_tower[-1].bias.data[:] = 2.0
+                cls_tower[-1].bias.data[: self.human_nc] = math.log(
+                    5 / self.human_nc / (640 / self.stride[i]) ** 2
+                )
+
+    def _add_human_predictions(
+        self,
+        preds: dict[str, torch.Tensor],
+        x: list[torch.Tensor],
+        box_head: nn.ModuleList | None,
+        cls_head: nn.ModuleList | None,
+    ) -> dict[str, torch.Tensor]:
+        """Attach frozen det-neck human assignment logits to a Segment26 prediction dictionary."""
+        if not bool(getattr(self, "use_human_det_branch", True)):
+            return preds
+        if box_head is None or cls_head is None:
+            return preds
+        bs = x[0].shape[0]
+        preds["human_boxes"] = torch.cat(
+            [box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+        )
+        preds["human_scores"] = torch.cat(
+            [cls_head[i](x[i]).view(bs, self.human_nc, -1) for i in range(self.nl)], dim=-1
+        )
+        preds["human_feats"] = x
+        return preds
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Return Segment26-compatible predictions from adapted PS det-neck features."""
+        adapted = self._adapt_features(x)
+        proto = self.proto(self._proto_features(x, adapted))
+        preds = self.forward_head(adapted, **self.one2many)
+        preds["proto"] = proto
+        self._add_human_predictions(preds, x, getattr(self, "human_cv2", None), getattr(self, "human_cv3", None))
+
+        if self._uses_end2end():
+            one2one = self.forward_head([xi.detach() for xi in adapted], **self.one2one)
+            one2one["proto"] = tuple(p.detach() for p in proto) if isinstance(proto, tuple) else proto.detach()
+            self._add_human_predictions(
+                one2one,
+                x,
+                getattr(self, "human_cv2", None),
+                getattr(self, "human_cv3", None),
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+
+        if self.training:
+            return preds
+        raw = preds["one2many"] if isinstance(preds, dict) and "one2many" in preds else preds
+        outputs = self._inference(raw, feats=adapted)
+        if self._uses_end2end():
+            outputs = self.postprocess(outputs.permute(0, 2, 1))
+        return (outputs, proto) if self.export else ((outputs, proto), preds)
+
+    def _inference(self, x: dict[str, torch.Tensor], feats: list[torch.Tensor] | None = None) -> torch.Tensor:
+        """Decode configured boxes/classes and append mask coefficients for segmentation validation."""
+        if "feats" not in x and feats is not None:
+            x = {**x, "feats": feats}
+        decode_head = str(getattr(self, "person_mask_decode_head", "human") or "human").strip().lower()
+        if decode_head in {"human_det", "person", "person_face"}:
+            decode_head = "human"
+        if decode_head == "human" and "human_boxes" in x and "human_scores" in x:
+            human = {
+                **x,
+                "boxes": x["human_boxes"],
+                "scores": x["human_scores"][:, :1],
+                "feats": x.get("human_feats", x.get("feats")),
+            }
+            nc, no = self.nc, self.no
+            self.nc, self.no = 1, 4 * self.reg_max + 1
+            try:
+                preds = Detect._inference(self, human)
+            finally:
+                self.nc, self.no = nc, no
+        else:
+            preds = Detect._inference(self, x)
+        if "mask_coefficient" not in x:
+            return preds
+        return torch.cat([preds, x["mask_coefficient"]], dim=1)
+
+    def _deploy_outputs(self, preds: dict[str, torch.Tensor], proto: torch.Tensor | None = None, tasks: set[str] | None = None):
+        """Decode deploy tensors using the PS multi-task tuple contract."""
+        boxes = self._get_decode_boxes(preds).permute(0, 2, 1)
+        decode_head = str(getattr(self, "person_mask_decode_head", "human") or "human").strip().lower()
+        if decode_head in {"human_det", "person", "person_face"}:
+            decode_head = "human"
+        if decode_head == "human" and "human_boxes" in preds and "human_scores" in preds:
+            decode_preds = {
+                **preds,
+                "boxes": preds["human_boxes"],
+                "scores": preds["human_scores"][:, :1],
+                "feats": preds.get("human_feats", preds.get("feats")),
+            }
+            boxes = self._get_decode_boxes(decode_preds).permute(0, 2, 1)
+            scores = decode_preds["scores"].sigmoid().permute(0, 2, 1)
+        else:
+            scores = preds["scores"].sigmoid().permute(0, 2, 1)
         score, cls, idx = self.get_topk_index(scores, self.max_det)
         boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
         mask_coef = boxes.new_zeros((boxes.shape[0], boxes.shape[1], self.nm))
@@ -1216,6 +1530,111 @@ class YOLO26PSDetect25D(Detect):
         """Remove one-to-many branches for fused end-to-end inference."""
         self.cv2 = self.cv3 = self.human_cv2 = self.human_cv3 = self.pose_cv2 = self.pose_cv3 = self.cv4 = self.cv5 = None
         self.cv4_kpts = self.cv4_z = self.cv4_sigma = self.flow_model = None
+
+
+class YOLO26PSMergedSegment25D(YOLO26PSDetect25D):
+    """Full PS det/pose head with an added independent Stage-D YOLO26 segmentation branch."""
+
+    def __init__(
+        self,
+        nc: int = 366,
+        kpt_shape: tuple = (17, 4),
+        nm: int = 32,
+        fusion_channels: int = 192,
+        scene_nc: int = 150,
+        person_cls: int = 0,
+        pose_channels: int | None = None,
+        pose_feature_count: int | None = None,
+        pose_head_type: str = "simple",
+        seg_nc: int = 1,
+        seg_npr: int = 256,
+        seg_person_cls: int = 0,
+        seg_feature_count: int = 4,
+        reg_max=1,
+        end2end=False,
+        ch: tuple = (),
+        human_nc: int = 2,
+    ):
+        """Initialize the original PS head plus a separate Stage-D segmentation head."""
+        self.merged_seg_feature_count = int(seg_feature_count)
+        if self.merged_seg_feature_count > 0 and len(ch) > self.merged_seg_feature_count:
+            base_ch = tuple(ch[: -self.merged_seg_feature_count])
+            seg_ch = tuple(ch[-self.merged_seg_feature_count :])
+        else:
+            base_ch = tuple(ch)
+            seg_ch = tuple()
+        super().__init__(
+            nc=nc,
+            kpt_shape=kpt_shape,
+            nm=nm,
+            fusion_channels=fusion_channels,
+            scene_nc=scene_nc,
+            person_cls=person_cls,
+            pose_channels=pose_channels,
+            pose_feature_count=pose_feature_count,
+            pose_head_type=pose_head_type,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=base_ch,
+            human_nc=human_nc,
+        )
+        if not seg_ch:
+            seg_ch = tuple(base_ch[:3]) + tuple(base_ch[:1])
+        self.seg_head = YOLO26PSSegment(
+            nc=seg_nc,
+            nm=nm,
+            npr=seg_npr,
+            person_cls=seg_person_cls,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=seg_ch,
+        )
+        self.seg_person_cls = int(seg_person_cls)
+
+    def _merged_seg_features(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return the appended Stage-D segmentation features."""
+        count = int(getattr(self, "merged_seg_feature_count", 0))
+        if count <= 0 or len(x) < count:
+            return []
+        return list(x[-count:])
+
+    def _sync_seg_head_decode_state(self) -> None:
+        """Keep the nested segmentation head ready for independent P3-P5 decoding."""
+        device = next(self.seg_head.parameters()).device
+        self.seg_head.stride = torch.tensor([8.0, 16.0, 32.0], device=device)
+        self.seg_head.max_det = int(getattr(self, "max_det", self.seg_head.max_det))
+        self.seg_head.dynamic = bool(getattr(self, "dynamic", False))
+
+    def bias_init(self):
+        """Initialize inherited heads and the nested segmentation head."""
+        super().bias_init()
+        self._sync_seg_head_decode_state()
+        self.seg_head.bias_init()
+
+    def set_active_tasks(self, tasks: set[str] | list[str] | tuple[str, ...] | str | None) -> None:
+        """Set active branches for the merged model."""
+        super().set_active_tasks(tasks)
+        if getattr(self, "seg_head", None) is not None:
+            self.seg_head.set_active_tasks({"seg"} if "seg" in self._active_tasks() else {"det"})
+
+    def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | tuple:
+        """Route pure segmentation requests to the Stage-D branch, preserving the original PS path otherwise."""
+        tasks = self._active_tasks()
+        if "seg" in tasks and not (tasks & {"pose", "human_det", "sem"}) and tasks <= {"det", "seg"}:
+            seg_x = self._merged_seg_features(x)
+            if seg_x:
+                self._sync_seg_head_decode_state()
+                self.seg_head.set_active_tasks({"seg"})
+                return self.seg_head(seg_x)
+
+        if "seg" in tasks:
+            previous = self.active_tasks
+            self.active_tasks = tasks - {"seg"} or {"det"}
+            try:
+                return super().forward(x)
+            finally:
+                self.active_tasks = previous
+        return super().forward(x)
 
 
 class SemanticSegment(nn.Module):

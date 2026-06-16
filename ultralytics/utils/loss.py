@@ -1121,6 +1121,7 @@ class YOLO26PS25DLoss:
     }
 
     INSTANCE_KEYS = {"batch_idx", "cls", "bboxes", "keypoints", "body_kpts_3d", "instance_flags", "segments", "obb"}
+    single_mask_loss = staticmethod(v8SegmentationLoss.single_mask_loss)
 
     def __init__(
         self,
@@ -1180,6 +1181,10 @@ class YOLO26PS25DLoss:
             int(c) for c in getattr(head, "human_global_classes", (self.person_cls, self.face_cls))
         )
         self.overlap = bool(getattr(model.args, "overlap_mask", True))
+        self.person_mask_assignment_head = self._normalize_assignment_head(
+            self._runtime_value(model, "person_mask_assignment_head", default="seg")
+        )
+        self.person_mask_dice_weight = float(self._runtime_value(model, "person_mask_dice_weight", default=0.0) or 0.0)
         self.weights = self.DEFAULT_WEIGHTS.copy()
         self.weights.update(self._weight_overrides(model))
 
@@ -1320,8 +1325,11 @@ class YOLO26PS25DLoss:
             has_mask = self._task_image_mask(batch, "has_person_mask", batch_size)
             if has_mask.any():
                 person_mask_loss = self._person_mask_loss(preds, batch, has_mask, assignment_cache)
-                total_loss = total_loss + person_mask_loss * weights["person_mask"]
-                loss_items[8] = person_mask_loss.detach() * weights["person_mask"]
+                person_mask_gain = float(getattr(self.det.hyp, "box", 1.0))
+                person_mask_item = person_mask_loss * person_mask_gain
+                mask_batch_size = has_mask.to(total_loss.dtype).sum().clamp(min=1.0)
+                total_loss = total_loss + person_mask_item * mask_batch_size * weights["person_mask"]
+                loss_items[8] = person_mask_item.detach() * weights["person_mask"]
 
         if weights["scene_seg"] and "scene_seg" in preds:
             has_scene = self._task_image_mask(batch, "has_scene_seg", batch_size)
@@ -1348,7 +1356,9 @@ class YOLO26PS25DLoss:
         cls_flat = cls.to(self.device).view(-1).long()
         batch_idx = batch_idx.to(self.device).long().view(-1)
         person_cls, face_cls = self.human_global_classes[:2]
-        keep = cls_flat.eq(person_cls) | cls_flat.eq(face_cls)
+        keep = cls_flat.eq(person_cls)
+        if self.human_det.nc > 1:
+            keep = keep | cls_flat.eq(face_cls)
         inst_count = int(cls_flat.numel())
 
         for key, value in batch.items():
@@ -1356,7 +1366,10 @@ class YOLO26PS25DLoss:
                 out[key] = value[keep.to(value.device)]
 
         kept_cls = cls_flat[keep]
-        out["cls"] = torch.where(kept_cls.eq(face_cls), torch.ones_like(kept_cls), torch.zeros_like(kept_cls)).view(-1, 1)
+        if self.human_det.nc > 1:
+            out["cls"] = torch.where(kept_cls.eq(face_cls), torch.ones_like(kept_cls), torch.zeros_like(kept_cls)).view(-1, 1)
+        else:
+            out["cls"] = torch.zeros_like(kept_cls).view(-1, 1)
         out["cls"] = out["cls"].to(device=cls.device, dtype=cls.dtype)
         out["batch_idx"] = batch_idx[keep].to(device=batch["batch_idx"].device, dtype=batch["batch_idx"].dtype)
 
@@ -1969,15 +1982,52 @@ class YOLO26PS25DLoss:
         pred_masks: torch.Tensor,
         imgsz: torch.Tensor,
     ) -> torch.Tensor:
-        """Calculate person instance-mask loss from matched positive anchors."""
-        _, _, mask_h, mask_w = proto.shape
-        loss = self._safe_zero(proto) + self._safe_zero(pred_masks)
-        target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
-        marea = xyxy2xywh(target_bboxes_normalized)[..., 2:].prod(2)
-        mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
+        """Calculate person instance-mask loss with optional cropped Dice refinement."""
+        loss = v8SegmentationLoss.calculate_segmentation_loss(
+            self,
+            fg_mask,
+            masks,
+            target_gt_idx,
+            target_bboxes,
+            batch_idx,
+            proto,
+            pred_masks,
+            imgsz,
+        )
+        dice_weight = float(getattr(self, "person_mask_dice_weight", 0.0) or 0.0)
+        if dice_weight <= 0:
+            return loss
+        return loss + dice_weight * self._calculate_person_mask_dice_loss(
+            fg_mask,
+            masks,
+            target_gt_idx,
+            target_bboxes,
+            batch_idx,
+            proto,
+            pred_masks,
+            imgsz,
+        )
 
-        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, marea, masks)):
-            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, marea_i, masks_i = single_i
+    def _calculate_person_mask_dice_loss(
+        self,
+        fg_mask: torch.Tensor,
+        masks: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        batch_idx: torch.Tensor,
+        proto: torch.Tensor,
+        pred_masks: torch.Tensor,
+        imgsz: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-instance Dice inside assigned boxes to sharpen mask IoU."""
+        _, _, mask_h, mask_w = proto.shape
+        target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
+        mxyxy = target_bboxes_normalized * torch.tensor([mask_w, mask_h, mask_w, mask_h], device=proto.device)
+        loss = proto.sum() * 0.0 + pred_masks.sum() * 0.0
+        smooth = 1.0
+
+        for i, single_i in enumerate(zip(fg_mask, target_gt_idx, pred_masks, proto, mxyxy, masks)):
+            fg_mask_i, target_gt_idx_i, pred_masks_i, proto_i, mxyxy_i, masks_i = single_i
             if not fg_mask_i.any():
                 continue
             mask_idx = target_gt_idx_i[fg_mask_i]
@@ -1985,10 +2035,14 @@ class YOLO26PS25DLoss:
                 gt_mask = (masks_i == (mask_idx + 1).view(-1, 1, 1)).float()
             else:
                 gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
-            loss = loss + v8SegmentationLoss.single_mask_loss(
-                gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i].clamp(min=1e-6)
-            )
-        return loss / fg_mask.sum().clamp(min=1)
+            pred_mask = torch.einsum("in,nhw->ihw", pred_masks_i[fg_mask_i], proto_i).sigmoid()
+            boxes = mxyxy_i[fg_mask_i]
+            pred_mask = crop_mask(pred_mask, boxes)
+            gt_mask = crop_mask(gt_mask, boxes)
+            intersection = (pred_mask * gt_mask).sum(dim=(1, 2))
+            union = pred_mask.sum(dim=(1, 2)) + gt_mask.sum(dim=(1, 2))
+            loss = loss + (1.0 - (2.0 * intersection + smooth) / (union + smooth)).sum()
+        return loss / fg_mask.sum()
 
     def _scene_seg_loss(
         self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], image_mask: torch.Tensor
@@ -2129,11 +2183,10 @@ class YOLO26PS25DLoss:
         image_mask: torch.Tensor,
         cache: dict[tuple[bool, ...], tuple[dict[str, torch.Tensor], dict[str, Any], tuple]] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], tuple]:
-        """Return person-mask assignment, preferring the human detector's person/face matcher."""
-        if "human_boxes" not in preds or "human_scores" not in preds:
-            return self._get_assignment(preds, batch, image_mask, cache)
-
-        return self._get_human_assignment(preds, batch, image_mask)
+        """Return person-mask assignment from the configured detection branch."""
+        if self.person_mask_assignment_head == "human" and "human_boxes" in preds and "human_scores" in preds:
+            return self._get_human_assignment(preds, batch, image_mask)
+        return self._get_assignment(preds, batch, image_mask, cache)
 
     def _get_human_assignment(
         self,
@@ -2223,6 +2276,10 @@ class YOLO26PS25DLoss:
         for key, value in preds.items():
             if key == "feats" and isinstance(value, (list, tuple)):
                 out[key] = [x[image_mask] for x in value]
+            elif isinstance(value, (list, tuple)):
+                out[key] = type(value)(
+                    x[image_mask] if torch.is_tensor(x) and x.shape[:1] == (batch_size,) else x for x in value
+                )
             elif torch.is_tensor(value) and value.shape[:1] == (batch_size,):
                 out[key] = value[image_mask]
             else:
@@ -2287,6 +2344,25 @@ class YOLO26PS25DLoss:
         gather_idx = target_gt_idx.clamp(max=max_count - 1).view(batch_size, num_anchors, *([1] * (values.ndim - 1)))
         return batched.gather(1, gather_idx.expand(batch_size, num_anchors, *values.shape[1:]))
 
+    @staticmethod
+    def _runtime_value(model, name: str, default: Any = None) -> Any:
+        """Read staged runtime options from the model or its args namespace."""
+        value = getattr(model, name, None)
+        if value is not None:
+            return value
+        args = getattr(model, "args", None)
+        return getattr(args, name, default)
+
+    @staticmethod
+    def _normalize_assignment_head(value: Any) -> str:
+        """Normalize mask-assignment head names."""
+        head = str(value or "seg").strip().lower()
+        if head in {"seg", "segment", "mask", "det", "default"}:
+            return "seg"
+        if head in {"human", "human_det", "person", "person_face"}:
+            return "human"
+        return "seg"
+
     def _zero_aux(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
         """Keep inactive branches graph-connected for DDP and staged partial-label training."""
         boxes = preds.get("boxes", preds.get("pose_boxes"))
@@ -2308,8 +2384,10 @@ class YOLO26PS25DLoss:
         return zero
 
     @staticmethod
-    def _safe_zero(tensor: torch.Tensor) -> torch.Tensor:
+    def _safe_zero(tensor: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Return a graph-connected scalar zero without large FP16 reductions."""
+        if isinstance(tensor, (list, tuple)):
+            return sum((YOLO26PS25DLoss._safe_zero(x) for x in tensor if torch.is_tensor(x)), tensor[0].new_zeros(()))
         return tensor.float().sum() * 0.0
 
     @staticmethod

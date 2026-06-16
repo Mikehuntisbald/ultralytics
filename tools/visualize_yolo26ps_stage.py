@@ -19,6 +19,7 @@ import random
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
@@ -31,6 +32,7 @@ import sys
 sys.path.insert(0, str(ROOT))
 
 from ultralytics import YOLO
+from ultralytics.models.yolo.detect import DetectionPredictor
 from ultralytics.utils import ops
 from ultralytics.utils.nms import TorchNMS
 
@@ -371,7 +373,16 @@ def run_inference(
     deploy = raw
     if isinstance(raw, (tuple, list)) and len(raw) == 2 and torch.is_tensor(raw[0]):
         deploy = official_pose_to_deploy(raw[0])
-    if isinstance(raw, (tuple, list)) and len(raw) == 2 and isinstance(raw[0], (tuple, list)):
+    if (
+        isinstance(raw, (tuple, list))
+        and len(raw) == 2
+        and isinstance(raw[0], (tuple, list))
+        and len(raw[0]) == 2
+        and torch.is_tensor(raw[0][0])
+        and torch.is_tensor(raw[0][1])
+    ):
+        deploy = segment_to_deploy(raw[0][0], raw[0][1])
+    if isinstance(raw, (tuple, list)) and len(raw) == 2 and isinstance(raw[0], (tuple, list)) and len(raw[0]) >= 5:
         deploy = raw[0]
     if not (isinstance(deploy, (tuple, list)) and len(deploy) >= 5):
         raise RuntimeError(f"Unexpected YOLO26-PS output type: {type(raw)}")
@@ -394,6 +405,39 @@ def official_pose_to_deploy(pred: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     empty_proto = pred.new_zeros((pred.shape[0], 32, 0, 0))
     empty_scene = pred.new_zeros((pred.shape[0], 0, 0, 0))
     return det, pose25d, empty_coef, empty_proto, empty_scene
+
+
+def segment_to_deploy(
+    pred: torch.Tensor, proto: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert standard segment tensors to the PS visualization tuple."""
+    if isinstance(proto, (tuple, list)):
+        proto = proto[0]
+    if pred.ndim != 3:
+        raise RuntimeError(f"Unexpected segment output shape: {tuple(pred.shape)}")
+    nm = int(proto.shape[1]) if torch.is_tensor(proto) and proto.ndim == 4 else 32
+    if pred.shape[-1] == 6 + nm:
+        # Official E2E Segment postprocess: [xyxy, score, cls, mask_coeff].
+        pred = pred.contiguous()
+        boxes = pred[..., :4]
+        scores = pred[..., 4:5]
+        cls = pred[..., 5:6]
+        coeff = pred[..., 6:]
+    elif pred.shape[1] >= 5 + nm:
+        # Non-E2E Segment inference: [xywh, class_scores, mask_coeff] in channel-first layout.
+        pred = pred.permute(0, 2, 1).contiguous()
+        nc = pred.shape[-1] - 4 - nm
+        if nc <= 0:
+            raise RuntimeError(f"Unexpected segment output shape: {tuple(pred.shape)} with nm={nm}")
+        boxes = ops.xywh2xyxy(pred[..., :4])
+        scores, cls = pred[..., 4 : 4 + nc].max(dim=-1, keepdim=True)
+        coeff = pred[..., 4 + nc :]
+    else:
+        raise RuntimeError(f"Unexpected segment output shape: {tuple(pred.shape)} with nm={nm}")
+    det = torch.cat([boxes, scores, cls], dim=-1)
+    pose25d = pred.new_zeros((pred.shape[0], pred.shape[1], 17, 4))
+    scene_seg = pred.new_zeros((pred.shape[0], 0, 0, 0))
+    return det, pose25d, coeff, proto, scene_seg
 
 
 def prepare_predictions(
@@ -557,17 +601,29 @@ def main() -> None:
     if hasattr(head, "set_active_tasks"):
         head.set_active_tasks(active_tasks_for_source(samples[0]["source"], args, head))
     head.max_det = args.max_det
-    model.predict(
-        samples[0]["image"],
-        imgsz=args.imgsz,
-        conf=args.conf,
-        iou=args.iou,
-        max_det=args.max_det,
-        save=False,
-        verbose=False,
-        device=args.device,
+    device = torch.device(f"cuda:{args.device}" if str(args.device).isdigit() and torch.cuda.is_available() else args.device)
+    model.model.to(device).eval()
+    predictor = DetectionPredictor(
+        overrides={
+            "model": str(args.weights),
+            "imgsz": args.imgsz,
+            "conf": args.conf,
+            "iou": args.iou,
+            "max_det": args.max_det,
+            "save": False,
+            "verbose": False,
+            "device": args.device,
+        }
     )
-    predictor = model.predictor
+    predictor.device = device
+    predictor.imgsz = args.imgsz
+    predictor.model = SimpleNamespace(
+        fp16=False,
+        stride=model.model.stride,
+        input_stride=getattr(model.model, "input_stride", model.model.stride),
+        format="pt",
+        dynamic=False,
+    )
     head = model.model.model[-1]
     head.max_det = args.max_det
     model.model.eval()

@@ -70,7 +70,9 @@ from ultralytics.nn.modules import (
     SemanticSegment,
     TorchVision,
     WorldDetect,
+    YOLO26PSAdapterSegment,
     YOLO26PSDetect25D,
+    YOLO26PSMergedSegment25D,
     YOLO26PSSegment,
     YOLOEDetect,
     YOLOESegment,
@@ -210,7 +212,7 @@ class BaseModel(torch.nn.Module):
             or torch.is_grad_enabled()
             or not getattr(self, "parallel_neck_inference", False)
             or len(self.model) < 48
-            or not isinstance(self.model[-1], YOLO26PSDetect25D)
+            or type(self.model[-1]) is not YOLO26PSDetect25D
         ):
             return False
 
@@ -586,7 +588,10 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        if isinstance(self.model[-1], (YOLO26PSDetect25D, YOLO26PSSegment)):
+        if isinstance(
+            self.model[-1],
+            (YOLO26PSDetect25D, YOLO26PSMergedSegment25D, YOLO26PSSegment, YOLO26PSAdapterSegment),
+        ):
             return YOLO26PS25DE2ELoss(self) if getattr(self, "end2end", False) else YOLO26PS25DLoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
@@ -652,7 +657,7 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        if isinstance(self.model[-1], YOLO26PSSegment):
+        if isinstance(self.model[-1], (YOLO26PSSegment, YOLO26PSAdapterSegment, YOLO26PSMergedSegment25D)):
             return YOLO26PS25DE2ELoss(self) if getattr(self, "end2end", False) else YOLO26PS25DLoss(self)
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
@@ -1851,7 +1856,9 @@ def parse_model(d, ch, verbose=True):
                 YOLOEDetect,
                 Segment,
                 Segment26,
+                YOLO26PSAdapterSegment,
                 YOLO26PSDetect25D,
+                YOLO26PSMergedSegment25D,
                 YOLO26PSSegment,
                 YOLOESegment,
                 YOLOESegment26,
@@ -1868,15 +1875,31 @@ def parse_model(d, ch, verbose=True):
                     args.extend([None, "simple"])
                 elif len(args) == 8:
                     args.append("simple")
+            if m is YOLO26PSMergedSegment25D:
+                if len(args) == 6:
+                    args.extend([None, None, "simple"])
+                elif len(args) == 7:
+                    args.extend([None, "simple"])
+                elif len(args) == 8:
+                    args.append("simple")
             args.extend([reg_max, end2end, [ch[x] for x in f]])
-            if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26 or m is YOLO26PSSegment:
+            if (
+                m is Segment
+                or m is YOLOESegment
+                or m is Segment26
+                or m is YOLOESegment26
+                or m is YOLO26PSSegment
+                or m is YOLO26PSAdapterSegment
+            ):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
                 YOLOEDetect,
                 Segment,
                 Segment26,
+                YOLO26PSAdapterSegment,
                 YOLO26PSDetect25D,
+                YOLO26PSMergedSegment25D,
                 YOLO26PSSegment,
                 YOLOESegment,
                 YOLOESegment26,

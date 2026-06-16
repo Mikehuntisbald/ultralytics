@@ -94,6 +94,7 @@ compile: False # (bool | str) enable torch.compile() backend='inductor'; True="d
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)
 mask_ratio: 4 # (int) mask downsample ratio (segment only)
+person_mask_dice_weight: 0.0 # (float) YOLO26-PS person-mask cropped Dice gain; 0 disables
 
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
